@@ -26,8 +26,8 @@ python scripts/regenerate_train_data.py \
     --temperature 0.7 \
     --top-p 0.8 \
     --top-k 20 \
-    --input-file-path /local_home3/fengsicheng/specforge/data/sharegpt4v_train.jsonl \
-    --output-file-path /local_home3/fengsicheng/specforge/regen_data/sharegpt4v_regen_first_turn.jsonl \
+    --input-file-path /local_home1/fengsicheng/specforge/data/sharegpt4v_train.jsonl \
+    --output-file-path /local_home1/fengsicheng/specforge/regen_data/sharegpt4v_regen_first_turn.jsonl \
     --resume \
     --reasoning disable
 

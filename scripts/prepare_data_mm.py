@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 SUPPORTED_DATASETS = ("sharegpt4v", "sharegpt4v-pt")
-DEFAULT_OUTPUT_DIRECTORY = "/local_home3/fengsicheng/specforge/data/"
+DEFAULT_OUTPUT_DIRECTORY = "/local_home1/fengsicheng/specforge/data/"
 SUPPORTED_DATA_PATH_SUFFIXES = {".json", ".jsonl"}
 IMAGE_PLACEHOLDER = "<image>"
 # Lin-Chen/ShareGPT4V hosts both subsets in one repo, distinguished by the
@@ -76,6 +77,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-eval",
         action="store_true",
         help="Write a deterministic 5% evaluation split.",
+    )
+    parser.add_argument(
+        "--dump-missing-prefix",
+        action="append",
+        default=[],
+        metavar="PREFIX",
+        help=(
+            "For missing images whose directory prefix matches, print each "
+            "full relative image path (e.g. web-celebrity/images). Repeatable."
+        ),
     )
     return parser
 
@@ -166,15 +177,22 @@ def resolve_image_path(image_root: Path, relative_path: str) -> Path | None:
     return resolved if resolved.is_file() else None
 
 
+def _image_prefix(relative_path: str) -> str:
+    return relative_path.rsplit("/", 1)[0] if "/" in relative_path else "(no directory)"
+
+
 def _write_split(
     dataset: Iterable[Mapping[str, Any]],
     output_path: Path,
     processor: RowProcessor,
     dataset_name: str,
     image_root: Path,
-) -> tuple[int, int]:
+    dump_missing_prefixes: Sequence[str] = (),
+) -> tuple[int, int, Counter[str], list[str]]:
     skipped_messages = 0
     missing_images = 0
+    missing_prefixes: Counter[str] = Counter()
+    dumped_missing_paths: list[str] = []
     with output_path.open("w", encoding="utf-8") as output_file:
         for item in dataset:
             row, skipped_count = processor(item, dataset_name)
@@ -185,12 +203,16 @@ def _write_split(
             resolved_image = resolve_image_path(image_root, row["image"])
             if resolved_image is None:
                 missing_images += 1
+                prefix = _image_prefix(row["image"])
+                missing_prefixes[prefix] += 1
+                if prefix in dump_missing_prefixes:
+                    dumped_missing_paths.append(row["image"])
                 continue
 
             row["image"] = str(resolved_image)
             skipped_messages += skipped_count
             output_file.write(json.dumps(row, ensure_ascii=False) + "\n")
-    return skipped_messages, missing_images
+    return skipped_messages, missing_images, missing_prefixes, dumped_missing_paths
 
 
 def process_and_save_dataset(
@@ -201,31 +223,36 @@ def process_and_save_dataset(
     image_root: Path,
     *,
     eval_dataset: Iterable[Mapping[str, Any]] | None = None,
+    dump_missing_prefixes: Sequence[str] = (),
 ) -> Path:
     output_directory.mkdir(parents=True, exist_ok=True)
     train_output_path = output_directory / f"{dataset_name}_train.jsonl"
+    # Always regenerate: overwrite any existing output instead of skipping.
     if train_output_path.exists():
-        print(f"Dataset already exists at {train_output_path}; skipping conversion.")
-        return train_output_path
+        print(f"Overwriting existing dataset at {train_output_path}.")
 
-    skipped_messages, missing_images = _write_split(
+    skipped_messages, missing_images, missing_prefixes, dumped_missing_paths = _write_split(
         dataset,
         train_output_path,
         processor,
         dataset_name,
         image_root,
+        dump_missing_prefixes,
     )
     if eval_dataset is not None:
         eval_output_path = output_directory / f"{dataset_name}_test.jsonl"
-        eval_skipped, eval_missing = _write_split(
+        eval_skipped, eval_missing, eval_missing_prefixes, eval_dumped = _write_split(
             eval_dataset,
             eval_output_path,
             processor,
             dataset_name,
             image_root,
+            dump_missing_prefixes,
         )
         skipped_messages += eval_skipped
         missing_images += eval_missing
+        missing_prefixes += eval_missing_prefixes
+        dumped_missing_paths += eval_dumped
 
     if skipped_messages:
         print(
@@ -234,6 +261,13 @@ def process_and_save_dataset(
         )
     if missing_images:
         print(f"Skipped {missing_images} rows with images missing under {image_root}.")
+        print("Missing-image path prefixes (count, prefix):")
+        for prefix, count in missing_prefixes.most_common():
+            print(f"  {count}\t{prefix}")
+    if dumped_missing_paths:
+        print("Missing images under the requested prefixes:")
+        for path in sorted(dumped_missing_paths):
+            print(f"  {path}")
     print(f"Saved {dataset_name} training data to {train_output_path}.")
     return train_output_path
 
@@ -259,6 +293,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.dataset,
         args.image_root,
         eval_dataset=eval_dataset,
+        dump_missing_prefixes=args.dump_missing_prefix,
     )
 
 

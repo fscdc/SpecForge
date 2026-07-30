@@ -14,6 +14,7 @@ from specforge.algorithms.common.dflash_family_data import (
     build_offline_normalizer,
     build_offline_reader,
 )
+from specforge.algorithms.common.mm_server_input import build_image_input_adapter
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
@@ -155,6 +156,14 @@ def algorithm_spec() -> AlgorithmSpec:
                 modality="text",
                 required_tensors=ready,
             ),
+            # Image capture yields the same algorithm-ready tensors: the target's
+            # image tokens are expanded into input_ids before capture, so the
+            # trainer still consumes plain per-token features.
+            FeatureContract(
+                mode=FeatureMode.STREAMING,
+                modality="image",
+                required_tensors=ready,
+            ),
         ),
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
@@ -223,6 +232,23 @@ def algorithm_providers() -> AlgorithmProviders:
                     ),
                 ),
                 build_collator=collator,
+            ),
+            # Image modality: same capture layout as text, but prompt building and
+            # request construction are owned by the multimodal input adapter.
+            ServerStreamingProvider(
+                modality="image",
+                capture_method="dflash",
+                target_representation=None,
+                layout=ServerCaptureLayout(
+                    aux_feature="hidden_states",
+                    last_hidden_feature=None,
+                    passthrough=(
+                        ("input_ids", "input_ids", ()),
+                        ("loss_mask", "loss_mask", ()),
+                    ),
+                ),
+                build_collator=collator,
+                build_input_adapter=build_image_input_adapter,
             ),
         ),
     )

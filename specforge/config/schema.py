@@ -137,6 +137,15 @@ class DataConfig(StrictConfigModel):
     chat_template: str = "llama3"
     is_preformatted: bool = False
     train_only_last_turn: bool = False
+    #: image modality — root directory prepended to relative ``image`` paths in
+    #: the training records. Empty means the records already carry usable paths.
+    image_root: str = ""
+    #: image modality — cap on visual tokens per image. Leave at 0: the capture
+    #: server expands ``image_data`` with the checkpoint's own resolution, so a
+    #: client-side cap makes the prompt we send shorter than the sequence the
+    #: server builds and the request is rejected for exceeding the context.
+    #: Only set this if the server is configured with a matching limit.
+    image_max_tokens: int = Field(default=0, ge=0)
     build_dataset_num_proc: int = Field(default=8, gt=0)
     #: Ordered background feature-loader workers. ``None`` preserves the
     #: former strategy defaults (EAGLE/P-EAGLE=4, DFlash-family=8).

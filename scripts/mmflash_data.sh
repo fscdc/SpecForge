@@ -13,6 +13,7 @@
 GPU_IDS=(0 1)
 
 # dataset: sharegpt4v / sharegpt4v-pt
+# hpc: /Project_Storage/CFP-04/CFP04-CF-054/fengsicheng/specforge/data
 # python scripts/prepare_data_mm.py \
 #     --dataset sharegpt4v \
 #     --image-root /local_home1/fengsicheng/specforge/data \
@@ -22,7 +23,7 @@ GPU_IDS=(0 1)
 
 
 # regen dataset: sharegpt4v
-export LD_LIBRARY_PATH="/home/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="/home/svu/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
 export FLASHINFER_USE_CUDA_NORM=1
 export NVCC_PREPEND_FLAGS="-ccbin g++-11"
 
@@ -62,10 +63,11 @@ done
 #     --temperature 0.7 \
 #     --top-p 0.8 \
 #     --top-k 20 \
-#     --input-file-path /local_home1/fengsicheng/specforge/data/sharegpt4v-pt_train.jsonl \
-#     --output-file-path /local_home1/fengsicheng/specforge/regen_data/qwen35-4B_sharegpt4v-pt_regen_first_turn.jsonl \
+#     --input-file-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/data/sharegpt4v-pt_train.jsonl \
+#     --output-file-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_sharegpt4v-pt_regen_first_turn.jsonl \
 #     --resume \
 #     --reasoning disable
+
 
 
 # pkill -f "sglang.launch_server"

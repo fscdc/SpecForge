@@ -255,10 +255,9 @@ index f95c59f6f..9e64326a1 100644
 +            spec_capture=self.spec_capture or None,
              routed_experts=self.routed_experts,
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index bf932611a..f0e821ec4 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -1172,6 +1172,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1172,6 +1172,7 @@
                  multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                  mm_data_mooncake=obj.mm_data_mooncake,
                  encoder_urls=obj.encoder_urls,
@@ -266,7 +265,62 @@ index bf932611a..f0e821ec4 100644
              )
          elif isinstance(obj, EmbeddingReqInput):
              # Resolve unresolved embed overrides now that input_ids are available
-@@ -1922,6 +1923,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1426,9 +1427,19 @@
+         self,
+         obj: Union[GenerateReqInput, EmbeddingReqInput],
+         request: Optional[fastapi.Request] = None,
++        state: Optional[ReqState] = None,
+     ):
+-        """Wait for the response of one request."""
+-        state = self.rid_to_state[obj.rid]
++        """Wait for the response of one request.
++
++        Callers that collect this generator for a later gather (the batch
++        paths) must pass ``state``: a request that finishes while the rest of
++        the batch is still being tokenized/dispatched has its ``rid_to_state``
++        entry deleted by ``_handle_batch_output``, so the lazy lookup below
++        would raise ``KeyError`` even though the state object still carries
++        the finished output.
++        """
++        if state is None:
++            state = self.rid_to_state[obj.rid]
+         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
+         is_stream = getattr(obj, "stream", False)
+         while True:
+@@ -1552,7 +1563,9 @@
+                     state = self.rid_to_state[tmp_obj.rid]
+                     if tmp_obj.return_prompt_token_ids:
+                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
+-                    generators.append(self._wait_one_response(tmp_obj, request))
++                    generators.append(
++                        self._wait_one_response(tmp_obj, request, state=state)
++                    )
+                     rids.append(tmp_obj.rid)
+             else:
+                 # Sequential tokenization and processing
+@@ -1568,7 +1581,9 @@
+                         if tmp_obj.return_prompt_token_ids:
+                             state.prompt_token_ids = list(tokenized_obj.input_ids)
+                         self._send_one_request(tokenized_obj)
+-                        generators.append(self._wait_one_response(tmp_obj, request))
++                        generators.append(
++                            self._wait_one_response(tmp_obj, request, state=state)
++                        )
+                         rids.append(tmp_obj.rid)
+         else:
+             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
+@@ -1621,7 +1636,9 @@
+                     if tmp_obj.return_prompt_token_ids:
+                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
+                     self._send_one_request(tokenized_obj)
+-                    generators.append(self._wait_one_response(tmp_obj, request))
++                    generators.append(
++                        self._wait_one_response(tmp_obj, request, state=state)
++                    )
+                     rids.append(tmp_obj.rid)
+ 
+                 self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
+@@ -1922,6 +1939,10 @@
                  hidden_states = recv_obj.output_hidden_states[i]
                  if hidden_states is not None:
                      meta_info["hidden_states"] = hidden_states
@@ -580,3 +634,26 @@ index 000000000..d317b2801
 +
 +def get_sink() -> Optional[SpecCaptureSink]:
 +    return _SINK
+diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
+--- a/python/sglang/srt/multimodal/processors/base_processor.py
++++ b/python/sglang/srt/multimodal/processors/base_processor.py
+@@ -1248,7 +1248,18 @@
+ 
+         """
+         assert images is not None
+-        image_sizes = [(image.height, image.width) for image in images]
++        image_sizes = [
++            (
++                (image.height, image.width)
++                if hasattr(image, "height")
++                # nvJPEG GPU decode (srt.utils.common._load_image) returns CHW
++                # torch tensors, which carry no PIL size attributes; without
++                # this branch every JPEG input falls back to the expensive
++                # decode+retokenize path (token drift).
++                else (int(image.shape[-2]), int(image.shape[-1]))
++            )
++            for image in images
++        ]
+         num_image_tokens = self._processor._get_num_multimodal_tokens(
+             image_sizes=image_sizes
+         ).num_image_tokens

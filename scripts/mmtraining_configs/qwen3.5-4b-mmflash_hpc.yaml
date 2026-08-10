@@ -12,15 +12,15 @@ model:
   embedding_key: "model.language_model.embed_tokens.weight" # @sicheng: changed "model.embed_tokens.weight"
   torch_dtype: "bfloat16"
 data:
-  train_data_path: "/local_home1/fengsicheng/specforge/regen_data/qwen35-4B_sharegpt4v_regen_first_turn.jsonl"
+  train_data_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_sharegpt4v_regen_first_turn.jsonl"
   max_length: 3072
   chat_template: "qwen3.5"
   build_dataset_num_proc: 32
-  cache_dir: "/local_home1/fengsicheng/specforge/.cache"
+  cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
 training:
   strategy: "dflash"
   num_epochs: 10
-  # max_steps: 10000
+  max_steps: 1000
   batch_size: 2
   accumulation_steps: 4
   learning_rate: 0.0006
@@ -33,18 +33,10 @@ training:
   log_interval: 50
   dist_timeout: 30
   seed: 42
-runtime:
-  # Keep Mooncake residency far below capacity. Reclamation is only pumped when
-  # the consumer materializes a feature, so once the store fills up, puts fail,
-  # no refs are published, the consumer stalls, and gc() stops running — the
-  # store never recovers. Staying orders of magnitude away from full is what
-  # prevents that, not raw capacity (~20 MB/sample, so 32 in flight ~= 0.6 GB).
-  in_flight_high_watermark: 32
-  in_flight_low_watermark: 24
 tracking:
   report_to: "tensorboard"
 run_id: "qwen3.5-4b-mmflash"
-output_dir: "/local_home1/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash"
+output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash"
 
 deployment:
   mode: disaggregated
@@ -52,9 +44,15 @@ deployment:
     nnodes: 1
     nproc_per_node: 1 # @sicheng: same as gpu count
   disaggregated:
-    control_dir: "/local_home1/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash/control"
-    consumer_state_dir: "/local_home1/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash/consumer-state"
+    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash/control"
+    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash/consumer-state"
     backend: mooncake
+    # server_urls:
+    #   - http://127.0.0.1:30000
+    # mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    # mooncake_master_server_addr: 127.0.0.1:35551
+    # mooncake_protocol: tcp
+    
     # managed_local: the CLI supervises Mooncake and the SGLang capture server
     # itself, so nothing has to be started by hand. It derives the server URLs
     # and Mooncake endpoints, which is why none of them may be set here.
@@ -64,10 +62,6 @@ deployment:
         - "0"
       mooncake:
         protocol: tcp
-        # Image prompts are long, so one sample's aux features are ~100 MB
-        # (5 layers x 4096 tokens x 2560 hidden x bf16). The 32 GB default fills
-        # up, spec-capture put_from starts failing, and the rollout worker dies.
-        global_segment_size_bytes: 68719476736  # 64 GB
       capture_servers:
         - port: 30000
           cuda_visible_devices:
@@ -75,4 +69,4 @@ deployment:
           tp_size: 1
           # GPU 2 is shared with other jobs, so size the static pool to the free
           # memory rather than to the whole card.
-          mem_fraction_static: 0.30
+          mem_fraction_static: 0.80

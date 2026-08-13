@@ -19,8 +19,8 @@ data:
   cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
 training:
   strategy: "dflash"
-  num_epochs: 10
-  max_steps: 1000
+  num_epochs: 6
+  # max_steps: 1000 # set for testing, comment out for full training
   batch_size: 2
   accumulation_steps: 4
   learning_rate: 0.0006
@@ -29,23 +29,23 @@ training:
   attention_backend: "flex_attention"
   num_anchors: 512
   loss_decay_gamma: 7
-  save_interval: 10000
+  save_interval: 1000
   log_interval: 50
   dist_timeout: 30
   seed: 42
 tracking:
   report_to: "tensorboard"
 run_id: "qwen3.5-4b-mmflash"
-output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash"
+output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-sharegpt4v"
 
 deployment:
   mode: disaggregated
   trainer:
     nnodes: 1
-    nproc_per_node: 1 # @sicheng: same as gpu count
+    nproc_per_node: 3 # @sicheng: same as gpu count
   disaggregated:
-    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash/control"
-    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash/consumer-state"
+    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-sharegpt4v/control"
+    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-sharegpt4v/consumer-state"
     backend: mooncake
     # server_urls:
     #   - http://127.0.0.1:30000
@@ -59,13 +59,15 @@ deployment:
     managed_local:
       # trainer (consumer) GPUs — must stay disjoint from the capture server's
       trainer_cuda_visible_devices:
-        - "0"
+        - "1"
+        - "2"
+        - "3"
       mooncake:
         protocol: tcp
       capture_servers:
         - port: 30000
           cuda_visible_devices:
-            - "1"
+            - "0"
           tp_size: 1
           # GPU 2 is shared with other jobs, so size the static pool to the free
           # memory rather than to the whole card.

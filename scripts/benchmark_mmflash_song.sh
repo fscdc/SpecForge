@@ -1,15 +1,15 @@
 # 对于draft model，我们需要先转换为一个sglang可以load的形式
 # TODO: 改成真实路径
-specforge export --to hf \
-  --checkpoint /TODO/outputs/qwen3.5-4b-mmflash/qwen3.5-4b-mmflash_latest \
-  --draft-config configs/qwen3.5-4b-dflash.json \
-  --output-dir /TODO/specforge/draft_models/qwen3.5-4b-mmflash-hf
+# specforge export --to hf \
+#   --checkpoint /TODO/outputs/qwen3.5-4b-mmflash/qwen3.5-4b-mmflash_latest \
+#   --draft-config configs/qwen3.5-4b-dflash.json \
+#   --output-dir /TODO/specforge/draft_models/qwen3.5-4b-mmflash-hf
 
 
 # TODO: 这个地方把要多少卡一些测试的GPU_IDs写在这里就行了，后面会自动根据这个列表去启动server
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0
 
-GPU_IDS=(0 1)
+GPU_IDS=(0)
 
 # 对于松哥的环境，下面这两个export的东西应该都不需要
 # for deep100
@@ -86,15 +86,18 @@ fi
 CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_mmflash.py \
     --model-path Qwen/Qwen3.5-4B \
     --ports "${PORTS[@]}" \
-    --config-list 64,${BLOCK_SIZE} \
-    --benchmark-list ocrbench chartqa realworldqa mmstar \
+    --config-list 1,${BLOCK_SIZE} \
+    --benchmark-list chartqa:200 mmstar:200 mathvision:200 \
     --dtype bfloat16 \
     --chat-template-name qwen2-vl \
     --disable-thinking \
-    --temperature 0.7 \
-    --top-p 0.8 \
+    --temperature 1.0 \
+    --top-p 0.95 \
     --top-k 20 \
-    --max-tokens 4096 \
+    --max-tokens 32768 \
     --skip-launch-server \
     --save-generations \
-    --name mmflash_qwen35-4B_concurrency128
+    --name mmflash_qwen35-4B_concurrency1
+
+
+pkill -f "sglang.launch_server"

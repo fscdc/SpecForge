@@ -12,8 +12,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True # fix
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
 export FLASHINFER_USE_CUDA_NORM=1
 
-rm -rf /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash/control
-rm -rf /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash/consumer-state
+# rm -rf /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash/control
+# rm -rf /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash/consumer-state
 
 specforge train --config scripts/mmtraining_configs/qwen3.5-4b-mmflash_hpc.yaml
 

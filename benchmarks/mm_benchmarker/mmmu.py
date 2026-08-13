@@ -30,16 +30,19 @@ from .base import MMBenchmarker
 from .registry import MM_BENCHMARKS
 from .utils import create_interleaved_sgl_function
 
-# prompt formats of the MMMU repository, as used by the lm-eval task
+# Prompt formats of the MMMU repository, as used by the lm-eval task, with the
+# answer-directly instruction replaced by an explanation plus a \boxed{}. The
+# scoring reads the box first (see `extract_boxed`), and only falls back to the
+# repository's own parsers when a generation carries none.
 MULTI_CHOICE_EXAMPLE_FORMAT = """{}
 
 {}
 
-Answer with the option's letter from the given choices directly."""
+Answer with an explanation, then put the letter of the correct option in \\boxed{{}}."""
 
 SHORT_ANS_EXAMPLE_FORMAT = """{}
 
-Answer the question using a single word or phrase."""
+Answer with an explanation, then put your final answer in \\boxed{{}}."""
 
 START_CHR = "A"
 OPTION_LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H", "I"]
@@ -125,6 +128,58 @@ def split_into_parts(prompt: str, image_paths: Dict[int, str]) -> List[Tuple[str
 
 
 # ----------- Process Multi-choice -------------
+def extract_boxed(response: str) -> Optional[str]:
+    """
+    The content of the last ``\\boxed{...}``, or None when there is none.
+
+    Matched on "oxed{" so that a single- and a double-escaped backslash both
+    hit, and closed by brace counting so that a boxed ``\\frac{1}{2}`` survives.
+    A generation truncated inside its box yields what it had written so far.
+    """
+    start = response.rfind("oxed{")
+    if start == -1:
+        return None
+    depth = 1
+    collected = []
+    for char in response[start + len("oxed{") :]:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        collected.append(char)
+    return "".join(collected).strip() or None
+
+
+def _unwrap_boxed_text(text: str) -> str:
+    """Drop a LaTeX text wrapper and the punctuation a box is decorated with."""
+    text = re.sub(r"\\(?:text|mathrm)\s*\{([^}]*)\}", r"\1", text)
+    # one pass over both ends: "(a)." has to lose the period before the paren
+    return text.strip().strip("()[]{}$ .,:;").strip()
+
+
+def parse_boxed_choice(
+    boxed: str, all_choices: List[str], index2ans: Dict[str, str]
+) -> Optional[str]:
+    """
+    The option letter a ``\\boxed{}`` names, either directly or by option text.
+
+    Returns None when the box holds neither, leaving the caller to fall back to
+    the repository's parser rather than guessing.
+    """
+    text = _unwrap_boxed_text(boxed)
+    if not text:
+        return None
+    if text.upper() in all_choices:
+        return text.upper()
+    for letter, option in index2ans.items():
+        # both sides normalized the same way, so a boxed "dog." still matches
+        if letter in all_choices and _unwrap_boxed_text(str(option)).lower() == text.lower():
+            return letter
+    return None
+
+
 def parse_multi_choice_response(
     response: str, all_choices: List[str], index2ans: Dict[str, str]
 ) -> str:
@@ -359,6 +414,15 @@ class MMMUBenchmarker(MMBenchmarker):
         # subset -> {"skipped": n, "kept": n, "total": n} of the multi-image filter
         self.multi_image_filter: Dict[str, Dict[str, int]] = {}
 
+    def default_max_new_tokens(self) -> int:
+        """
+        Room for the explanation the prompt asks for before the \\boxed{}.
+
+        A generation cut off before it reaches its box falls back to parsing the
+        explanation, which is exactly what the box is there to avoid.
+        """
+        return 4096
+
     @staticmethod
     def _resolve_subsets(subset: Optional[List[str]]) -> List[str]:
         """Map the requested subject names onto the dataset config names."""
@@ -548,14 +612,32 @@ class MMMUBenchmarker(MMBenchmarker):
         return sum(scored) / len(scored)
 
     def _score(self, prediction: str, label: str, index: int) -> bool:
-        """Parse one generation the way its question type asks for, and score it."""
+        """
+        Parse one generation the way its question type asks for, and score it.
+
+        The prompt asks for the answer in a ``\\boxed{}``, so that is read
+        first. Falling back to the repository's parsers matters: theirs scan the
+        whole generation, which now carries an explanation, and the
+        multiple-choice one picks a letter at random when it finds none.
+        """
+        boxed = extract_boxed(prediction)
         if self.question_types[index] == "multiple-choice":
             option_strs = self.options_list[index]
             all_choices = OPTION_LETTERS[: len(option_strs)]
             index2ans = dict(zip(OPTION_LETTERS, option_strs))
-            parsed = parse_multi_choice_response(prediction, all_choices, index2ans)
+            parsed = (
+                parse_boxed_choice(boxed, all_choices, index2ans)
+                if boxed is not None
+                else None
+            )
+            if parsed is None:
+                parsed = parse_multi_choice_response(prediction, all_choices, index2ans)
             return eval_multi_choice(label, parsed)
-        return eval_open(label, parse_open_response(prediction))
+        # An open answer is scored against the box alone when there is one:
+        # parsing the explanation too would credit any number it mentions.
+        return eval_open(
+            label, parse_open_response(boxed if boxed is not None else prediction)
+        )
 
     def compute_categorical_performance(
         self, states: List[Any], latency: float, answer_key: str

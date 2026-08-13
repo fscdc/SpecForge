@@ -92,10 +92,13 @@ CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_mmflash.py \
     --dtype bfloat16 \
     --chat-template-name qwen2-vl \
     --disable-thinking \
-    --temperature 0.7 \
-    --top-p 0.8 \
+    --temperature 1.0 \
+    --top-p 0.95 \
     --top-k 20 \
     --max-tokens 4096 \
     --skip-launch-server \
     --save-generations \
     --name mmflash_qwen35-4B_concurrency128
+
+
+pkill -f "sglang.launch_server"

@@ -39,7 +39,6 @@ except ImportError:  # scored without symbolic evaluation, see the module docstr
 
 # prompt of the lmms-eval task
 BOXED_PROMPT = 'Please solve the problem step by step and put your answer in one "\\boxed{}".'
-MC_PROMPT = "Answer the question with the option's letter from the given choices directly."
 
 # the "flag" phrases the reference implementation cuts the answer out of
 ANSWER_FLAGS = (
@@ -273,17 +272,24 @@ def find_math_answer(s: str) -> str:
 
 def build_prompt(question: str, options: List[str]) -> str:
     """
-    The prompt of the lmms-eval task.
+    The prompt of the lmms-eval task, minus one contradiction.
 
-    Reproduced as-is, including the missing separator between the instruction and
-    the question, so that the numbers stay comparable with published ones.
+    The task appends "Answer the question with the option's letter from the
+    given choices directly." to a multiple-choice question, which tells the
+    model the opposite of the step-by-step instruction BOXED_PROMPT already
+    opened with. Only the boxed instruction is kept, so both question types ask
+    for the same thing; `score_answer` credits a box holding either the letter
+    or the option text.
+
+    The missing separator between the instruction and the question is the
+    task's, and is reproduced as-is.
     """
     letters = [chr(ord("A") + index) for index in range(len(options))]
     choices_str = "\n".join(
         f"{letter}. {choice}" for letter, choice in zip(letters, options)
     )
     if choices_str:
-        return f"{BOXED_PROMPT}{question}\nChoices: {choices_str}\n{MC_PROMPT}"
+        return f"{BOXED_PROMPT}{question}\nChoices: {choices_str}"
     return f"{BOXED_PROMPT}{question}"
 
 

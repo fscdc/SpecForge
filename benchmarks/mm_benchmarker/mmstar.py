@@ -34,10 +34,19 @@ from .base import MMBenchmarker
 from .registry import MM_BENCHMARKS
 from .utils import CHOICES, create_image_sgl_function, extract_choice
 
-# lmms_eval_specific_kwargs of the task: "default" is what published numbers use,
-# "qwen3_vl" is the variant the task ships for the Qwen3-VL family
+# "default" is what we run: it asks for the reasoning before the answer and
+# pins the answer down to a \boxed{}, which the extraction reads first.
+# "lmms_eval" and "qwen3_vl" are the task's own kwargs, kept so a run can be
+# compared against published numbers.
 PROMPT_VARIANTS = {
     "default": {
+        "pre_prompt": "",
+        "post_prompt": (
+            "\nAnswer with an explanation, then put the letter of the correct "
+            "option in \\boxed{}."
+        ),
+    },
+    "lmms_eval": {
         "pre_prompt": "",
         "post_prompt": "\nAnswer with the option's letter from the given choices directly",
     },
@@ -146,6 +155,15 @@ class MMStarBenchmarker(MMBenchmarker):
         # macro average per category and per l2 category of that call
         self.category_scores: Dict[str, float] = {}
         self.l2_category_scores: Dict[str, float] = {}
+
+    def default_max_new_tokens(self) -> int:
+        """
+        Room for the explanation the prompt asks for before the \\boxed{}.
+
+        A generation cut off before it reaches its box is scored wrong, so this
+        sits well above the 2048 of the base class.
+        """
+        return 4096
 
     def load_data(self) -> Tuple[List[Dict[str, Any]], List[Optional[str]]]:
         """Load and preprocess the MMStar dataset."""

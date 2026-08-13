@@ -1,8 +1,7 @@
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0
 
-GPU_IDS=(0 1)
+GPU_IDS=(0)
 
-# regen dataset: sharegpt4v
 
 # for deep100
 # export LD_LIBRARY_PATH="/home/svu/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
@@ -12,6 +11,8 @@ GPU_IDS=(0 1)
 # for hopper
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
 export FLASHINFER_USE_CUDA_NORM=1
+
+
 
 # The scheduler decides which GPUs this job gets and may name them by UUID
 # (GPU-xxxxxxxx-...), so GPU_IDS indexes into that list rather than assuming the
@@ -78,43 +79,18 @@ fi
 python benchmarks/bench_mmflash.py \
     --model-path Qwen/Qwen3.5-4B \
     --ports "${PORTS[@]}" \
-    --config-list 64,0 \
-    --benchmark-list ocrbench chartqa realworldqa mmstar \
+    --config-list 1,0 \
+    --benchmark-list chartqa:200 mmstar:200 mathvision:200 \
     --dtype bfloat16 \
     --chat-template-name qwen2-vl \
     --disable-thinking \
-    --temperature 0.7 \
-    --top-p 0.8 \
+    --temperature 1.0 \
+    --top-p 0.95 \
     --top-k 20 \
-    --max-tokens 16384 \
+    --max-tokens 32768 \
     --skip-launch-server \
     --save-generations \
-    --name qwen35-4B_ocrbench_chartqa_realworldqa_mmstar_concurrency128
+    --name origin_qwen35-4B_concurrency1
 
 
-# python benchmarks/bench_mmflash.py \
-#     --model-path Qwen/Qwen3.5-4B \
-#     --ports "${PORTS[@]}" \
-#     --config-list 64,0 \
-#     --benchmark-list mmstar \
-#     --dtype bfloat16 \
-#     --chat-template-name qwen2-vl \
-#     --disable-thinking \
-#     --temperature 0.7 \
-#     --top-p 0.8 \
-#     --top-k 20 \
-#     --max-tokens 16384 \
-#     --skip-launch-server
-
-# python benchmarks/bench_mmflash.py \
-#     --model-path Qwen/Qwen3.5-4B \
-#     --ports "${PORTS[@]}" \
-#     --config-list 64,0 \
-#     --benchmark-list mathvision \
-#     --dtype bfloat16 \
-#     --chat-template-name qwen2-vl \
-#     --temperature 1.0 \
-#     --top-p 0.95 \
-#     --top-k 20 \
-#     --max-tokens 16384 \
-#     --skip-launch-server
+pkill -f "sglang.launch_server"

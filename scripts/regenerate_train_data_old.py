@@ -6,7 +6,7 @@ Usage:
 1. Set up one or more SGLang servers for the target model.
 
 python3 -m sglang.launch_server \
-	--model Qwen/Qwen3.5-4B \
+	--model Qwen/Qwen3.5-35B-A3B \
 	--mem-fraction-static 0.7 \
 	--tp 1 \
 	--trust-remote-code \
@@ -19,33 +19,23 @@ python3 -m sglang.launch_server \
 
 2. Regenerate the dataset using the `regenerate_train_data.py` script.
 python scripts/regenerate_train_data.py \
-    --model Qwen/Qwen3.5-4B \
+    --model Qwen/Qwen3.5-35B-A3B \
     --concurrency 128 \
     --max-tokens 4096 \
     --server-address localhost:30000 localhost:30010 localhost:30020 localhost:30030 localhost:30040 localhost:30050 localhost:30060 localhost:30070 \
-    --temperature 0.7 \
-    --top-p 0.8 \
-    --top-k 20 \
-    --input-file-path /local_home1/fengsicheng/specforge/data/sharegpt4v_train.jsonl \
-    --output-file-path /local_home1/fengsicheng/specforge/regen_data/sharegpt4v_regen_first_turn.jsonl \
+    --temperature 0.8 \
+    --input-file-path /data/jiapingW/pr/SpecForge/cache/dataset/opc_train_first_turn.jsonl \
+    --output-file-path ./cache/dataset/opc_train_regen_first_turn.jsonl \
     --resume \
-    --reasoning disable
-
-Multimodal rows (produced by prepare_data_mm.py) carry a top-level `image`
-path and an `<image>` placeholder inside a user turn's text. Multimodal
-regeneration is restricted to Qwen3.5 chat/instruct checkpoints (see
-SUPPORTED_MM_MODELS below); "-Base" checkpoints are not chat-aligned and are
-rejected.
+    --reasoning save
 """
 
 import argparse
-import base64
 import json
-import mimetypes
 import os
 import random
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 from tqdm import tqdm
 
@@ -62,28 +52,75 @@ try:
 except ModuleNotFoundError:
     from conversation_validation import has_think_marker, validate_conversation
 
-IMAGE_PLACEHOLDER = "<image>"
 
-# Chat/Instruct Qwen3.5 checkpoints only. "-Base" checkpoints are not
-# chat-aligned and cannot reliably serve /v1/chat/completions requests.
-SUPPORTED_MM_MODELS = (
-    "Qwen/Qwen3.5-0.8B",
-    "Qwen/Qwen3.5-2B",
-    "Qwen/Qwen3.5-4B",
-    "Qwen/Qwen3.5-9B",
-    "Qwen/Qwen3.5-27B",
-    "Qwen/Qwen3.5-27B-FP8",
-    "Qwen/Qwen3.5-27B-GPTQ-Int4",
-    "Qwen/Qwen3.5-35B-A3B",
-    "Qwen/Qwen3.5-35B-A3B-FP8",
-    "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
-    "Qwen/Qwen3.5-122B-A10B",
-    "Qwen/Qwen3.5-122B-A10B-FP8",
-    "Qwen/Qwen3.5-122B-A10B-GPTQ-Int4",
-    "Qwen/Qwen3.5-397B-A17B",
-    "Qwen/Qwen3.5-397B-A17B-FP8",
-    "Qwen/Qwen3.5-397B-A17B-GPTQ-Int4",
+# The instruction the text benchmarks append to a math question, kept
+# character for character in sync with benchmarks/bench_text.py::COT_SUFFIX.
+# Regenerating math rows behind this wording is what keeps the draft model's
+# training prompts in the same distribution as its benchmark prompts.
+MATH_COT_SUFFIX = (
+    "\nPlease reason step by step, and put your final answer within \\boxed{}."
 )
+
+# Blend sources whose rows are math problems, matched against a row's "source"
+# field the same way scripts/prepare_data.py matches its --source handles: case
+# and punctuation are folded away, so "orcamath" still finds
+# "HuggingFaceH4/orca-math-word-problems-200k".
+DEFAULT_MATH_SOURCES = ("metamathqa", "orca-math-word-problems")
+
+
+def _normalize_source(name: str) -> str:
+    return "".join(character for character in name.lower() if character.isalnum())
+
+
+def is_math_source(source: Any, handles: Sequence[str]) -> bool:
+    """Whether a row's source field names one of the math subsets."""
+    if not isinstance(source, str):
+        return False
+    normalized = _normalize_source(source)
+    return any(_normalize_source(handle) in normalized for handle in handles)
+
+
+def apply_math_cot_prompt(data: Any, suffix: str, handles: Sequence[str]) -> bool:
+    """Append the benchmark's reasoning instruction to a math row's prompt.
+
+    Only the first user message is rewritten: the math subsets of a blend are
+    single-turn, and what matters is that the target model answers the exact
+    prompt the draft model will later be benchmarked on. Returns whether the
+    row was rewritten, and leaves an already-suffixed prompt alone so a resumed
+    or re-regenerated file never stacks the instruction twice.
+    """
+    if not suffix or not isinstance(data, dict):
+        return False
+    if not is_math_source(data.get("source"), handles):
+        return False
+
+    conversations = data.get("conversations")
+    if not isinstance(conversations, list):
+        return False
+    for message in conversations:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            return False
+        if content.rstrip().endswith(suffix.strip()):
+            return False
+        message["content"] = content.rstrip() + suffix
+        return True
+    return False
+
+
+def input_rows_carry_source(input_file_path: str) -> bool:
+    """Whether the first row of the input names its blend source."""
+    with open(input_file_path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                return isinstance(json.loads(line).get("source"), str)
+            except (json.JSONDecodeError, AttributeError):
+                return False
+    return False
 
 
 def validate_regen_input(data: Any) -> str | None:
@@ -91,26 +128,10 @@ def validate_regen_input(data: Any) -> str | None:
     if not isinstance(data, dict):
         return "Expected a JSON object"
 
-    conversation_error = validate_conversation(
+    return validate_conversation(
         data.get("conversations"),
         error_style="regeneration",
     )
-    if conversation_error is not None:
-        return conversation_error
-
-    image_path = data.get("image")
-    if image_path is not None:
-        if not isinstance(image_path, str) or not os.path.isfile(image_path):
-            return f"Image file not found: {image_path!r}"
-        has_placeholder = any(
-            isinstance(message.get("content"), str)
-            and IMAGE_PLACEHOLDER in message["content"]
-            for message in data["conversations"]
-        )
-        if not has_placeholder:
-            return "Row has an `image` field but no `<image>` placeholder in conversations"
-
-    return None
 
 
 def set_skipped(data: Any, error: str) -> Dict[str, Any]:
@@ -124,22 +145,6 @@ def set_skipped(data: Any, error: str) -> Dict[str, Any]:
 def count_lines(path: str) -> int:
     with open(path, encoding="utf-8") as handle:
         return sum(1 for _ in handle)
-
-
-def input_has_image_field(path: str) -> bool:
-    """Peek the first non-empty row to decide whether this input is
-    multimodal. A single preparation run produces a homogeneous file (either
-    every row carries an `image` field or none do), so checking the first
-    row is sufficient without scanning the whole file.
-    """
-    with open(path, encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            data = json.loads(line)
-            return isinstance(data, dict) and "image" in data
-    return False
 
 
 def parse_arguments():
@@ -228,6 +233,37 @@ def parse_arguments():
         help="Resume from existing output file, skip already processed samples",
     )
 
+    # math prompt alignment
+    math_prompt_group = parser.add_argument_group("math prompt alignment")
+    math_prompt_group.add_argument(
+        "--math-cot-suffix",
+        type=str,
+        default=MATH_COT_SUFFIX,
+        help=(
+            "Instruction appended to the prompt of every math row, so the "
+            "regenerated answer is produced under the same wording the "
+            "benchmarks use (default: the gsm8k/math500/aime suffix). Rows are "
+            "recognised by their 'source' field, which only a blend prepared by "
+            "scripts/prepare_data.py carries; every other input is untouched"
+        ),
+    )
+    math_prompt_group.add_argument(
+        "--no-math-cot-suffix",
+        action="store_true",
+        help="Regenerate math rows against their original, unmodified prompt",
+    )
+    math_prompt_group.add_argument(
+        "--math-source",
+        type=str,
+        nargs="+",
+        default=list(DEFAULT_MATH_SOURCES),
+        help=(
+            "Source handles treated as math, matched case- and "
+            "punctuation-insensitively against a row's source field "
+            f"(default: {' '.join(DEFAULT_MATH_SOURCES)})"
+        ),
+    )
+
     # sglang server
     server_group = parser.add_argument_group("sglang server")
     server_group.add_argument(
@@ -272,50 +308,7 @@ def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
     return length
 
 
-def _image_to_data_url(image_path: str) -> str:
-    """Read a local image file and encode it as an OpenAI-style data URL."""
-    mime_type, _ = mimetypes.guess_type(image_path)
-    if mime_type is None:
-        mime_type = "image/jpeg"
-    with open(image_path, "rb") as handle:
-        encoded = base64.b64encode(handle.read()).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
-
-
-def to_multimodal_messages(
-    messages: List[Dict[str, Any]], image_data_url: str
-) -> List[Dict[str, Any]]:
-    """Return a copy of ``messages`` with the first `<image>` placeholder
-    replaced by an OpenAI-style image content part.
-
-    The stored message list (plain-string content with the placeholder
-    intact) is left untouched; this copy exists only to be sent over the
-    wire, so every regenerated row keeps writing the placeholder back to
-    disk.
-    """
-    converted = []
-    image_injected = False
-    for message in messages:
-        content = message.get("content")
-        if (
-            not image_injected
-            and isinstance(content, str)
-            and IMAGE_PLACEHOLDER in content
-        ):
-            text = content.replace(IMAGE_PLACEHOLDER, "").strip()
-            converted_message = dict(message)
-            converted_message["content"] = [
-                {"type": "image_url", "image_url": {"url": image_data_url}},
-                {"type": "text", "text": text},
-            ]
-            converted.append(converted_message)
-            image_injected = True
-        else:
-            converted.append(message)
-    return converted
-
-
-def build_query_kwargs(args, messages, max_tokens=None, image_data_url=None):
+def build_query_kwargs(args, messages, max_tokens=None):
     effective_max_tokens = max_tokens if max_tokens is not None else args.max_tokens
 
     query_messages = messages
@@ -326,9 +319,6 @@ def build_query_kwargs(args, messages, max_tokens=None, image_data_url=None):
             if query_message.get("role") == "assistant":
                 query_message.pop("reasoning_content", None)
             query_messages.append(query_message)
-
-    if image_data_url is not None:
-        query_messages = to_multimodal_messages(query_messages, image_data_url)
 
     query_kwargs = dict(
         model=args.model,
@@ -372,9 +362,6 @@ def call_sglang(
     messages = data["conversations"]
     regenerated_messages = []
 
-    image_path = data.get("image")
-    image_data_url = _image_to_data_url(image_path) if image_path is not None else None
-
     # ignore data which starts with an assistant message
     if messages[0]["role"] == "assistant":
         data["status"] = "error"
@@ -389,9 +376,7 @@ def call_sglang(
         elif message["role"] == "user":
             regenerated_messages.append(message)
 
-            query_kwargs = build_query_kwargs(
-                args, regenerated_messages, max_tokens, image_data_url=image_data_url
-            )
+            query_kwargs = build_query_kwargs(args, regenerated_messages, max_tokens)
 
             try:
                 resp = client.chat.completions.create(**query_kwargs)
@@ -462,14 +447,6 @@ def main():
     if args.max_tokens <= 0:
         raise ValueError("Max tokens must be greater than 0")
 
-    if input_has_image_field(args.input_file_path) and args.model not in SUPPORTED_MM_MODELS:
-        raise ValueError(
-            f"Input file {args.input_file_path!r} contains multimodal rows "
-            f"(an `image` field), but --model {args.model!r} is not a "
-            "supported Qwen3.5 chat/instruct checkpoint. Supported models: "
-            f"{', '.join(SUPPORTED_MM_MODELS)}"
-        )
-
     print(f"Configuration:")
     print(f"  Model path: {args.model}")
     print(f"  Max tokens: {args.max_tokens}")
@@ -479,6 +456,19 @@ def main():
     print(f"  Input file: {args.input_file_path}")
     print(f"  Output file: {args.output_file_path}")
     print(f"  Resume mode: {args.resume}")
+    math_cot_suffix = "" if args.no_math_cot_suffix else args.math_cot_suffix
+    if math_cot_suffix:
+        print(f"  Math sources: {args.math_source}")
+        print(f"  Math prompt suffix: {math_cot_suffix.strip()!r}")
+        if not input_rows_carry_source(args.input_file_path):
+            print(
+                "  WARNING: the input rows have no 'source' field, so no math "
+                "prompt will be aligned. Rebuild the input with "
+                "`python scripts/prepare_data.py --dataset perfectblend "
+                "... --overwrite`, or pass --no-math-cot-suffix to silence this."
+            )
+    else:
+        print("  Math prompt suffix: disabled")
     print("-" * 50)
     total_lines = count_lines(args.input_file_path)
 
@@ -546,6 +536,7 @@ def main():
     error_samples = 0
     skipped_samples = 0
     submitted_samples = 0
+    math_prompted_samples = 0
 
     # Create progress bar
     with (
@@ -583,6 +574,9 @@ def main():
                 skipped_samples += 1
                 pbar.update(1)
                 continue
+
+            if apply_math_cot_prompt(data, math_cot_suffix, args.math_source):
+                math_prompted_samples += 1
 
             # find server address with the least waiting requests
             server_address = valid_server_addresses[start_server_index]
@@ -677,6 +671,12 @@ def main():
         print(f"Average context length: {avg_len:.2f}")
     else:
         print("No successful examples to compute context length statistics.")
+
+    if math_cot_suffix:
+        print(
+            "Math rows regenerated under the benchmark prompt: "
+            f"{math_prompted_samples}"
+        )
 
     total_processed = success_samples + error_samples + skipped_samples
     if skip_lines > 0:

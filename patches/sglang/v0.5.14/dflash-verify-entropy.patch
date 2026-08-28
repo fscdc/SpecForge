@@ -1,0 +1,154 @@
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -1,5 +1,7 @@
++import json
+ import logging
+ import math
++import os
+ from copy import deepcopy
+ from typing import List, Optional
+ 
+@@ -47,6 +49,92 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++class DFlashVerifyEntropyRecorder:
++    """Record the target's per-position entropy at DFlash verify time.
++
++    The entropy at a committed position is by construction the same one plain
++    autoregressive decoding would produce for that prefix — speculative decoding
++    is distribution-preserving. What only exists here is the alignment: which
++    position the draft got wrong, and how uncertain the target was exactly
++    there. Positions past the first rejection are conditioned on draft tokens
++    the target rejected, so they are recorded under ``discarded`` and must not
++    be mixed into a "what does the model's output distribution look like" study.
++
++    Off unless ``SGLANG_DFLASH_ENTROPY_DUMP`` names a file. Each verify step
++    appends one JSON object per request; the file is opened per process (pid in
++    the name) so tensor-parallel ranks never interleave writes.
++    """
++
++    ENV_VAR = "SGLANG_DFLASH_ENTROPY_DUMP"
++
++    def __init__(self, path: str):
++        base, ext = os.path.splitext(path)
++        self.path = f"{base}.pid{os.getpid()}{ext or '.jsonl'}"
++        self._handle = None
++        self._step = 0
++        logger.info("DFLASH verify-entropy recording to %s", self.path)
++
++    @classmethod
++    def maybe_create(cls) -> Optional["DFlashVerifyEntropyRecorder"]:
++        path = os.environ.get(cls.ENV_VAR, "").strip()
++        return cls(path) if path else None
++
++    @staticmethod
++    def compute(next_token_logits: torch.Tensor) -> torch.Tensor:
++        """Exact entropy in nats of every row of ``[n, vocab]`` logits.
++
++        Uses logsumexp rather than a materialized log_softmax so the peak extra
++        memory is one probability tensor instead of two, which matters because
++        the verify logits are ``[bs * block_size, vocab]``.
++        """
++        logits = next_token_logits.float()
++        log_z = torch.logsumexp(logits, dim=-1)
++        probs = torch.softmax(logits, dim=-1)
++        # H = log Z - E_p[logit]
++        return log_z - (probs * logits).sum(dim=-1)
++
++    def record(
++        self,
++        *,
++        reqs,
++        entropy,
++        accept_len,
++        block_size: int,
++        draft_tokens=None,
++        target_top1=None,
++    ) -> None:
++        """Append one record per request for this verify step."""
++        try:
++            if self._handle is None:
++                self._handle = open(self.path, "a", buffering=1)
++            entropy = entropy.view(-1, block_size).tolist()
++            accepted = accept_len.tolist()
++            drafted = draft_tokens.tolist() if draft_tokens is not None else None
++            predicted = target_top1.tolist() if target_top1 is not None else None
++            for i, req in enumerate(reqs):
++                row = {
++                    "rid": getattr(req, "rid", None),
++                    "step": self._step,
++                    "block_size": block_size,
++                    # tokens the target confirmed; position accept_len is the one
++                    # it rejected (or the block ran out), and everything after it
++                    # is conditioned on a prefix the target threw away
++                    "accept_len": int(accepted[i]),
++                    "entropy": [round(v, 5) for v in entropy[i]],
++                }
++                if drafted is not None:
++                    row["draft_tokens"] = drafted[i]
++                if predicted is not None:
++                    row["target_top1"] = predicted[i]
++                self._handle.write(json.dumps(row) + "\n")
++            self._step += 1
++        except Exception as error:  # never let diagnostics break serving
++            logger.warning("DFLASH verify-entropy recording disabled: %s", error)
++            self._handle = None
++            self.record = lambda **_kwargs: None
++
++
+ _FusedKVMaterializeHelper = None
+ 
+ 
+@@ -246,6 +334,8 @@
+         supports_gpu_triton = is_cuda() or is_hip()
+         self._use_triton_prepare_block = supports_gpu_triton
+         self._use_triton_accept_bonus = supports_gpu_triton
++        # None unless SGLANG_DFLASH_ENTROPY_DUMP is set; see the recorder
++        self._verify_entropy_recorder = DFlashVerifyEntropyRecorder.maybe_create()
+         self._accept_bonus_buffer_cap: int = 0
+         self._accept_bonus_buffer_slot: int = 0
+         self._accept_len_buf: Optional[torch.Tensor] = None
+@@ -1546,6 +1636,15 @@
+         logits_output = target_out.logits_output
+         can_run_cuda_graph = target_out.can_run_cuda_graph
+ 
++        # Diagnostics: the target's own uncertainty at each of the block_size
++        # positions it just verified. Taken before the adjustments below, which
++        # rewrite the logits in place for temperature and penalties.
++        verify_entropy = None
++        if self._verify_entropy_recorder is not None:
++            verify_entropy = DFlashVerifyEntropyRecorder.compute(
++                logits_output.next_token_logits
++            )
++
+         if sampling_info is not None:
+             apply_dflash_verify_logits_adjustments(
+                 next_token_logits=logits_output.next_token_logits,
+@@ -1555,6 +1654,7 @@
+ 
+         candidates = draft_tokens
+         new_seq_lens = None
++        target_predict = None
+         if (
+             sampling_info is not None
+             and not sampling_info.is_all_greedy
+@@ -1638,6 +1738,17 @@
+                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                 )
+ 
++        if verify_entropy is not None:
++            self._verify_entropy_recorder.record(
++                reqs=model_worker_batch.reqs,
++                entropy=verify_entropy,
++                accept_len=accept_len,
++                block_size=int(self.block_size),
++                draft_tokens=candidates,
++                # only the greedy path materializes the target's argmax
++                target_top1=target_predict,
++            )
++
+         if need_mamba_verify_commit:
+             assert seq_lens_pre_verify is not None
+             self._update_target_mamba_state_after_verify(

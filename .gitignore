@@ -202,3 +202,7 @@ wandb/
 
 pytorch.*
 results/
+results_*
+
+stderr.*
+stdout.*

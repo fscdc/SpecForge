@@ -7,6 +7,7 @@ from specforge.algorithms.common.defaults import (
     one_loss_token,
     online_needs_input_tools,
 )
+from specforge.algorithms.common.mm_server_input import build_image_input_adapter
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
@@ -156,6 +157,16 @@ def algorithm_spec() -> AlgorithmSpec:
                 allowed_target_representations={"hidden_state"},
                 default_target_representation="hidden_state",
             ),
+            # Image capture yields the same algorithm-ready tensors: the target's
+            # image tokens are expanded into input_ids before capture, so the
+            # trainer still consumes plain per-token features.
+            FeatureContract(
+                mode=FeatureMode.STREAMING,
+                modality="image",
+                required_tensors=required,
+                allowed_target_representations={"hidden_state"},
+                default_target_representation="hidden_state",
+            ),
         ),
         capabilities=AlgorithmCapabilities(
             attention_backends={"sdpa", "flex_attention", "fa", "usp"},
@@ -226,6 +237,24 @@ def algorithm_providers() -> AlgorithmProviders:
                     attention_mask_feature="attention_mask",
                 ),
                 build_collator=build_server_collator,
+            ),
+            # Image modality: same capture layout as text, but prompt building and
+            # request construction are owned by the multimodal input adapter.
+            ServerStreamingProvider(
+                modality="image",
+                capture_method="eagle3",
+                target_representation="hidden_state",
+                layout=ServerCaptureLayout(
+                    aux_feature="hidden_state",
+                    last_hidden_feature="target",
+                    passthrough=(
+                        ("input_ids", "input_ids", ()),
+                        ("loss_mask", "loss_mask", ()),
+                    ),
+                    attention_mask_feature="attention_mask",
+                ),
+                build_collator=build_server_collator,
+                build_input_adapter=build_image_input_adapter,
             ),
         ),
         vocab_mapping_modes=frozenset({FeatureMode.OFFLINE, FeatureMode.STREAMING}),

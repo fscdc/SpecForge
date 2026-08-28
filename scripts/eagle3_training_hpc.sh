@@ -17,10 +17,10 @@ export TRITON_CACHE_DIR="/tmp/${USER}_triton"
 export TORCHINDUCTOR_CACHE_DIR="/tmp/${USER}_inductor"
 mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
 
-# rm -rf /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-sharegpt4v/control
-# rm -rf /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-sharegpt4v/consumer-state
+rm -rf /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-eagle3-sharegpt4v/control
+rm -rf /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-eagle3-sharegpt4v/consumer-state
 
-specforge train --config scripts/mmtraining_configs/qwen3.5-4b-mmflash_hpc.yaml
+specforge train --config scripts/mmtraining_configs/qwen3.5-4b-eagle3_hpc.yaml
 
 
 # 跑之前check一下

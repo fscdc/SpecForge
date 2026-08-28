@@ -45,6 +45,8 @@ OPC_SUBSETS = (
     "realuser_instruct",
 )
 
+SOURCE_COLUMN = "source"
+
 ROLE_MAPPING = {
     "human": "user",
     "gpt": "assistant",
@@ -86,13 +88,54 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--split-eval",
         action="store_true",
-        help="Write a deterministic 5% evaluation split.",
+        help="Write a deterministic 5%% evaluation split.",
     )
     parser.add_argument(
         "--opc-subset",
         choices=(*OPC_SUBSETS, "all"),
         default=OPC_SUBSETS[0],
         help="OpenCoder opc-sft-stage1 subset, or all supported subsets.",
+    )
+    parser.add_argument(
+        "--source",
+        action="append",
+        metavar="NAME[=COUNT]",
+        help=(
+            "Keep only this source of a blended dataset, optionally capped at "
+            "COUNT randomly drawn rows (omit COUNT, or use 'all', to keep every "
+            "row of it). Repeat the flag to build a mixture, e.g. "
+            "--source metamathqa=50000 --source ultrainteract=30000. NAME is "
+            "matched case- and punctuation-insensitively against the dataset's "
+            "source column, so 'metamathqa' finds 'meta-math/MetaMathQA'. Use "
+            "--list-sources to see what a preset actually contains."
+        ),
+    )
+    parser.add_argument(
+        "--list-sources",
+        action="store_true",
+        help="Print the source column's values and row counts, then exit.",
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=42,
+        help="Seed for the per-source random draw (default: 42).",
+    )
+    parser.add_argument(
+        "--output-name",
+        help=(
+            "Base name for the output files instead of the preset name, so "
+            "several source mixtures can live side by side as "
+            "<name>_train.jsonl."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Rewrite the output even if it exists. Without it an existing file "
+            "is kept, which silently ignores a changed --source mixture."
+        ),
     )
     return parser
 
@@ -108,6 +151,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error("--data-path must point to a .json or .jsonl file")
     if args.sample_size is not None and args.sample_size <= 0:
         parser.error("--sample-size must be greater than zero")
+    if args.source:
+        try:
+            parse_source_specs(args.source)
+        except ValueError as error:
+            parser.error(str(error))
 
     return args
 
@@ -176,6 +224,22 @@ def process_sharegpt_row(
         "id": str(row["id"]),
         "conversations": conversations,
     }, skipped_count
+
+
+def process_perfectblend_row(
+    row: Mapping[str, Any], dataset_name: str | None = None
+) -> ProcessedRow:
+    """Convert a blend row, keeping the source column the plain path drops.
+
+    scripts/regenerate_train_data.py reads the source back to decide which rows
+    are math and therefore need the benchmark's prompt wording; without it a
+    prepared blend is indistinguishable from any other ShareGPT file.
+    """
+    processed, skipped_count = process_sharegpt_row(row, dataset_name)
+    source = row.get(SOURCE_COLUMN)
+    if processed is not None and source is not None:
+        processed[SOURCE_COLUMN] = source
+    return processed, skipped_count
 
 
 def process_nebius_infinity_instruct(
@@ -328,6 +392,108 @@ def _identity_row(
     return dict(row), 0
 
 
+def _normalize_source(name: str) -> str:
+    """Fold a source name to letters and digits, so short handles still match.
+
+    ``meta-math/MetaMathQA`` becomes ``metamathmetamathqa``, which contains the
+    handle ``metamathqa``; without the fold a user would have to type the exact
+    Hugging Face path, punctuation included.
+    """
+    return "".join(character for character in name.lower() if character.isalnum())
+
+
+def parse_source_specs(specs: Sequence[str]) -> list[tuple[str, int | None]]:
+    """Turn ``["metamathqa=50000", "ultrainteract"]`` into (name, count) pairs.
+
+    A missing count, or the literal ``all``, means "every row of that source".
+    Raises ValueError on anything malformed so the CLI can report it.
+    """
+    parsed: list[tuple[str, int | None]] = []
+    for spec in specs:
+        name, separator, raw_count = spec.partition("=")
+        name = name.strip()
+        if not name:
+            raise ValueError(f"--source {spec!r} is missing a source name")
+        if not separator or raw_count.strip().lower() == "all":
+            parsed.append((name, None))
+            continue
+        try:
+            count = int(raw_count)
+        except ValueError:
+            raise ValueError(
+                f"--source {spec!r}: COUNT must be an integer or 'all'"
+            ) from None
+        if count <= 0:
+            raise ValueError(f"--source {spec!r}: COUNT must be greater than zero")
+        parsed.append((name, count))
+    return parsed
+
+
+def source_counts(dataset: Any) -> dict[str, int]:
+    """Row count per value of the source column, read as a column not row by row."""
+    if SOURCE_COLUMN not in getattr(dataset, "column_names", []):
+        raise ValueError(
+            f"this dataset has no {SOURCE_COLUMN!r} column, so it cannot be "
+            "split by source"
+        )
+    counts: dict[str, int] = {}
+    for value in dataset[SOURCE_COLUMN]:
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def _resolve_source(name: str, available: Iterable[str]) -> str:
+    """Map one user-supplied handle onto exactly one real source value."""
+    wanted = _normalize_source(name)
+    matches = [value for value in available if wanted in _normalize_source(value)]
+    if len(matches) == 1:
+        return matches[0]
+    listing = ", ".join(sorted(available))
+    if not matches:
+        raise ValueError(f"--source {name!r} matches none of: {listing}")
+    raise ValueError(
+        f"--source {name!r} is ambiguous, it matches {sorted(matches)}; "
+        f"use a longer handle. Available: {listing}"
+    )
+
+
+def select_sources(
+    dataset: Any,
+    specs: Sequence[tuple[str, int | None]],
+    *,
+    seed: int = 42,
+) -> Any:
+    """Keep the requested sources, each capped at its own random sample.
+
+    Row indices are gathered from the source column and sampled per source, so
+    a blend of a few tens of thousands of rows never materializes the whole
+    dataset. The kept indices are returned in dataset order, which keeps the
+    output reproducible for a given seed.
+    """
+    counts = source_counts(dataset)
+    column = dataset[SOURCE_COLUMN]
+    rng = random.Random(seed)
+
+    indices: list[int] = []
+    for name, limit in specs:
+        resolved = _resolve_source(name, counts)
+        available = [i for i, value in enumerate(column) if value == resolved]
+        if limit is None or limit >= len(available):
+            if limit is not None and limit > len(available):
+                print(
+                    f"  {resolved}: asked for {limit}, only {len(available)} "
+                    "rows exist; keeping all of them"
+                )
+            chosen = available
+        else:
+            chosen = rng.sample(available, limit)
+        print(f"  {resolved}: {len(chosen)} of {len(available)} rows")
+        indices.extend(chosen)
+
+    indices.sort()
+    return dataset.select(indices)
+
+
 def add_index(row: Mapping[str, Any], index: int) -> dict[str, Any]:
     indexed = dict(row)
     indexed["id"] = index
@@ -386,7 +552,7 @@ def load_dataset_preset(
     if dataset_name == "perfectblend":
         return (
             _indexed(_train_split("mlabonne/open-perfectblend")),
-            process_sharegpt_row,
+            process_perfectblend_row,
         )
 
     regenerated_presets = {
@@ -523,11 +689,15 @@ def process_and_save_dataset(
     dataset_name: str,
     *,
     eval_dataset: Iterable[Mapping[str, Any]] | None = None,
+    overwrite: bool = False,
 ) -> Path:
     output_directory.mkdir(parents=True, exist_ok=True)
     train_output_path = output_directory / f"{dataset_name}_train.jsonl"
-    if train_output_path.exists():
-        print(f"Dataset already exists at {train_output_path}; skipping conversion.")
+    if train_output_path.exists() and not overwrite:
+        print(
+            f"Dataset already exists at {train_output_path}; skipping conversion "
+            "(pass --overwrite to rebuild it, e.g. after changing --source)."
+        )
         return train_output_path
 
     skipped_messages = _write_split(
@@ -579,6 +749,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         opc_subset=args.opc_subset,
     )
 
+    if args.list_sources:
+        counts = source_counts(dataset)
+        total = sum(counts.values())
+        print(f"{args.dataset} sources ({total} rows):")
+        for name, count in sorted(counts.items(), key=lambda item: -item[1]):
+            print(f"  {count:>9}  {100 * count / total:5.1f}%  {name}")
+        return
+
+    if args.source:
+        print(f"Selecting sources from {args.dataset} (seed {args.sample_seed}):")
+        dataset = select_sources(
+            dataset,
+            parse_source_specs(args.source),
+            seed=args.sample_seed,
+        )
+        print(f"Kept {len(dataset)} rows in total.")
+
     if args.sample_size is not None and args.sample_size < len(dataset):
         dataset = dataset.select(range(args.sample_size))
         print(f"Processing {args.sample_size} samples from {args.dataset}.")
@@ -593,8 +780,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         dataset,
         args.output_path,
         processor,
-        args.dataset,
+        args.output_name or args.dataset,
         eval_dataset=eval_dataset,
+        overwrite=args.overwrite,
     )
 
 

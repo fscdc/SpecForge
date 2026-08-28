@@ -19,7 +19,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 from benchmarker.base import Benchmarker
-from benchmarker.utils import compute_metrics
+from benchmarker.utils import (
+    compute_metrics,
+    per_sample_entropy_stats,
+    per_sample_spec_stats,
+)
 from sglang import set_default_backend
 from sglang.global_config import global_config
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
@@ -144,6 +148,7 @@ class MMBenchmarker(Benchmarker):
         sampling_params: Optional[Dict[str, Any]] = None,
         assistant_prefix: Optional[str] = None,
         chat_template_name: Optional[str] = None,
+        top_logprobs_num: Optional[int] = None,
     ):
         """
         Run the benchmark evaluation.
@@ -169,6 +174,10 @@ class MMBenchmarker(Benchmarker):
                 prompts, e.g. "qwen2-vl". SGLang guesses it from the model path
                 when not given, and falls back to a generic USER:/ASSISTANT:
                 template it cannot, which is wrong for most VL models.
+            top_logprobs_num (int): Ask the server for this many top logprobs per
+                generated token, which is what the target-model entropy is
+                computed from. None (the default) leaves logprobs off. DFlash
+                rejects `return_logprob`, so this only works on a target-only run.
         """
         ports = [port] if isinstance(port, int) else list(port)
         assert len(ports) > 0, "at least one port is required"
@@ -196,6 +205,9 @@ class MMBenchmarker(Benchmarker):
         if len(questions) == 0:
             print("No valid questions found. Please check the dataset format.")
             return
+        # kept so that a per-sample report can say which question produced a
+        # given accept length, not just its index
+        self.questions = questions
 
         # Create SGL function
         sgl_function = self.create_sgl_function()
@@ -220,6 +232,18 @@ class MMBenchmarker(Benchmarker):
             }
         )
 
+        # run_batch declares these, and _resolve_sampling_params lets every gen()
+        # inherit them, so no per-benchmark SGL function has to be touched
+        logprob_params = {}
+        if top_logprobs_num:
+            logprob_params = {
+                "return_logprob": True,
+                "top_logprobs_num": int(top_logprobs_num),
+                # the generated tokens are what the entropy is about; leaving the
+                # start len unset keeps the prompt's logprobs out of the response
+                "return_text_in_logprobs": False,
+            }
+
         for _ in range(num_runs):
             tic = time.perf_counter()
             states = sgl_function.run_batch(
@@ -227,6 +251,7 @@ class MMBenchmarker(Benchmarker):
                 max_new_tokens=self.get_max_new_tokens(),
                 num_threads=batch_size,
                 progress_bar=True,
+                **logprob_params,
                 **sampling_params,
             )
             latency = time.perf_counter() - tic
@@ -280,13 +305,27 @@ class MMBenchmarker(Benchmarker):
                     )
 
         # Compute performance metrics
+        additional_answer_keys = (
+            answer_keys[1:] if answer_keys and len(answer_keys) > 1 else None
+        )
         metrics = compute_metrics(
             states,
             latency,
             answer_key=primary_answer_key,
-            additional_answer_keys=(
-                answer_keys[1:] if answer_keys and len(answer_keys) > 1 else None
-            ),
+            additional_answer_keys=additional_answer_keys,
+        )
+        # the same numbers before they are averaged away: the run-level accept
+        # length hides which questions the draft did well or badly on
+        self.per_sample_stats = per_sample_spec_stats(
+            states,
+            answer_key=primary_answer_key,
+            additional_answer_keys=additional_answer_keys,
+        )
+        # target-model next-token entropy; empty unless the run asked for logprobs
+        self.per_sample_entropy, self.token_entropy_series = per_sample_entropy_stats(
+            states,
+            answer_key=primary_answer_key,
+            additional_answer_keys=additional_answer_keys,
         )
         if has_labels_list:
             metrics.accuracy = accuracy
@@ -354,6 +393,11 @@ class MMBenchmarker(Benchmarker):
         One object per question, with the raw generation, the answer that was
         extracted from it and the reference. This is what tells a model that got
         the question wrong apart from an answer the parsing failed to read.
+
+        The prompt (image path included) and the per-sample decoding stats
+        (accept length, verify count, finish reason) travel in the same record,
+        so this file alone is enough to ask what a low accept length correlates
+        with.
         """
         generations = getattr(self, "generations", None)
         if not generations:
@@ -365,6 +409,21 @@ class MMBenchmarker(Benchmarker):
         # expose what it actually compared, and whether it counted
         parsed = getattr(self, "parsed_answers", None) or []
         hits = getattr(self, "hits", None) or []
+        questions = getattr(self, "questions", None) or []
+        stats = getattr(self, "per_sample_stats", None) or []
+        entropy_stats = getattr(self, "per_sample_entropy", None) or []
+        entropy_series = getattr(self, "token_entropy_series", None) or []
+        # per-index side channels a benchmark may keep, e.g. the MMStar taxonomy.
+        # Stored under the singular name, which is what one record is about.
+        side_lists = {
+            key: values
+            for attribute, key in (
+                ("categories", "category"),
+                ("l2_categories", "l2_category"),
+            )
+            for values in [getattr(self, attribute, None)]
+            if isinstance(values, list) and len(values) == len(generations)
+        }
 
         with open(path, "w") as handle:
             for index, generation in enumerate(generations):
@@ -380,6 +439,42 @@ class MMBenchmarker(Benchmarker):
                     record["parsed"] = parsed[index]
                 if index < len(hits):
                     record["score"] = hits[index]
+                if index < len(questions):
+                    question = questions[index]
+                    if isinstance(question, dict):
+                        record.update(
+                            {
+                                key: value
+                                for key, value in question.items()
+                                if key not in record
+                            }
+                        )
+                    else:
+                        record["question"] = question
+                for name, values in side_lists.items():
+                    record[name] = values[index]
+                if index < len(stats):
+                    record.update(
+                        {
+                            key: value
+                            for key, value in stats[index].items()
+                            if key != "index"
+                        }
+                    )
+                if index < len(entropy_stats) and entropy_stats[index].get("n_tokens"):
+                    record.update(
+                        {
+                            key: value
+                            for key, value in entropy_stats[index].items()
+                            if key != "index"
+                        }
+                    )
+                    # the raw series is what a position-resolved study needs, and
+                    # this file is the only place big enough to keep it
+                    if index < len(entropy_series):
+                        record["token_entropy"] = [
+                            round(value, 4) for value in entropy_series[index]
+                        ]
                 handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         return len(generations)
 

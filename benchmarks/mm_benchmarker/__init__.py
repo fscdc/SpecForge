@@ -2,7 +2,7 @@
 Multimodal benchmark implementations for speculative decoding evaluation.
 
 Each benchmark lives in its own module and registers itself with `MM_BENCHMARKS`,
-so that `bench_mmflash.py` can look it up by name:
+so that `bench_mm.py` can look it up by name:
 
 ```python
 # mm_benchmarker/mmstar.py
@@ -28,6 +28,7 @@ from .ocrbench import OCRBenchBenchmarker
 from .realworldqa import RealWorldQABenchmarker
 from .registry import MM_BENCHMARKS
 from .simplevqa import SimpleVQABenchmarker
+from .vdc import VDCBenchmarker
 
 __all__ = [
     "MM_BENCHMARKS",
@@ -38,4 +39,5 @@ __all__ = [
     "OCRBenchBenchmarker",
     "RealWorldQABenchmarker",
     "SimpleVQABenchmarker",
+    "VDCBenchmarker",
 ]

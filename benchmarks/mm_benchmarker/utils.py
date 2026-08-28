@@ -158,6 +158,38 @@ def extract_mcq_answer(response: str, choices: Optional[List[str]] = None) -> st
     return candidates[0][0]
 
 
+# One instruction for every benchmark that asks for a worked answer, so the
+# generations stay comparable across tasks and the box is always what scoring
+# reads. Kept verbatim from the MathVision task, which is where it comes from.
+STEP_BY_STEP_BOXED_PROMPT = (
+    'Please solve the problem step by step and put your answer in one "\\boxed{}".'
+)
+
+
+def extract_boxed(response: str) -> Optional[str]:
+    """
+    The content of the last ``\\boxed{...}``, or None when there is none.
+
+    Matched on "oxed{" so that a single- and a double-escaped backslash both
+    hit, and closed by brace counting so that a boxed ``\\frac{1}{2}`` survives.
+    A generation truncated inside its box yields what it had written so far.
+    """
+    start = response.rfind("oxed{")
+    if start == -1:
+        return None
+    depth = 1
+    collected = []
+    for char in response[start + len("oxed{") :]:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        collected.append(char)
+    return "".join(collected).strip() or None
+
+
 def extract_choice(
     response: str, choices: Tuple[str, ...] = CHOICES
 ) -> Optional[str]:

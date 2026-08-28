@@ -32,7 +32,12 @@ from datasets import load_dataset
 
 from .base import MMBenchmarker
 from .registry import MM_BENCHMARKS
-from .utils import CHOICES, create_image_sgl_function, extract_choice
+from .utils import (
+    CHOICES,
+    STEP_BY_STEP_BOXED_PROMPT,
+    create_image_sgl_function,
+    extract_choice,
+)
 
 # "default" is what we run: it asks for the reasoning before the answer and
 # pins the answer down to a \boxed{}, which the extraction reads first.
@@ -41,10 +46,9 @@ from .utils import CHOICES, create_image_sgl_function, extract_choice
 PROMPT_VARIANTS = {
     "default": {
         "pre_prompt": "",
-        "post_prompt": (
-            "\nAnswer with an explanation, then put the letter of the correct "
-            "option in \\boxed{}."
-        ),
+        # the shared instruction, so every benchmark asks for the same shape of
+        # answer; extract_choice() reads the letter back out of the box
+        "post_prompt": "\n" + STEP_BY_STEP_BOXED_PROMPT,
     },
     "lmms_eval": {
         "pre_prompt": "",

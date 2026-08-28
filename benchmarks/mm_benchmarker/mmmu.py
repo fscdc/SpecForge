@@ -28,21 +28,22 @@ from datasets import load_dataset
 
 from .base import MMBenchmarker
 from .registry import MM_BENCHMARKS
-from .utils import create_interleaved_sgl_function
+from .utils import (
+    STEP_BY_STEP_BOXED_PROMPT,
+    create_interleaved_sgl_function,
+    extract_boxed,
+)
 
 # Prompt formats of the MMMU repository, as used by the lm-eval task, with the
-# answer-directly instruction replaced by an explanation plus a \boxed{}. The
+# answer-directly instruction replaced by the shared step-by-step box. The
 # scoring reads the box first (see `extract_boxed`), and only falls back to the
 # repository's own parsers when a generation carries none.
-MULTI_CHOICE_EXAMPLE_FORMAT = """{}
+# The instruction is appended after formatting, not concatenated into these:
+# it contains a literal "\\boxed{}", which str.format would read as a
+# placeholder.
+MULTI_CHOICE_EXAMPLE_FORMAT = "{}\n\n{}\n\n"
 
-{}
-
-Answer with an explanation, then put the letter of the correct option in \\boxed{{}}."""
-
-SHORT_ANS_EXAMPLE_FORMAT = """{}
-
-Answer with an explanation, then put your final answer in \\boxed{{}}."""
+SHORT_ANS_EXAMPLE_FORMAT = "{}\n\n"
 
 START_CHR = "A"
 OPTION_LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H", "I"]
@@ -98,8 +99,11 @@ def build_prompt(question: str, question_type: str, options: str) -> str:
             # add (A) {choice1}\n , (B) {choice2}\n , and so on
             choices_str += f"\n({chr(ord(START_CHR) + i)}) {choice}"
         # remove the extraneous prepended \n that we added
-        return MULTI_CHOICE_EXAMPLE_FORMAT.format(question, choices_str.lstrip())
-    return SHORT_ANS_EXAMPLE_FORMAT.format(question)
+        return (
+            MULTI_CHOICE_EXAMPLE_FORMAT.format(question, choices_str.lstrip())
+            + STEP_BY_STEP_BOXED_PROMPT
+        )
+    return SHORT_ANS_EXAMPLE_FORMAT.format(question) + STEP_BY_STEP_BOXED_PROMPT
 
 
 def split_into_parts(prompt: str, image_paths: Dict[int, str]) -> List[Tuple[str, str]]:
@@ -128,30 +132,6 @@ def split_into_parts(prompt: str, image_paths: Dict[int, str]) -> List[Tuple[str
 
 
 # ----------- Process Multi-choice -------------
-def extract_boxed(response: str) -> Optional[str]:
-    """
-    The content of the last ``\\boxed{...}``, or None when there is none.
-
-    Matched on "oxed{" so that a single- and a double-escaped backslash both
-    hit, and closed by brace counting so that a boxed ``\\frac{1}{2}`` survives.
-    A generation truncated inside its box yields what it had written so far.
-    """
-    start = response.rfind("oxed{")
-    if start == -1:
-        return None
-    depth = 1
-    collected = []
-    for char in response[start + len("oxed{") :]:
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                break
-        collected.append(char)
-    return "".join(collected).strip() or None
-
-
 def _unwrap_boxed_text(text: str) -> str:
     """Drop a LaTeX text wrapper and the punctuation a box is decorated with."""
     text = re.sub(r"\\(?:text|mathrm)\s*\{([^}]*)\}", r"\1", text)

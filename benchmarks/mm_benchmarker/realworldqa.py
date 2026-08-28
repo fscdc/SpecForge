@@ -31,7 +31,9 @@ from .base import MMBenchmarker
 from .registry import MM_BENCHMARKS
 from .utils import (
     CHOICES,
+    STEP_BY_STEP_BOXED_PROMPT,
     create_image_sgl_function,
+    extract_boxed,
     extract_choice,
     reference_in_prediction,
 )
@@ -61,13 +63,19 @@ MULTIPLE_CHOICE = "multiple-choice"
 OPEN_ENDED = "open-ended"
 
 
-def build_prompt(question: str, pre_prompt: str = "", post_prompt: str = "") -> str:
+def build_prompt(
+    question: str,
+    pre_prompt: str = "",
+    post_prompt: str = "\n" + STEP_BY_STEP_BOXED_PROMPT,
+) -> str:
     """
-    The prompt of the lmms-eval task.
+    The prompt of the lmms-eval task, minus its answer-directly instruction.
 
-    With the default (empty) prompts the question is sent as-is, keeping the
-    answer instruction it already contains. A task variant that appends its own
-    instruction strips that one first.
+    The dataset embeds "Please answer directly with only the letter ... and
+    nothing else" in the question itself, which contradicts the shared
+    step-by-step instruction, so it is stripped before the shared one is
+    appended. Pass ``post_prompt=""`` to send the question exactly as the task
+    does, which is the only form whose numbers are comparable to lmms-eval's.
     """
     question = question.strip()
     if post_prompt:
@@ -98,7 +106,9 @@ def score_answer(generation: str, answer: str, match: str = "lenient") -> float:
         # a letter is a letter, there is nothing to loosen here
         return float(extract_choice(generation, CHOICES) == reference.upper())
 
-    prediction = normalize_open_answer(generation)
+    # the prompt asks for the answer in a box, so read that first; a generation
+    # that carries none is still scored on its full text, as the task does
+    prediction = normalize_open_answer(extract_boxed(generation) or generation)
     reference = reference.lower()
     if prediction == reference:
         return 1.0
@@ -158,8 +168,13 @@ class RealWorldQABenchmarker(MMBenchmarker):
         self.exact_match: Optional[float] = None
 
     def default_max_new_tokens(self) -> int:
-        """The lmms-eval task answers in at most 16 tokens."""
-        return 16
+        """
+        Room for the explanation the shared prompt asks for before the box.
+
+        The lmms-eval task answers in at most 16 tokens, which is what this
+        returned while the question carried its answer-directly instruction.
+        """
+        return 2048
 
     def load_data(self) -> Tuple[List[Dict[str, Any]], List[Optional[str]]]:
         """Load and preprocess the RealWorldQA dataset."""

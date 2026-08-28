@@ -121,6 +121,31 @@ class TestPrepareData(unittest.TestCase):
             row,
         )
 
+    def test_blend_conversion_keeps_the_source_column(self):
+        row, _ = prepare_data.process_perfectblend_row(
+            {
+                "id": 7,
+                "source": "meta-math/MetaMathQA",
+                "conversations": [
+                    {"from": "human", "value": "question"},
+                    {"from": "gpt", "value": "answer"},
+                ],
+            }
+        )
+
+        # Regeneration reads the source back to find the math rows.
+        self.assertEqual("meta-math/MetaMathQA", row["source"])
+
+    def test_blend_conversion_tolerates_a_missing_source(self):
+        row, _ = prepare_data.process_perfectblend_row(
+            {
+                "id": 7,
+                "conversations": [{"from": "human", "value": "question"}],
+            }
+        )
+
+        self.assertNotIn("source", row)
+
     def test_math_and_code_presets_produce_conversation_rows(self):
         math_row, skipped = prepare_data.process_gsm8k_row(
             {"question": "1 + 1?", "answer": "2"}
@@ -209,6 +234,147 @@ class TestPrepareData(unittest.TestCase):
 
             self.assertTrue((output_directory / "ultrachat_train.jsonl").exists())
             self.assertTrue((output_directory / "ultrachat_test.jsonl").exists())
+
+
+class _SourceDataset:
+    """The slice of the datasets API that the source selection actually uses."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    @property
+    def column_names(self):
+        return list(self.rows[0]) if self.rows else []
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return [row[key] for row in self.rows]
+        return self.rows[key]
+
+    def select(self, indices):
+        return _SourceDataset([self.rows[index] for index in indices])
+
+
+def _blended_dataset():
+    """Stand-in for mlabonne/open-perfectblend's source column."""
+    sizes = {
+        "meta-math/MetaMathQA": 40,
+        "openbmb/UltraInteract_sft": 30,
+        "HuggingFaceH4/ultrafeedback_binarized": 20,
+        "mlabonne/ultrachat_200k_sft": 10,
+    }
+    rows = []
+    for source, count in sizes.items():
+        rows.extend(
+            {
+                "id": f"{source}#{index}",
+                "source": source,
+                "conversations": [
+                    {"from": "human", "value": f"q{index}"},
+                    {"from": "gpt", "value": f"a{index}"},
+                ],
+            }
+            for index in range(count)
+        )
+    return _SourceDataset(rows)
+
+
+class TestSourceMixture(unittest.TestCase):
+    def test_source_specs_parse_counts_and_all(self):
+        self.assertEqual(
+            prepare_data.parse_source_specs(["metamathqa=50000", "ultra", "x=all"]),
+            [("metamathqa", 50000), ("ultra", None), ("x", None)],
+        )
+
+    def test_malformed_source_specs_are_rejected(self):
+        for spec in ("=5", "x=abc", "x=0", "x=-3"):
+            with self.assertRaises(ValueError):
+                prepare_data.parse_source_specs([spec])
+
+    def test_handles_match_sources_ignoring_punctuation_and_case(self):
+        available = prepare_data.source_counts(_blended_dataset())
+        self.assertEqual(
+            prepare_data._resolve_source("metamathqa", available),
+            "meta-math/MetaMathQA",
+        )
+        self.assertEqual(
+            prepare_data._resolve_source("UltraInteract", available),
+            "openbmb/UltraInteract_sft",
+        )
+
+    def test_unknown_and_ambiguous_handles_name_the_alternatives(self):
+        available = prepare_data.source_counts(_blended_dataset())
+        with self.assertRaisesRegex(ValueError, "matches none of"):
+            prepare_data._resolve_source("nosuchthing", available)
+        # "ultra" hits both ultrafeedback and ultrachat
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            prepare_data._resolve_source("ultra", available)
+
+    def test_mixture_keeps_the_requested_count_per_source(self):
+        dataset = _blended_dataset()
+        selected = prepare_data.select_sources(
+            dataset,
+            prepare_data.parse_source_specs(["metamathqa=5", "ultrainteract=3"]),
+            seed=42,
+        )
+        self.assertEqual(len(selected), 8)
+        self.assertEqual(
+            prepare_data.source_counts(selected),
+            {"meta-math/MetaMathQA": 5, "openbmb/UltraInteract_sft": 3},
+        )
+
+    def test_a_count_above_the_source_size_keeps_every_row(self):
+        selected = prepare_data.select_sources(
+            _blended_dataset(), [("ultrachat", 10_000)], seed=42
+        )
+        self.assertEqual(len(selected), 10)
+
+    def test_the_draw_is_random_and_reproducible(self):
+        dataset = _blended_dataset()
+        first = [row["id"] for row in prepare_data.select_sources(
+            dataset, [("metamathqa", 5)], seed=42
+        )]
+        again = [row["id"] for row in prepare_data.select_sources(
+            dataset, [("metamathqa", 5)], seed=42
+        )]
+        other_seed = [row["id"] for row in prepare_data.select_sources(
+            dataset, [("metamathqa", 5)], seed=7
+        )]
+        self.assertEqual(first, again)
+        self.assertNotEqual(first, other_seed)
+        # not simply the head of the source, which is what --sample-size gives
+        self.assertNotEqual(first, [row["id"] for row in dataset.rows[:5]])
+
+    def test_source_selection_needs_a_source_column(self):
+        with self.assertRaisesRegex(ValueError, "no 'source' column"):
+            prepare_data.source_counts(_SourceDataset([{"id": "1"}]))
+
+    def test_existing_output_is_only_rewritten_with_overwrite(self):
+        dataset = _blended_dataset()
+        with TemporaryDirectory() as directory:
+            output_directory = Path(directory)
+            path = prepare_data.process_and_save_dataset(
+                dataset, output_directory, prepare_data.process_sharegpt_row, "mix"
+            )
+            path.write_text("stale\n", encoding="utf-8")
+            prepare_data.process_and_save_dataset(
+                dataset, output_directory, prepare_data.process_sharegpt_row, "mix"
+            )
+            self.assertEqual(path.read_text(encoding="utf-8"), "stale\n")
+            prepare_data.process_and_save_dataset(
+                dataset,
+                output_directory,
+                prepare_data.process_sharegpt_row,
+                "mix",
+                overwrite=True,
+            )
+            self.assertEqual(len(path.read_text(encoding="utf-8").splitlines()), 100)
 
 
 if __name__ == "__main__":

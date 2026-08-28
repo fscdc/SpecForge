@@ -299,7 +299,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
-        self.block_size = config.block_size
+        # Checkpoints exported by this repo carry block_size at the top level;
+        # the ones published by z-lab keep it only inside dflash_config, and
+        # reading the top level alone made those fail to load at all.
+        self.block_size = getattr(config, "block_size", None)
+        if self.block_size is None:
+            self.block_size = dflash_config.get("block_size")
+        if self.block_size is None:
+            raise ValueError(
+                "draft config defines no block_size, at the top level or in "
+                "dflash_config"
+            )
         self.mask_token_id = dflash_config.get("mask_token_id", None)
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)

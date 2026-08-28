@@ -1,6 +1,10 @@
+import json
+import re
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
+from scripts import regenerate_train_data
 from tests.utils import (
     execute_shell_command,
     get_available_port,
@@ -61,6 +65,107 @@ class TestRegenerateTrainData(unittest.TestCase):
             )
         finally:
             terminate_process_trees(sglang_process, grace_s=30)
+
+
+class TestMathCotPrompt(unittest.TestCase):
+    """The math prompt regeneration uses must match what the benchmarks send."""
+
+    def _row(self, source, prompt="What is 2+2?"):
+        return {
+            "id": "1",
+            "source": source,
+            "conversations": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": "4"},
+            ],
+        }
+
+    def _apply(self, row):
+        return regenerate_train_data.apply_math_cot_prompt(
+            row,
+            regenerate_train_data.MATH_COT_SUFFIX,
+            regenerate_train_data.DEFAULT_MATH_SOURCES,
+        )
+
+    def test_suffix_matches_the_text_benchmarks(self):
+        benchmark = Path(__file__).parent.parent.parent / "benchmarks" / "bench_text.py"
+        declared = re.search(
+            r"^COT_SUFFIX = (.+)$", benchmark.read_text(), re.MULTILINE
+        )
+        self.assertIsNotNone(declared, "benchmarks/bench_text.py lost COT_SUFFIX")
+        self.assertEqual(
+            eval(declared.group(1)),  # noqa: S307 - a string literal from our own repo
+            regenerate_train_data.MATH_COT_SUFFIX,
+        )
+
+    def test_math_rows_get_the_benchmark_instruction(self):
+        for source in (
+            "meta-math/MetaMathQA",
+            "HuggingFaceH4/orca-math-word-problems-200k",
+        ):
+            with self.subTest(source=source):
+                row = self._row(source)
+                self.assertTrue(self._apply(row))
+                self.assertEqual(
+                    "What is 2+2?" + regenerate_train_data.MATH_COT_SUFFIX,
+                    row["conversations"][0]["content"],
+                )
+
+    def test_other_subsets_and_sourceless_rows_are_untouched(self):
+        for source in (
+            "openbmb/UltraInteract_sft",
+            "mlabonne/ultrachat_200k_sft",
+            "HuggingFaceH4/ultrafeedback_binarized",
+            "theblackcat102/evol-codealpaca-v1",
+            "Post-training-Data-Flywheel/AutoIF-instruct-61k",
+            "mlabonne/lmsys-arena-human-preference-55k-sharegpt",
+        ):
+            with self.subTest(source=source):
+                row = self._row(source)
+                self.assertFalse(self._apply(row))
+                self.assertEqual("What is 2+2?", row["conversations"][0]["content"])
+
+        sourceless = {"id": "1", "conversations": [{"role": "user", "content": "hi"}]}
+        self.assertFalse(self._apply(sourceless))
+
+    def test_the_instruction_is_never_stacked_twice(self):
+        row = self._row("meta-math/MetaMathQA")
+        self.assertTrue(self._apply(row))
+        self.assertFalse(self._apply(row))
+        self.assertEqual(1, row["conversations"][0]["content"].count("step by step"))
+
+    def test_only_the_first_user_turn_is_rewritten(self):
+        row = {
+            "id": "1",
+            "source": "meta-math/MetaMathQA",
+            "conversations": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "second"},
+            ],
+        }
+        self.assertTrue(self._apply(row))
+        self.assertEqual("You are helpful.", row["conversations"][0]["content"])
+        self.assertTrue(row["conversations"][1]["content"].startswith("first\n"))
+        self.assertEqual("second", row["conversations"][3]["content"])
+
+    def test_an_input_without_sources_is_detected_up_front(self):
+        with TemporaryDirectory() as directory:
+            blend = Path(directory, "blend.jsonl")
+            blend.write_text(
+                json.dumps(self._row("meta-math/MetaMathQA")) + "\n", encoding="utf-8"
+            )
+            plain = Path(directory, "plain.jsonl")
+            plain.write_text(
+                json.dumps({"id": "1", "conversations": []}) + "\n", encoding="utf-8"
+            )
+            empty = Path(directory, "empty.jsonl")
+            empty.write_text("", encoding="utf-8")
+
+            self.assertTrue(regenerate_train_data.input_rows_carry_source(str(blend)))
+            self.assertFalse(regenerate_train_data.input_rows_carry_source(str(plain)))
+            self.assertFalse(regenerate_train_data.input_rows_carry_source(str(empty)))
 
 
 if __name__ == "__main__":

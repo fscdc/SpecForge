@@ -54,6 +54,13 @@ _CONSUMER_DONE_SUFFIX = ".consumer_done"
 _CONSUMER_FAILED_SUFFIX = ".consumer_failed"
 _CONSUMER_QUANTUM_SUFFIX = ".consumer_quantum"
 
+# ``mark_consumed`` publishes the counter with os.replace, which is atomic on a
+# local filesystem but not reliably so over NFS: a reader can momentarily miss
+# the entry or observe a stale page. Reporting 0 for such a read would look like
+# the counter had rewound, so retry briefly instead.
+_CONSUMED_READ_ATTEMPTS = 5
+_CONSUMED_READ_BACKOFF_S = 0.05
+
 
 @dataclass
 class RefPublishTransaction:
@@ -120,6 +127,12 @@ class StreamingRefChannel:
         # and the prefetch worker (failure settlement), so the increment and
         # the sidecar publish must be one atomic section.
         self._consumed_lock = threading.Lock()
+        # Highest counter value ever read back. The sidecar only ever grows, so
+        # this is the floor a failed or stale read falls back to. Guarded by its
+        # own lock: ``seed_consumed`` reads the counter while holding
+        # ``_consumed_lock``, which is not reentrant.
+        self._consumed_seen = 0
+        self._consumed_seen_lock = threading.Lock()
 
     # -- producer ----------------------------------------------------------
     def publish(self, ref: SampleRef) -> None:
@@ -296,12 +309,41 @@ class StreamingRefChannel:
         return self._published
 
     def consumed_remote(self) -> int:
-        """How many refs the consumer reports having consumed (cross-process)."""
-        try:
-            with open(self.path + _CONSUMED_SUFFIX) as f:
-                return int(f.read() or "0")
-        except (FileNotFoundError, ValueError):
-            return 0
+        """How many refs the consumer reports having consumed (cross-process).
+
+        Never reports less than a value already observed. The counter only
+        grows, so a missing file or an unparsable read is a transient view of
+        the sidecar mid-``os.replace``, not evidence that the consumer rewound.
+        Reporting 0 for those would make the producer's byte accounting look
+        corrupt and fail the run; holding the last known value merely stalls
+        backpressure for one poll.
+        """
+        path = self.path + _CONSUMED_SUFFIX
+        for attempt in range(_CONSUMED_READ_ATTEMPTS):
+            value: Optional[int] = None
+            try:
+                with open(path) as f:
+                    raw = f.read()
+            except FileNotFoundError:
+                # Genuinely absent until the consumer's first ack, so the very
+                # first read legitimately answers 0 without burning retries.
+                with self._consumed_seen_lock:
+                    if self._consumed_seen == 0:
+                        return 0
+            else:
+                try:
+                    value = int(raw or "0")
+                except ValueError:
+                    value = None  # torn read: retry rather than report 0
+            if value is not None:
+                with self._consumed_seen_lock:
+                    if value > self._consumed_seen:
+                        self._consumed_seen = value
+                    return self._consumed_seen
+            if attempt + 1 < _CONSUMED_READ_ATTEMPTS:
+                time.sleep(_CONSUMED_READ_BACKOFF_S)
+        with self._consumed_seen_lock:
+            return self._consumed_seen
 
     def in_flight_remote(self) -> int:
         """published - consumed: the producer's backpressure signal."""

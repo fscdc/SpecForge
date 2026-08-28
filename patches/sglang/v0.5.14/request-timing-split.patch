@@ -1,0 +1,23 @@
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -2078,6 +2078,20 @@
+                 state.time_stats.set_finished_time()
+                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
+ 
++                # Spec-decoding analysis: split the request's wall time into
++                # its two phases. Only the decode phase is what a draft model
++                # accelerates, and on a prompt of tens of thousands of visual
++                # tokens the prefill dwarfs it, so an end-to-end number alone
++                # hides whatever the draft did. Both values are already
++                # computed by APIServerReqTimeStats; only e2e_latency was
++                # being returned. first_token_time is written on the first
++                # output batch, which the scheduler sends for streaming and
++                # non-streaming requests alike, so this works either way.
++                meta_info["first_token_latency"] = (
++                    state.time_stats.get_first_token_latency()
++                )
++                meta_info["decode_latency"] = state.time_stats.get_decode_latency()
++
+                 if self.server_args.speculative_algorithm:
+                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
+                 if self.enable_metrics:

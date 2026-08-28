@@ -12,6 +12,13 @@ GPU_IDS=(0)
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
 export FLASHINFER_USE_CUDA_NORM=1
 
+export HF_HUB_DISABLE_XET=1
+
+
+# Patch the installed SGLang so every response carries its prefill/decode split
+# (first_token_latency / decode_latency). Must run before launch_server imports
+# tokenizer_manager.py. `bash scripts/benchmark_helper.sh --unpatch` undoes it.
+bash scripts/benchmark_helper.sh || exit 1
 
 
 # The scheduler decides which GPUs this job gets and may name them by UUID
@@ -21,6 +28,7 @@ IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 SERVER_ADDRESSES=()
 PORTS=()
+BASE_URLS=()
 for idx in "${!GPU_IDS[@]}"; do
     gpu_id="${VISIBLE_GPUS[${GPU_IDS[$idx]}]:-}"
     if [ -z "${gpu_id}" ]; then
@@ -30,13 +38,14 @@ for idx in "${!GPU_IDS[@]}"; do
     port=$((30000 + idx * 10))
     SERVER_ADDRESSES+=("localhost:${port}")
     PORTS+=("${port}")
+    BASE_URLS+=("http://localhost:${port}")
     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
         --model Qwen/Qwen3.5-4B \
         --mem-fraction-static 0.7 \
         --tp 1 \
         --trust-remote-code \
         --cuda-graph-max-bs 128 \
-        --attention-backend triton \
+        --attention-backend fa3 \
         --mm-attention-backend sdpa \
         --host 0.0.0.0 \
         --port ${port} \
@@ -75,22 +84,51 @@ if [ $? -ne 0 ]; then
 fi
 
 
+# # temperature = 1.0
+# python benchmarks/bench_mm.py \
+#     --model Qwen/Qwen3.5-4B \
+#     --base-url "${BASE_URLS[@]}" \
+#     --concurrency 1 \
+#     --block-size 0 \
+#     --benchmark-list chartqa:200 mmstar:200 \
+#     --reasoning off \
+#     --temperature 1.0 \
+#     --top-p 0.95 \
+#     --top-k 20 \
+#     --max-tokens 8192 \
+#     --save-generations \
+#     --name origin_qwen35-4B_concurrency1
 
-python benchmarks/bench_mmflash.py \
-    --model-path Qwen/Qwen3.5-4B \
-    --ports "${PORTS[@]}" \
-    --config-list 1,0 \
-    --benchmark-list chartqa:200 mmstar:200 mathvision:200 \
-    --dtype bfloat16 \
-    --chat-template-name qwen2-vl \
-    --disable-thinking \
-    --temperature 1.0 \
+# temperature = 0.0
+python benchmarks/bench_mm.py \
+    --model Qwen/Qwen3.5-4B \
+    --base-url "${BASE_URLS[@]}" \
+    --concurrency 1 \
+    --block-size 0 \
+    --benchmark-list chartqa:200 mmstar:200 realworldqa:200 mmmu:200 mathvision:200 vdc:20 \
+    --reasoning off \
+    --temperature 0.0 \
     --top-p 0.95 \
     --top-k 20 \
-    --max-tokens 32768 \
-    --skip-launch-server \
+    --max-tokens 8192 \
     --save-generations \
-    --name origin_qwen35-4B_concurrency1
+    --name origin_qwen35-4B_concurrency1_temp0
+
+
+# # for text benchmark
+# python benchmarks/bench_text.py \
+#     --model Qwen/Qwen3.5-4B \
+#     --base-url "${BASE_URLS[@]}" \
+#     --concurrency 1 \
+#     --block-size 0 \
+#     --benchmark-list gsm8k:200 \
+#     --reasoning off \
+#     --temperature 0.0 \
+#     --top-p 0.95 \
+#     --top-k 20 \
+#     --max-tokens 8192 \
+#     --save-generations \
+#     --name origin_qwen35-4B_concurrency1_temp0
 
 
 pkill -f "sglang.launch_server"

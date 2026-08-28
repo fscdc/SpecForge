@@ -1,0 +1,84 @@
+model:
+  target_model_path: "Qwen/Qwen3.5-4B"
+  draft_model_config: "configs/qwen3.5-4b-eagle3.json"
+  # EAGLE3's draft lm_head covers only draft_vocab_size (32000) of the target's
+  # 248320 tokens, so a t2d/d2t mapping is mandatory. Disaggregated runs cannot
+  # derive it (producer and consumer would each build a different one), so it
+  # has to be generated up front -- see the note at the bottom of this file.
+  # Kept out of any cache/ directory: this is a required input, not a artifact
+  # that may be cleaned between runs.
+  vocab_mapping_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/vocab_mapping/qwen3.5-4b-eagle3.pt"
+  target_backend: sglang
+  # image+text capture: routes prompt building and server requests through the
+  # multimodal ServerInputAdapter. Requires a vision-language target model.
+  input_modality: image
+  trust_remote_code: true
+  # A VL checkpoint nests the text stack under model.language_model.* (the
+  # vision tower lives in model.visual.*), so the text-only key does not exist.
+  # lm_head_key is unused here because the model ties word embeddings.
+  embedding_key: "model.language_model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+data:
+  train_data_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_sharegpt4v_regen_first_turn.jsonl"
+  max_length: 3072
+  chat_template: "qwen3.5"
+  build_dataset_num_proc: 32
+  cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
+training:
+  strategy: "eagle3"
+  num_epochs: 6
+  # max_steps: 1000 # set for testing, comment out for full training
+  batch_size: 2
+  accumulation_steps: 4
+  learning_rate: 0.0001
+  warmup_ratio: 0.04
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "flex_attention"
+  save_interval: 1000
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+tracking:
+  report_to: "tensorboard"
+run_id: "qwen3.5-4b-eagle3"
+output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-eagle3-sharegpt4v"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1 # @sicheng: same as gpu count
+  disaggregated:
+    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-eagle3-sharegpt4v/control"
+    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-eagle3-sharegpt4v/consumer-state"
+    backend: mooncake
+
+    # managed_local: the CLI supervises Mooncake and the SGLang capture server
+    # itself, so nothing has to be started by hand. It derives the server URLs
+    # and Mooncake endpoints, which is why none of them may be set here.
+    managed_local:
+      # trainer (consumer) GPUs — must stay disjoint from the capture server's
+      trainer_cuda_visible_devices:
+        - "1"
+        # - "2"
+        # - "3"
+      mooncake:
+        protocol: tcp
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices:
+            - "0"
+          tp_size: 1
+          mem_fraction_static: 0.80
+
+# Before the first run, generate the vocab mapping this config points at:
+#
+#   SNAP=$(ls -d /scratch/fengsicheng/.cache/huggingfaceexport/hub/\
+# models--Qwen--Qwen3.5-4B/snapshots/*/ | head -1)
+#   python scripts/prepare_vocab_mapping.py \
+#       --config scripts/mmtraining_configs/qwen3.5-4b-eagle3.yaml \
+#       --target-path "$SNAP"
+#
+# That script only tokenizes text -- no target weights, no GPU, no hidden
+# states on disk -- so it counts the very tokens train_data_path supervises.

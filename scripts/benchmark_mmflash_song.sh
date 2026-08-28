@@ -24,11 +24,18 @@ GPU_IDS=(0)
 
 BLOCK_SIZE=16
 
+# Patch the installed SGLang so every response carries its prefill/decode split
+# (first_token_latency / decode_latency). Must run before launch_server imports
+# tokenizer_manager.py. `bash scripts/benchmark_helper.sh --unpatch` undoes it.
+bash scripts/benchmark_helper.sh || exit 1
+
+
 IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 # TODO: 这里把draft model的路径写在这里就行了
 SERVER_ADDRESSES=()
 PORTS=()
+BASE_URLS=()
 for idx in "${!GPU_IDS[@]}"; do
     gpu_id="${VISIBLE_GPUS[${GPU_IDS[$idx]}]:-}"
     if [ -z "${gpu_id}" ]; then
@@ -38,6 +45,7 @@ for idx in "${!GPU_IDS[@]}"; do
     port=$((30000 + idx * 10))
     SERVER_ADDRESSES+=("localhost:${port}")
     PORTS+=("${port}")
+    BASE_URLS+=("http://localhost:${port}")
     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
         --model Qwen/Qwen3.5-4B \
         --speculative-algorithm DFLASH \
@@ -83,19 +91,17 @@ if [ $? -ne 0 ]; then
 fi
 
 
-CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_mmflash.py \
-    --model-path Qwen/Qwen3.5-4B \
-    --ports "${PORTS[@]}" \
-    --config-list 1,${BLOCK_SIZE} \
+CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_mm.py \
+    --model Qwen/Qwen3.5-4B \
+    --base-url "${BASE_URLS[@]}" \
+    --concurrency 1 \
+    --block-size ${BLOCK_SIZE} \
     --benchmark-list chartqa:200 mmstar:200 mathvision:200 \
-    --dtype bfloat16 \
-    --chat-template-name qwen2-vl \
-    --disable-thinking \
+    --reasoning off \
     --temperature 1.0 \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 32768 \
-    --skip-launch-server \
     --save-generations \
     --name mmflash_qwen35-4B_concurrency1
 

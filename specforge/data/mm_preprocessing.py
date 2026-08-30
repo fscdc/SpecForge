@@ -102,10 +102,19 @@ def _limit_image_tokens(processor, max_tokens: int) -> None:
         image_processor.max_pixels = min(image_processor.max_pixels, max_pixels)
 
 
-def resolve_image_path(image: Any, image_root: str) -> str:
-    """Resolve one record's image reference against the configured root."""
+def resolve_image_path(image: Any, image_root: str) -> str | None:
+    """Resolve one record's image reference against the configured root.
+
+    ``None`` for a text-only record. A blend such as LLaVA-OneVision mixes
+    text-only rows into an otherwise multimodal file, and those rows train the
+    draft just as well -- they simply carry no picture.
+    """
+    if image is None:
+        return None
     if not isinstance(image, str) or not image:
-        raise ValueError(f"record image must be a non-empty string, got {image!r}")
+        raise ValueError(
+            f"record image must be a non-empty string or None, got {image!r}"
+        )
     if image_root and not os.path.isabs(image):
         return os.path.join(image_root, image)
     return image
@@ -267,15 +276,32 @@ def encode_mm_record(
     if not conversations:
         raise ValueError(f"record {record.get('id')!r} has no conversations")
 
+    image_path = resolve_image_path(record.get("image"), image_root)
+    if image_path is None and any(
+        isinstance(turn.get("content"), str) and IMAGE_PLACEHOLDER in turn["content"]
+        for turn in conversations
+    ):
+        # Checked before templating: to_chat_messages turns the placeholder
+        # into a structured image part, so by then it is gone from the text.
+        raise ValueError(
+            f"record {record.get('id')!r} has no image but its conversation "
+            f"still carries an {IMAGE_PLACEHOLDER} placeholder"
+        )
+
     messages = to_chat_messages(conversations)
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=False
     )
 
-    image_path = resolve_image_path(record.get("image"), image_root)
-    with Image.open(image_path) as handle:
-        image = handle.convert("RGB")
-        batch = processor(text=[text], images=[image], return_tensors="pt")
+    if image_path is None:
+        # A text-only row: the processor must not be handed an empty image
+        # list, which some implementations turn into a zero-length pixel batch
+        # rather than a plain text encode.
+        batch = processor(text=[text], return_tensors="pt")
+    else:
+        with Image.open(image_path) as handle:
+            image = handle.convert("RGB")
+            batch = processor(text=[text], images=[image], return_tensors="pt")
 
     input_ids = batch["input_ids"][0].tolist()
     if len(input_ids) > max_length:
@@ -297,6 +323,8 @@ def encode_mm_record(
     return {
         "input_ids": input_ids,
         "loss_mask": loss_mask,
+        # None for a text-only row; the capture request carries no picture for
+        # it and the server builds a plain text sequence.
         "image": image_path,
     }
 

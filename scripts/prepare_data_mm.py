@@ -16,7 +16,7 @@ import random
 import sys
 import time
 import zlib
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -79,6 +79,10 @@ LLAVA_OV_DEFAULT_EXCLUDED = ("gui", "medical")
 #: is resolved at call time, so leaving it unpinned would silently re-sample if
 #: the blend were ever re-uploaded.
 LLAVA_OV_REVISION = "0efb7ad47f8ba36e1d262545cadec4cd8960dc5f"
+#: Manifests live beside the script rather than with the data: they are the
+#: record of how a mixture was built, small enough to keep in the repo, and
+#: still useful once the dataset itself has been moved or deleted.
+MANIFEST_DIRECTORY = Path(__file__).resolve().parent / "data_reproduce"
 #: Streaming reads whole parquet row groups, and this repo writes them at
 #: roughly this size, so it is the floor on what touching one config costs.
 LLAVA_OV_ROW_GROUP_BYTES = 100 * 1024**2
@@ -140,10 +144,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Root the records' relative `image` paths resolve against, the "
             "same directory the training config's `image_root` points at. The "
             "sharegpt4v presets need it to already hold the images (coco/, "
-            f"sam/, ...). For {LLAVA_OV_PRESET} the images are extracted into "
-            "<image-root>/<output-name>/ and the records store paths relative "
-            "to it, so the JSONL survives being moved to another machine; "
-            "omit it there to store absolute paths instead."
+            f"sam/, ...). For {LLAVA_OV_PRESET} it is where the extracted "
+            "images go, under <image-root>/<output-name>/; the records always "
+            "carry absolute paths, so the training config needs no image_root."
         ),
     )
     parser.add_argument(
@@ -316,9 +319,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error("--shuffle-buffer must be at least 1")
         if args.image_root is not None and args.image_dir is not None:
             parser.error(
-                "--image-root and --image-dir both say where images go; pass "
-                "--image-root to store portable relative paths, --image-dir "
-                "to store absolute ones"
+                "--image-root and --image-dir both say where images go; "
+                "--image-root adds an <output-name> subdirectory under it, "
+                "--image-dir is used as given"
             )
     elif args.image_root is None:
         parser.error(f"--image-root is required for --dataset {args.dataset}")
@@ -619,6 +622,36 @@ def write_llava_ov_image(
     return str(destination)
 
 
+#: Below this, two strings are too short for containment to mean anything --
+#: a one-word answer often appears verbatim in its own question.
+LEAKED_ANSWER_MIN_CHARS = 40
+#: How close in length the pair must be before containment counts as a leak.
+LEAKED_ANSWER_MIN_RATIO = 0.8
+
+
+def leaks_answer(question: str, answer: str) -> bool:
+    """Whether a pair is one blob of text split badly across both turns.
+
+    Some `visual7w` rows in the blend carry the whole "Question: ... Answer:
+    ..." text in *both* turns, with a couple of leading characters lost from
+    one of them, so the answer is handed to the model inside its own prompt.
+    Training on those teaches copying rather than answering.
+
+    Detected by containment rather than a diff: the two differ only by a
+    truncated prefix, so the shorter sits inside the longer, and requiring
+    similar lengths keeps a genuinely short answer that happens to echo a word
+    of its question from tripping it.
+    """
+    left = " ".join(question.split())
+    right = " ".join(answer.split())
+    if min(len(left), len(right)) < LEAKED_ANSWER_MIN_CHARS:
+        return False
+    shorter, longer = sorted((left, right), key=len)
+    if len(shorter) / len(longer) < LEAKED_ANSWER_MIN_RATIO:
+        return False
+    return shorter in longer
+
+
 def process_llava_ov_row(
     row: Mapping[str, Any], config: str, index: int, image_directory: Path
 ) -> tuple[list[dict[str, Any]], int]:
@@ -669,7 +702,10 @@ def process_llava_ov_row(
         return [], skipped_count + len(pairs)  # an <image> with nothing behind it
 
     records: list[dict[str, Any]] = []
-    for position, (question, answer) in enumerate(pairs):
+    for question, answer in pairs:
+        if leaks_answer(question, answer):
+            skipped_count += 1
+            continue
         if image_path is not None:
             # Normalise the placeholder: strip it wherever the source put it and
             # give every record exactly one, in front of its own question.
@@ -680,7 +716,7 @@ def process_llava_ov_row(
         conversations.append({"role": "assistant", "content": answer})
         records.append(
             {
-                "id": f"{config}#{index}-{position}",
+                "id": f"{config}#{index}-{len(records)}",
                 "image": image_path,
                 "conversations": conversations,
             }
@@ -870,103 +906,74 @@ def fetch_llava_ov_config(
         )
 
 
-def prepare_llava_onevision(args: argparse.Namespace) -> Path:
-    """Write `--sample-size` rows of the blend to one JSONL, images alongside."""
-    configs = llava_ov_eligible_configs(args.exclude_family)
-    families = sorted({family for _name, family, _rows in configs})
-    pool = sum(rows for _name, _family, rows in configs)
-    dropped = sorted(set(args.exclude_family)) or ["nothing"]
-    print(
-        f"{LLAVA_OV_REPO}: {len(configs)} configs over {len(families)} "
-        f"families ({pool:,} rows) after excluding {', '.join(dropped)}"
-    )
-    if args.sample_size > pool:
-        raise ValueError(
-            f"--sample-size {args.sample_size} exceeds the {pool:,} rows "
-            "available (a row yields one record per question, so this is a "
-            "conservative bound)"
-        )
+def summarise_records(
+    counts: Mapping[str, int],
+    prompt_chars: Mapping[str, list[int]],
+    answer_chars: Mapping[str, list[int]],
+    family_of: Mapping[str, str],
+) -> None:
+    """Print what the written dataset actually contains, per family.
 
-    drawn = select_configs(
-        configs,
-        args.sample_size,
-        min_rows=args.min_samples_per_config,
-        seed=args.seed,
-    )
-    quota = allocate_quota(drawn, args.sample_size)
-    by_family: Counter[str] = Counter()
-    family_of = {name: family for name, family, _rows in configs}
-    for name, count in quota.items():
-        by_family[family_of[name]] += count
-    print(f"Sampling {args.sample_size:,} records from {len(quota)} configs:")
-    for family, count in by_family.most_common():
-        print(f"  {count:>9,}  {count / args.sample_size:5.1%}  {family}")
-    unit = (
-        LLAVA_OV_SHARD_BYTES if args.fetch == "shards" else LLAVA_OV_ROW_GROUP_BYTES
-    )
-    what = "shard" if args.fetch == "shards" else "parquet row group"
-    print(
-        f"--fetch {args.fetch} reads a whole ~{unit // 1024**2} MB {what} at a "
-        f"time, so expect at least {len(quota) * unit / 1024**3:,.1f} GiB of "
-        "transfer; raise --min-samples-per-config to touch fewer configs, "
-        "lower it for a wider blend."
-    )
+    Answer length is the number worth watching: a subset whose answers are two
+    characters long fills most of a draft block with padding, which flatters
+    every acceptance number measured on it.
+    """
 
-    output_directory = Path(args.output_path)
-    output_directory.mkdir(parents=True, exist_ok=True)
-    name = args.output_name or args.dataset
-    manifest_path = output_directory / f"{name}_manifest.json"
-    if args.manifest is not None:
-        recorded = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
-        quota = {str(k): int(v) for k, v in recorded["quota"].items()}
-        args.revision = recorded["revision"]
-        args.seed = recorded["seed"]
-        args.shuffle_buffer = recorded["shuffle_buffer"]
+    def quantile(values: Sequence[int], fraction: float) -> int:
+        return values[min(int(len(values) * fraction), len(values) - 1)]
+
+    by_family: dict[str, list[int]] = defaultdict(list)
+    prompts_by_family: dict[str, list[int]] = defaultdict(list)
+    for config, lengths in answer_chars.items():
+        by_family[family_of[config]].extend(lengths)
+        prompts_by_family[family_of[config]].extend(prompt_chars[config])
+
+    total = sum(counts.values())
+    print(f"\nAnswer and prompt length by family ({total:,} records):")
+    print(
+        f"  {'family':<18}{'records':>10}{'share':>8}"
+        f"{'prompt p50':>12}{'answer p50':>12}{'p90':>8}{'<=3 chars':>11}"
+    )
+    for family, lengths in sorted(by_family.items(), key=lambda kv: -len(kv[1])):
+        lengths.sort()
+        prompts = sorted(prompts_by_family[family])
+        tiny = sum(1 for value in lengths if value <= 3) / len(lengths)
         print(
-            f"Replaying {args.manifest}: {sum(quota.values()):,} records over "
-            f"{len(quota)} configs at revision {args.revision[:12]}"
+            f"  {family:<18}{len(lengths):>10,}{len(lengths) / total:>8.1%}"
+            f"{quantile(prompts, 0.5):>12,}{quantile(lengths, 0.5):>12,}"
+            f"{quantile(lengths, 0.9):>8,}{tiny:>11.0%}"
         )
-    if args.image_root is not None:
-        # Records carry <name>/<config>/<file>, so several mixtures can share
-        # one root and the JSONL stays valid wherever that root is mounted.
-        image_relative_to: Path | None = Path(args.image_root)
-        image_directory = image_relative_to / name
-    else:
-        image_relative_to = None
-        image_directory = Path(args.image_dir or output_directory / f"{name}_images")
-    image_directory.mkdir(parents=True, exist_ok=True)
+
+    tiny_configs = sorted(
+        (
+            (sum(1 for v in lengths if v <= 3) / len(lengths), config, len(lengths))
+            for config, lengths in answer_chars.items()
+            if len(lengths) >= 500
+        ),
+        reverse=True,
+    )[:8]
+    if tiny_configs and tiny_configs[0][0] > 0.05:
+        print("\n  Subsets whose answers are mostly a word or two:")
+        for share, config, size in tiny_configs:
+            if share <= 0.05:
+                break
+            print(f"    {config:<24}{size:>9,}{share:>8.0%} at <=3 chars")
+
+
+def _write_llava_ov_dataset(
+    args: argparse.Namespace,
+    name: str,
+    quota: Mapping[str, int],
+    output_directory: Path,
+    image_directory: Path,
+    family_of: Mapping[str, str],
+) -> Path:
+    """Fetch every config's share, concatenate the parts, and report.
+
+    Split out of `prepare_llava_onevision` so a replay, which must not rewrite
+    the manifest it was handed, still runs exactly the same writer.
+    """
     train_output_path = output_directory / f"{name}_train.jsonl"
-    if train_output_path.exists():
-        print(f"Overwriting existing dataset at {train_output_path}.")
-
-    import datasets as _datasets
-    import numpy as _numpy
-
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "repo": LLAVA_OV_REPO,
-                "revision": args.revision,
-                "sample_size": args.sample_size,
-                "seed": args.seed,
-                "shuffle_buffer": args.shuffle_buffer,
-                "excluded_families": sorted(args.exclude_family),
-                # Recorded rather than recomputed on replay: the row counts
-                # behind it come from a live endpoint that would move if the
-                # blend were ever re-uploaded.
-                "quota": dict(sorted(quota.items())),
-                "versions": {
-                    "datasets": _datasets.__version__,
-                    "numpy": _numpy.__version__,
-                },
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    print(f"Wrote {manifest_path}")
-
     parts_directory = output_directory / f"{name}_parts"
     parts_directory.mkdir(parents=True, exist_ok=True)
 
@@ -1020,36 +1027,21 @@ def prepare_llava_onevision(args: argparse.Namespace) -> Path:
     written = 0
     with_image = 0
     images: set[str | None] = set()
-    portable_path = output_directory / f"{name}_train_relative.jsonl"
-    portable = (
-        portable_path.open("w", encoding="utf-8")
-        if image_relative_to is not None
-        else None
-    )
-    try:
-        with train_output_path.open("w", encoding="utf-8") as handle:
-            for config, _count in order:
-                for line in (parts_directory / f"{config}.jsonl").open(
-                    encoding="utf-8"
-                ):
-                    handle.write(line)
-                    record = json.loads(line)
-                    if portable is not None:
-                        image = record["image"]
-                        relative = dict(record)
-                        if image is not None:
-                            relative["image"] = str(
-                                Path(image).relative_to(image_relative_to)
-                            )
-                        portable.write(
-                            json.dumps(relative, ensure_ascii=False) + "\n"
-                        )
-                    written += 1
-                    with_image += record["image"] is not None
-                    images.add(record["image"])
-    finally:
-        if portable is not None:
-            portable.close()
+    counts: Counter[str] = Counter()
+    prompt_chars: dict[str, list[int]] = defaultdict(list)
+    answer_chars: dict[str, list[int]] = defaultdict(list)
+    with train_output_path.open("w", encoding="utf-8") as handle:
+        for config, _count in order:
+            for line in (parts_directory / f"{config}.jsonl").open(encoding="utf-8"):
+                handle.write(line)
+                record = json.loads(line)
+                written += 1
+                with_image += record["image"] is not None
+                images.add(record["image"])
+                counts[config] += 1
+                turns = record["conversations"]
+                prompt_chars[config].append(len(turns[-2]["content"]))
+                answer_chars[config].append(len(turns[-1]["content"]))
     images.discard(None)
 
     print(
@@ -1059,13 +1051,133 @@ def prepare_llava_onevision(args: argparse.Namespace) -> Path:
     )
     print(f"Images written under {image_directory}")
     print(f"Per-config parts kept in {parts_directory} for resuming.")
-    if image_relative_to is not None:
-        print(
-            f"Portable copy at {portable_path}: same records with paths "
-            f"relative to {image_relative_to}. Sync it with {manifest_path.name} "
-            "and the images, then point image_root at the new root."
-        )
+    summarise_records(counts, prompt_chars, answer_chars, family_of)
     return train_output_path
+
+
+def prepare_llava_onevision(args: argparse.Namespace) -> Path:
+    """Write `--sample-size` rows of the blend to one JSONL, images alongside."""
+    configs = llava_ov_eligible_configs(args.exclude_family)
+    families = sorted({family for _name, family, _rows in configs})
+    pool = sum(rows for _name, _family, rows in configs)
+    dropped = sorted(set(args.exclude_family)) or ["nothing"]
+    print(
+        f"{LLAVA_OV_REPO}: {len(configs)} configs over {len(families)} "
+        f"families ({pool:,} rows) after excluding {', '.join(dropped)}"
+    )
+    if args.sample_size > pool:
+        raise ValueError(
+            f"--sample-size {args.sample_size} exceeds the {pool:,} rows "
+            "available (a row yields one record per question, so this is a "
+            "conservative bound)"
+        )
+
+    drawn = select_configs(
+        configs,
+        args.sample_size,
+        min_rows=args.min_samples_per_config,
+        seed=args.seed,
+    )
+    quota = allocate_quota(drawn, args.sample_size)
+    by_family: Counter[str] = Counter()
+    family_of = {name: family for name, family, _rows in configs}
+    for name, count in quota.items():
+        by_family[family_of[name]] += count
+    print(f"Sampling {args.sample_size:,} records from {len(quota)} configs:")
+    for family, count in by_family.most_common():
+        print(f"  {count:>9,}  {count / args.sample_size:5.1%}  {family}")
+    unit = (
+        LLAVA_OV_SHARD_BYTES if args.fetch == "shards" else LLAVA_OV_ROW_GROUP_BYTES
+    )
+    what = "shard" if args.fetch == "shards" else "parquet row group"
+    print(
+        f"--fetch {args.fetch} reads a whole ~{unit // 1024**2} MB {what} at a "
+        f"time, so expect at least {len(quota) * unit / 1024**3:,.1f} GiB of "
+        "transfer; raise --min-samples-per-config to touch fewer configs, "
+        "lower it for a wider blend."
+    )
+
+    output_directory = Path(args.output_path)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    name = args.output_name or args.dataset
+    manifest_path = MANIFEST_DIRECTORY / f"{name}_manifest.json"
+    if args.manifest is not None:
+        recorded = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+        quota = {str(k): int(v) for k, v in recorded["quota"].items()}
+        args.revision = recorded["revision"]
+        args.seed = recorded["seed"]
+        args.shuffle_buffer = recorded["shuffle_buffer"]
+        recorded_size = sum(quota.values())
+        print(
+            f"Replaying {args.manifest}: {recorded_size:,} records over "
+            f"{len(quota)} configs at revision {args.revision[:12]}"
+        )
+        # The replayed record is authoritative, so say so rather than letting a
+        # stale flag look as if it took effect.
+        if args.sample_size != recorded_size:
+            print(
+                f"  NOTE: --sample-size {args.sample_size:,} is ignored; the "
+                f"manifest's quota decides, and it sums to {recorded_size:,}."
+            )
+        replayed = sorted(recorded.get("excluded_families", []))
+        if replayed != sorted(args.exclude_family):
+            print(
+                f"  NOTE: --exclude-family {sorted(args.exclude_family)} is "
+                f"ignored; the manifest was built excluding {replayed}."
+            )
+    if args.image_root is not None:
+        # One subdirectory per mixture, so several of them can share a root
+        # without colliding.
+        image_directory = Path(args.image_root) / name
+    else:
+        image_directory = Path(args.image_dir or output_directory / f"{name}_images")
+    image_directory.mkdir(parents=True, exist_ok=True)
+    train_output_path = output_directory / f"{name}_train.jsonl"
+    if train_output_path.exists():
+        print(f"Overwriting existing dataset at {train_output_path}.")
+
+    import datasets as _datasets
+    import numpy as _numpy
+
+    if args.manifest is not None:
+        # A replay reproduces a record that already exists; rewriting it would
+        # stamp this run's --sample-size, exclusions and library versions over
+        # the ones the mixture was actually built with -- and when the manifest
+        # replayed is this preset's own, it would overwrite the file just read.
+        print(f"Reusing {args.manifest}; not rewriting {manifest_path}")
+        return _write_llava_ov_dataset(
+            args, name, quota, output_directory, image_directory, family_of
+        )
+
+    MANIFEST_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "repo": LLAVA_OV_REPO,
+                "revision": args.revision,
+                "sample_size": args.sample_size,
+                "seed": args.seed,
+                "shuffle_buffer": args.shuffle_buffer,
+                "excluded_families": sorted(args.exclude_family),
+                # Recorded rather than recomputed on replay: the row counts
+                # behind it come from a live endpoint that would move if the
+                # blend were ever re-uploaded.
+                "quota": dict(sorted(quota.items())),
+                "versions": {
+                    "datasets": _datasets.__version__,
+                    "numpy": _numpy.__version__,
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(f"Wrote {manifest_path}")
+
+    return _write_llava_ov_dataset(
+        args, name, quota, output_directory, image_directory, family_of
+    )
 
 
 def process_and_save_dataset(

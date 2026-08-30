@@ -45,6 +45,7 @@ import mimetypes
 import os
 import random
 from concurrent.futures import ThreadPoolExecutor
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Sequence
 
 from tqdm import tqdm
@@ -63,9 +64,13 @@ except ModuleNotFoundError:
     from conversation_validation import has_think_marker, validate_conversation
 
 try:
-    from scripts.prepare_data_mm import LLAVA_OV_FAMILIES, _base_config
+    from scripts.prepare_data_mm import (
+        LLAVA_OV_FAMILIES,
+        _base_config,
+        leaks_answer,
+    )
 except ModuleNotFoundError:
-    from prepare_data_mm import LLAVA_OV_FAMILIES, _base_config
+    from prepare_data_mm import LLAVA_OV_FAMILIES, _base_config, leaks_answer
 
 IMAGE_PLACEHOLDER = "<image>"
 
@@ -384,6 +389,18 @@ def parse_arguments():
 
     # prompt alignment
     prompt_group = parser.add_argument_group("prompt alignment")
+    data_group.add_argument(
+        "--no-filter",
+        action="store_true",
+        help=(
+            "Skip the pass that runs once regeneration finishes and drops rows "
+            "the target left unusable -- an empty answer, a thinking marker, a "
+            "decoding loop, or an answer that just repeats its prompt. The "
+            "dropped rows are written to <output>_rejected.jsonl with the "
+            "reason, never deleted."
+        ),
+    )
+
     prompt_group.add_argument(
         "--align-prompts",
         action="store_true",
@@ -661,6 +678,142 @@ def call_sglang(
     return data
 
 
+#: A response this long that keeps restating the same chunk is a decoding loop,
+#: not an answer; below it the repetition test is too noisy to trust.
+DEGENERATE_MIN_CHARS = 4000
+#: Fraction of distinct chunks under which a long response counts as looping.
+DEGENERATE_MAX_UNIQUE = 0.25
+
+
+def is_degenerate(text: str, chunk: int = 64) -> bool:
+    """Whether a long response is a decoding loop rather than an answer.
+
+    Chunked rather than compressed or diffed because it has to run over a
+    million rows: a loop repeats the same window over and over, so the share of
+    distinct windows collapses while ordinary prose stays near one.
+    """
+    if len(text) < DEGENERATE_MIN_CHARS:
+        return False
+    chunks = [text[i : i + chunk] for i in range(0, len(text), chunk)]
+    return len(set(chunks)) / len(chunks) < DEGENERATE_MAX_UNIQUE
+
+
+def filter_regenerated(output_file_path: str) -> tuple[int, "Counter"]:
+    """Drop rows the regeneration left unusable, keeping the rejects on disk.
+
+    Runs once the whole file exists rather than inside the request loop: a row
+    can only be judged against the answer that came back, and one extra pass is
+    cheaper than threading this through the futures.
+    """
+    kept_path = f"{output_file_path}.filtered"
+    rejected_path = output_file_path.replace(".jsonl", "_rejected.jsonl")
+    reasons: Counter = Counter()
+    kept = 0
+    with (
+        open(output_file_path, encoding="utf-8") as source,
+        open(kept_path, "w", encoding="utf-8") as keep,
+        open(rejected_path, "w", encoding="utf-8") as reject,
+    ):
+        for line in source:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            conversations = data.get("conversations") or []
+            answers = [
+                message
+                for message in conversations
+                if isinstance(message, dict) and message.get("role") == "assistant"
+            ]
+            questions = [
+                message
+                for message in conversations
+                if isinstance(message, dict) and message.get("role") == "user"
+            ]
+            answer = (answers[-1].get("content") or "") if answers else ""
+            question = (questions[-1].get("content") or "") if questions else ""
+
+            if not answers:
+                reason = "no assistant turn"
+            elif not answer.strip():
+                reason = "empty answer"
+            elif has_think_marker(answer):
+                reason = "thinking marker in answer"
+            elif leaks_answer(question, answer):
+                reason = "answer repeats the prompt"
+            elif is_degenerate(answer):
+                reason = "degenerate repetition"
+            else:
+                reason = None
+
+            if reason is None:
+                keep.write(json.dumps(data, ensure_ascii=False) + "\n")
+                kept += 1
+            else:
+                data["filtered_reason"] = reason
+                reject.write(json.dumps(data, ensure_ascii=False) + "\n")
+                reasons[reason] += 1
+    os.replace(kept_path, output_file_path)
+    if not reasons:
+        os.unlink(rejected_path)
+    else:
+        print(f"  rejects written to {rejected_path}")
+    return kept, reasons
+
+
+def summarise_regenerated(output_file_path: str) -> None:
+    """Print what the regenerated training file actually contains.
+
+    Answer length is the number worth watching: a subset whose answers are two
+    characters long fills most of a draft block with padding, which flatters
+    every acceptance number measured on it.
+    """
+
+    def quantile(values, fraction):
+        return values[min(int(len(values) * fraction), len(values) - 1)]
+
+    total = 0
+    with_image = 0
+    with_system = 0
+    prompts: Dict[str, List[int]] = defaultdict(list)
+    answers: Dict[str, List[int]] = defaultdict(list)
+    with open(output_file_path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            total += 1
+            with_image += data.get("image") is not None
+            conversations = data["conversations"]
+            with_system += any(m.get("role") == "system" for m in conversations)
+            family = row_family(data) or "unlabelled"
+            prompts[family].append(len(conversations[-2]["content"]))
+            answers[family].append(len(conversations[-1]["content"]))
+    if not total:
+        print("No rows to summarise.")
+        return
+
+    print(f"\nRegenerated training data: {output_file_path}")
+    print(
+        f"  {total:,} rows -- {with_image:,} with an image, "
+        f"{total - with_image:,} text-only, {with_system:,} with a system turn"
+    )
+    print(
+        f"  {'family':<18}{'rows':>10}{'share':>8}"
+        f"{'prompt p50':>12}{'answer p50':>12}{'p90':>9}{'<=3 chars':>11}"
+    )
+    for family, lengths in sorted(answers.items(), key=lambda kv: -len(kv[1])):
+        lengths.sort()
+        heads = sorted(prompts[family])
+        tiny = sum(1 for value in lengths if value <= 3) / len(lengths)
+        print(
+            f"  {family:<18}{len(lengths):>10,}{len(lengths) / total:>8.1%}"
+            f"{quantile(heads, 0.5):>12,}{quantile(lengths, 0.5):>12,}"
+            f"{quantile(lengths, 0.9):>9,}{tiny:>11.0%}"
+        )
+
+
 def main():
     # Parse command line arguments
     args = parse_arguments()
@@ -927,6 +1080,21 @@ def main():
         )
     if args.align_prompts:
         print(f"  Prompts rewritten as math: {aligned_samples}")
+
+    if args.num_samples is not None:
+        # A partial run's file is not the training set, so rewriting it in
+        # place would be surprising.
+        print("\nSkipping the filter pass: --num-samples wrote a partial file.")
+    elif args.no_filter:
+        print("\nSkipping the filter pass (--no-filter).")
+    else:
+        print("\nFiltering unusable rows ...")
+        kept, reasons = filter_regenerated(args.output_file_path)
+        dropped = sum(reasons.values())
+        print(f"  kept {kept:,}, dropped {dropped:,}")
+        for reason, count in reasons.most_common():
+            print(f"    {count:>8,}  {reason}")
+    summarise_regenerated(args.output_file_path)
 
 
 if __name__ == "__main__":

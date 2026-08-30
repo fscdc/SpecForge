@@ -31,13 +31,15 @@ export HF_HUB_DOWNLOAD_TIMEOUT=120
 #     --output-name llava-ov15-1M
 
 
+
 # TODO@song: use the xx_manifest.json to construct same dataset on other server
+# deep100: /local_home2/fengsicheng/specforge/data
 # 这里先把数据造出来之后，再去跑后面的regen
 # python scripts/prepare_data_mm.py \
 #     --dataset llava-onevision-1.5 \
 #     --sample-size 1000000 \
 #     --fetch shards \
-#     --manifest /TODO/llava-ov15-1M_manifest.json \
+#     --manifest ./scripts/reproduce/llava-ov15-1M_manifest.json \
 #     --image-root TODO \
 #     --output-path TODO \
 #     --output-name llava-ov15-1M
@@ -171,9 +173,10 @@ if python3 scripts/regenerate_train_data.py \
     --top-p 0.95 \
     --top-k 20 \
     --input-file-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/data/llava-ov15-1M_train.jsonl \
-    --output-file-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M_regen_first_turn.jsonl \
+    --output-file-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M-prompted_regen_first_turn.jsonl \
     --resume \
     --reasoning disable \
+    --align-prompts \
     > "${LOG_DIR}/regen.log" 2>&1
 then
     echo "[done] regeneration finished successfully"

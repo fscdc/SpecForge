@@ -1,0 +1,18 @@
+{
+  "repo": "mvp-lab/LLaVA-OneVision-1.5-Instruct-Data",
+  "revision": "0efb7ad47f8ba36e1d262545cadec4cd8960dc5f",
+  "sample_size": 20,
+  "seed": 42,
+  "shuffle_buffer": 1,
+  "excluded_families": [
+    "gui",
+    "medical"
+  ],
+  "quota": {
+    "robut_wikisql": 20
+  },
+  "versions": {
+    "datasets": "5.0.1",
+    "numpy": "2.4.4"
+  }
+}

@@ -26,7 +26,6 @@ specforge train --config scripts/mmtraining_configs/qwen3.5-4b-mmflash_hpc.yaml
 # 跑之前check一下
 # ps -ef | grep -E "specforge|sglang.launch_server|mooncake_master" | grep -v grep
 
-# 如果上面check有残留，则要全部清除
 # pkill -f "specforge train"
 # pkill -f sglang.launch_server
 # pkill -f mooncake_master

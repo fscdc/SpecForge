@@ -27,7 +27,9 @@ from .mmstar import MMStarBenchmarker
 from .ocrbench import OCRBenchBenchmarker
 from .realworldqa import RealWorldQABenchmarker
 from .registry import MM_BENCHMARKS
+from .seedbench_image import SEEDBenchImageBenchmarker
 from .simplevqa import SimpleVQABenchmarker
+from .textvqa import TextVQABenchmarker
 from .vdc import VDCBenchmarker
 
 __all__ = [
@@ -38,6 +40,8 @@ __all__ = [
     "MMStarBenchmarker",
     "OCRBenchBenchmarker",
     "RealWorldQABenchmarker",
+    "SEEDBenchImageBenchmarker",
+    "TextVQABenchmarker",
     "SimpleVQABenchmarker",
     "VDCBenchmarker",
 ]

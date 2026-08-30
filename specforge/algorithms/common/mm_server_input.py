@@ -156,19 +156,25 @@ class ImageServerInputAdapter:
 
         ``input_ids`` already carry the processor's image-token expansion, so the
         captured features line up one-to-one with the payload the trainer reads.
+
+        A blend such as LLaVA-OneVision mixes text-only rows into an otherwise
+        multimodal file, so a batch can hold both; dropping the text-only third
+        is not an option. Every entry is a list -- ``[path]`` for a picture and
+        ``[]`` for none -- because that is the shape SGLang reads per batch
+        position: a flat list makes it label *every* entry "image", including
+        the ones with nothing to load, while a list of lists lets it assign no
+        modality to the empty ones. When the whole batch is text, ``image_data``
+        is left out and the request is an ordinary text one.
         """
         input_ids: list[list[int]] = []
-        image_data: list[Any] = []
+        image_data: list[list[Any]] = []
         for task in tasks:
             payload = task.payload
             input_ids.append(list(payload["input_ids"]))
             image = payload.get("image")
-            if not image:
-                raise ValueError(
-                    f"task {getattr(task, 'task_id', '?')!r} has no image; the "
-                    "image modality requires one image per prompt"
-                )
-            image_data.append(image)
+            image_data.append([image] if image else [])
+        if not any(image_data):
+            return {"input_ids": input_ids}
         return {"input_ids": input_ids, "image_data": image_data}
 
 

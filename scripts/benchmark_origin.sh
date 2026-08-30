@@ -100,12 +100,13 @@ fi
 #     --name origin_qwen35-4B_concurrency1
 
 # temperature = 0.0
+# chartqa:200 mmstar:200 realworldqa:200 mmmu:200 textvqa:200 seedbench-image:200 mathvision:200 vdc:20
 python benchmarks/bench_mm.py \
     --model Qwen/Qwen3.5-4B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
     --block-size 0 \
-    --benchmark-list chartqa:200 mmstar:200 realworldqa:200 mmmu:200 mathvision:200 vdc:20 \
+    --benchmark-list textvqa:200 seedbench-image:200 \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \

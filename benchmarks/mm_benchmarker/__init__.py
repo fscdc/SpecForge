@@ -21,6 +21,7 @@ The module then has to be imported below, otherwise the registration never runs.
 """
 
 from .chartqa import ChartQABenchmarker
+from .dynamath import DynaMathBenchmarker
 from .mathvision import MathVisionBenchmarker
 from .mmmu import MMMUBenchmarker
 from .mmstar import MMStarBenchmarker
@@ -35,6 +36,7 @@ from .vdc import VDCBenchmarker
 __all__ = [
     "MM_BENCHMARKS",
     "ChartQABenchmarker",
+    "DynaMathBenchmarker",
     "MathVisionBenchmarker",
     "MMMUBenchmarker",
     "MMStarBenchmarker",

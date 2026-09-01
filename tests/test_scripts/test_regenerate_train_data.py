@@ -84,6 +84,7 @@ class TestMathCotPrompt(unittest.TestCase):
         return regenerate_train_data.apply_math_cot_prompt(
             row,
             regenerate_train_data.MATH_COT_SUFFIX,
+            regenerate_train_data.DEFAULT_MATH_FAMILIES,
             regenerate_train_data.DEFAULT_MATH_SOURCES,
         )
 
@@ -163,9 +164,14 @@ class TestMathCotPrompt(unittest.TestCase):
             empty = Path(directory, "empty.jsonl")
             empty.write_text("", encoding="utf-8")
 
-            self.assertTrue(regenerate_train_data.input_rows_carry_source(str(blend)))
-            self.assertFalse(regenerate_train_data.input_rows_carry_source(str(plain)))
-            self.assertFalse(regenerate_train_data.input_rows_carry_source(str(empty)))
+            # a text blend labels its math rows with `source`, a
+            # LLaVA-OneVision file with the config in its id, and a file with
+            # neither aligns nothing -- which is what the run header warns about
+            self.assertEqual(
+                "source", regenerate_train_data.input_math_annotation(str(blend))
+            )
+            self.assertIsNone(regenerate_train_data.input_math_annotation(str(plain)))
+            self.assertIsNone(regenerate_train_data.input_math_annotation(str(empty)))
 
 
 if __name__ == "__main__":

@@ -277,15 +277,22 @@ def encode_mm_record(
         raise ValueError(f"record {record.get('id')!r} has no conversations")
 
     image_path = resolve_image_path(record.get("image"), image_root)
-    if image_path is None and any(
-        isinstance(turn.get("content"), str) and IMAGE_PLACEHOLDER in turn["content"]
+    # Checked before templating: to_chat_messages turns every placeholder into a
+    # structured image part, so by then they are gone from the text. One part is
+    # emitted per occurrence, but only `image_path` is ever handed to the
+    # processor, so a record carrying more placeholders than pictures makes the
+    # processor index a grid row that does not exist. That happens for real: an
+    # OCR reply transcribing a web page reproduces its literal <image> markup.
+    placeholders = sum(
+        turn["content"].count(IMAGE_PLACEHOLDER)
         for turn in conversations
-    ):
-        # Checked before templating: to_chat_messages turns the placeholder
-        # into a structured image part, so by then it is gone from the text.
+        if isinstance(turn.get("content"), str)
+    )
+    available = 0 if image_path is None else 1
+    if placeholders > available:
         raise ValueError(
-            f"record {record.get('id')!r} has no image but its conversation "
-            f"still carries an {IMAGE_PLACEHOLDER} placeholder"
+            f"record {record.get('id')!r} carries {placeholders} "
+            f"{IMAGE_PLACEHOLDER} placeholder(s) but {available} image(s)"
         )
 
     messages = to_chat_messages(conversations)

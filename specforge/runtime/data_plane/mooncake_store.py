@@ -67,6 +67,16 @@ from specforge.runtime.data_plane.feature_store import FeatureStore, spec_from_t
 
 logger = logging.getLogger(__name__)
 
+#: ``remove()`` status codes this store classifies, verified against the
+#: installed mooncake-store build: removing a key that is not there answers
+#: OBJECT_NOT_FOUND, and removing one whose read lease is still live answers
+#: OBJECT_HAS_LEASE. Every ``get_into`` AND every ``is_exist`` grants such a
+#: lease for the master's ``default_kv_lease_ttl`` (10s by default), so the
+#: remove a consumer issues right after reading a sample is expected to answer
+#: OBJECT_HAS_LEASE and to succeed once that lease lapses.
+_REMOVE_OBJECT_NOT_FOUND = -704
+_REMOVE_OBJECT_HAS_LEASE = -706
+
 # Defaults for MooncakeDistributedStore.setup(); override via ``setup_kwargs``.
 _MOONCAKE_SETUP_DEFAULTS = {
     "global_segment_size": 1 << 30,  # 1 GiB per-node segment
@@ -314,13 +324,32 @@ class MooncakeFeatureStore(FeatureStore):
                 f"mooncake get_into short read for {key}: got {rc} of {nb} bytes"
             )
 
-    def _store_remove(self, key: str) -> bool:
-        """Best-effort physical free. Returns True on confirmed removal."""
+    def _store_remove_status(self, key: str) -> str:
+        """One physical remove, as ``removed`` / ``absent`` / ``retry``.
+
+        Classified from the status code rather than by probing, because
+        ``is_exist`` grants a fresh read lease: probing a key whose remove just
+        failed renews the very lease that blocked it, and every later retry
+        then lands inside a window the probe keeps extending. The code already
+        separates the two outcomes -- a key that is not there is as good as
+        freed, only a live lease is worth retrying.
+        """
         try:
             rc = self._store.remove(key)
         except Exception:  # pragma: no cover - transient RPC failure
-            return False
-        return rc is None or int(rc) == 0
+            return "retry"
+        if rc is None or int(rc) == 0:
+            return "removed"
+        rc = int(rc)
+        if rc == _REMOVE_OBJECT_NOT_FOUND:
+            return "absent"  # freed remotely / never written -> nothing to hold
+        if rc == _REMOVE_OBJECT_HAS_LEASE:
+            return "retry"  # a live read lease, which lapses on its own
+        return "retry"  # unknown RPC-level failure, also worth another attempt
+
+    def _store_remove(self, key: str) -> bool:
+        """Best-effort physical free. True when the key is gone afterwards."""
+        return self._store_remove_status(key) != "retry"
 
     # -- write -------------------------------------------------------------
     def put(
@@ -560,32 +589,22 @@ class MooncakeFeatureStore(FeatureStore):
         return out, gen
 
     # -- lifetime ----------------------------------------------------------
-    def _try_physical_free(
-        self,
-        sample_id: str,
-        *,
-        confirm_absent_on_failure: bool = True,
-    ) -> bool:
+    def _try_physical_free(self, sample_id: str) -> bool:
         """Remove all tensor objects. False on a retryable RPC failure.
 
-        Order matters against Mooncake's lease semantics: an is_exist probe
-        GRANTS a read lease, and a remove during any live lease fails (-706).
-        So each key is removed FIRST. The optional exist probe runs only after a
-        failed remove, purely to classify "already gone" as freed. Retry loops
-        disable that probe because probing a still-live key would renew its
-        lease and make every following remove fail again.
+        Never probes with ``is_exist``. The remove status already tells
+        "already gone" (freed) apart from "still leased" (retry), and a probe
+        would grant a fresh read lease that makes the next remove fail again --
+        which is how a bounded retry budget gets spent without the lease it is
+        waiting on ever being allowed to lapse.
         """
         gen = self._generation.get(sample_id)
         if gen is None:
             return True  # nothing tracked to remove (already freed)
         ok = True
         for name in self._sample_names.get(sample_id, []):
-            key = self._tkey(sample_id, gen, name)
-            if self._store_remove(key):
-                continue
-            if confirm_absent_on_failure and not self._store_exists(key):
-                continue  # already gone (freed remotely) counts as freed
-            ok = False
+            if not self._store_remove(self._tkey(sample_id, gen, name)):
+                ok = False
         return ok
 
     def _free_bookkeeping_locked(self, sample_id: str) -> int:
@@ -670,17 +689,9 @@ class MooncakeFeatureStore(FeatureStore):
                         "release_pending": 0,
                         "attempts": attempt,
                     }
-                final_attempt = attempt + 1 == max_attempts
                 for sample_id in pending:
                     try:
-                        physically_removed = self._try_physical_free(
-                            sample_id,
-                            # Intermediate retries must not renew Mooncake's
-                            # read lease. The final probe only classifies an
-                            # already-absent key and has no following retry to
-                            # poison.
-                            confirm_absent_on_failure=final_attempt,
-                        )
+                        physically_removed = self._try_physical_free(sample_id)
                     except Exception as exc:  # preserve state for the next retry
                         last_errors[sample_id] = f"{type(exc).__name__}: {exc}"
                         physically_removed = False
@@ -730,13 +741,13 @@ class MooncakeFeatureStore(FeatureStore):
                     and not self._still_leased_locked(sid, self._generation.get(sid))
                 ]
                 for sid in stale:
-                    if self._try_physical_free(sid, confirm_absent_on_failure=False):
+                    if self._try_physical_free(sid):
                         freed_bytes += self._free_bookkeeping_locked(sid)
                         freed += 1
                     else:
                         self._release_pending.setdefault(sid, 0)
-            # Reconcile release-pending without an exists probe: is_exist grants
-            # a read lease that would make the next remove fail (-706).
+            # Reconcile release-pending. No exists probe anywhere: is_exist
+            # grants a read lease that would make the next remove fail (-706).
             for sid in list(self._release_pending):
                 if self._release_pending[sid] >= self.max_release_attempts:
                     # Keep the physical key metadata and surface the pending
@@ -745,7 +756,7 @@ class MooncakeFeatureStore(FeatureStore):
                     # make a hard-pinned remote leak invisible.
                     continue
                 attempts = self._release_pending[sid] + 1
-                if self._try_physical_free(sid, confirm_absent_on_failure=False):
+                if self._try_physical_free(sid):
                     freed_bytes += self._free_bookkeeping_locked(sid)
                     freed += 1
                 else:

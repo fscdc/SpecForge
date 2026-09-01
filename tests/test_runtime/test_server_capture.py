@@ -651,24 +651,30 @@ class TestServerCaptureAdapter(unittest.TestCase):
 
         original_remove = backend.remove
         original_exists = backend.is_exist
-        backend.remove = lambda _key: -1
+        backend.remove = lambda _key: -1  # retryable RPC failure
 
-        def unavailable(_key):
-            raise RuntimeError("metadata unavailable")
+        def unreachable(_key):
+            raise AssertionError(
+                "discard must not probe is_exist: the probe grants a fresh read "
+                "lease, which is what blocks the next remove"
+            )
 
-        backend.is_exist = unavailable
-        with self.assertRaisesRegex(RuntimeError, "metadata unavailable"):
-            store.discard_external_attempts()
+        backend.is_exist = unreachable
+        # Discard completes its own bookkeeping; only the physical free is
+        # deferred, which is exactly what _release_pending is for.
+        self.assertEqual(1, store.discard_external_attempts())
 
         health = store.health()
         self.assertEqual(1, health["resident_samples"])
-        self.assertEqual(1, health["provisional_external"])
         self.assertEqual(1, health["release_pending"])
+        self.assertTrue(backend._d)  # keys still physically present
 
         backend.remove = original_remove
         backend.is_exist = original_exists
+        # The lifecycle drain is what actually reclaims them.
         store.drain_pending_removals(retry_interval_s=0)
         self.assertFalse(backend._d)
+        self.assertEqual(0, store.health()["release_pending"])
         self.assertEqual(0, store.health()["provisional_external"])
 
     def test_verify_specs_matches_tensor_verification_semantics(self):

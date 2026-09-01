@@ -9,7 +9,7 @@ import math
 import os
 import statistics
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import sglang as sgl
@@ -494,6 +494,72 @@ def load_verify_entropy_dump(path: str) -> Dict[str, Dict[str, Any]]:
                     else:
                         bucket["discarded"].append(value)
     return per_rid
+
+
+def results_path(output_dir: str, name: Optional[str]) -> str:
+    """
+    Where a run writes its results.
+
+    Deliberately without a timestamp: a rerun with the same --name lands on the
+    same file, so it can pick up the benchmarks the previous run finished and
+    only run what is missing.
+    """
+    return os.path.join(output_dir, f"{name + '_' if name else ''}results.jsonl")
+
+
+def load_results(
+    path: str, metadata: Dict[str, Any]
+) -> Tuple[Dict[str, Any], Set[str]]:
+    """
+    The results accumulated so far, ready for this run to add to.
+
+    The file holds one key per finished benchmark alongside the run's
+    configuration, so the benchmarks already in it are exactly the keys that
+    `metadata` does not claim. Their entries are returned untouched and named
+    in the second return value; the configuration is replaced by this run's,
+    which is the one the remaining benchmarks will actually use.
+
+    A file that cannot be parsed raises rather than being overwritten -- it
+    still holds hours of measurements.
+    """
+    results = dict(metadata)
+    if not os.path.exists(path):
+        return results, set()
+
+    try:
+        with open(path) as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            f"{path} exists but could not be read back ({error}). Move it aside "
+            "or delete it -- continuing would overwrite the benchmarks it holds."
+        ) from error
+    if not isinstance(stored, dict):
+        raise RuntimeError(
+            f"{path} holds a {type(stored).__name__}, not the object this "
+            "script writes. Move it aside or delete it."
+        )
+
+    # an empty list means the benchmark was never recorded, so it is not done
+    done = {key for key in stored if key not in metadata and stored[key]}
+    for key in done:
+        results[key] = stored[key]
+    return results, done
+
+
+def save_results(path: str, results: Dict[str, Any]) -> None:
+    """
+    Write the results file in one step.
+
+    Written to a sibling and renamed, because this is now called after every
+    benchmark: a run interrupted mid-write leaves the previous file intact
+    instead of a truncated one the next run would refuse to read.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    temporary = f"{path}.tmp"
+    with open(temporary, "w") as handle:
+        json.dump(results, handle, indent=4, default=str)
+    os.replace(temporary, path)
 
 
 def print_results(

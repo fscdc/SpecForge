@@ -5,7 +5,7 @@
 #   --draft-config configs/qwen3.5-4b-dflash.json \
 #   --output-dir /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-160000
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 GPU_IDS=(0)
 
@@ -45,7 +45,7 @@ for idx in "${!GPU_IDS[@]}"; do
         echo "GPU ${GPU_IDS[$idx]} is not among the ${#VISIBLE_GPUS[@]} GPU(s) of this job" >&2
         exit 1
     fi
-    port=$((30000 + idx * 10))
+    port=$((32000 + idx * 10))
     SERVER_ADDRESSES+=("localhost:${port}")
     PORTS+=("${port}")
     BASE_URLS+=("http://localhost:${port}")
@@ -102,7 +102,7 @@ python benchmarks/bench_mm.py \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
     --block-size ${BLOCK_SIZE} \
-    --benchmark-list chartqa:200 mmstar:200 realworldqa:200 mmmu:200 mathvision:200 vdc:20 \
+    --benchmark-list chartqa:200 mmstar:200 realworldqa:200 mmmu:200 textvqa:200 seedbench-image:200 mathvision:200 \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \

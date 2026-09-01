@@ -39,9 +39,9 @@ export HF_HUB_DOWNLOAD_TIMEOUT=120
 #     --dataset llava-onevision-1.5 \
 #     --sample-size 1000000 \
 #     --fetch shards \
-#     --manifest ./scripts/reproduce/llava-ov15-1M_manifest.json \
-#     --image-root TODO \
-#     --output-path TODO \
+#     --manifest ./scripts/data_reproduce/llava-ov15-1M_manifest.json \
+#     --image-root /local_home2/fengsicheng/specforge/data \
+#     --output-path /local_home2/fengsicheng/specforge/data \
 #     --output-name llava-ov15-1M
 
 
@@ -50,16 +50,16 @@ export HF_HUB_DOWNLOAD_TIMEOUT=120
 
 
 # for deep100
-# export LD_LIBRARY_PATH="/home/svu/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
-# export FLASHINFER_USE_CUDA_NORM=1
-# export NVCC_PREPEND_FLAGS="-ccbin g++-11"
+export LD_LIBRARY_PATH="/home/svu/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
+export FLASHINFER_USE_CUDA_NORM=1
+export NVCC_PREPEND_FLAGS="-ccbin g++-11"
 
 # for hopper
-export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
-export FLASHINFER_USE_CUDA_NORM=1
+# export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
+# export FLASHINFER_USE_CUDA_NORM=1
 
 export PYTHONUNBUFFERED=1
-GPU_IDS=(0 1)
+GPU_IDS=(0 1 2 3)
 
 JOB_ID="${PBS_JOBID:-${SLURM_JOB_ID:-local}}"
 LOG_DIR="logs/regen_${JOB_ID}"
@@ -92,7 +92,7 @@ echo "[info] starting SGLang servers..."
 
 for idx in "${!GPU_IDS[@]}"; do
     gpu_id="${GPU_IDS[$idx]}"
-    port=$((30000 + idx * 10))
+    port=$((40000 + idx * 10))
     addr="localhost:${port}"
 
     SERVER_ADDRESSES+=("${addr}")
@@ -164,6 +164,8 @@ echo "[run] regen log: ${LOG_DIR}/regen.log"
 
 
 # TODO@song: 这地方换成自己的路径即可
+# hpc
+# /scratch/Projects/CFP-04/CFP04-CF-054
 if python3 scripts/regenerate_train_data.py \
     --model Qwen/Qwen3.5-4B \
     --concurrency 64 \
@@ -172,11 +174,10 @@ if python3 scripts/regenerate_train_data.py \
     --temperature 0.0 \
     --top-p 0.95 \
     --top-k 20 \
-    --input-file-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/data/llava-ov15-1M_train.jsonl \
-    --output-file-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M-prompted_regen_first_turn.jsonl \
+    --input-file-path /local_home2/fengsicheng/specforge/data/llava-ov15-1M_train.jsonl \
+    --output-file-path /local_home2/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M_regen_first_turn.jsonl \
     --resume \
     --reasoning disable \
-    --align-prompts \
     > "${LOG_DIR}/regen.log" 2>&1
 then
     echo "[done] regeneration finished successfully"

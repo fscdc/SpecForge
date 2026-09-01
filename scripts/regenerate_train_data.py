@@ -1,49 +1,10 @@
-"""
-This script will re-generate the dataset from target model,
-which better aligns the draft model with the target model’s output distribution.
-
-Usage:
-1. Set up one or more SGLang servers for the target model.
-
-python3 -m sglang.launch_server \
-	--model Qwen/Qwen3.5-4B \
-	--mem-fraction-static 0.7 \
-	--tp 1 \
-	--trust-remote-code \
-    --cuda-graph-max-bs 128 \
-	--host 0.0.0.0 \
-	--port 30000 \
-	--dtype bfloat16 \
-    --reasoning-parser qwen3
-
-
-2. Regenerate the dataset using the `regenerate_train_data.py` script.
-python scripts/regenerate_train_data.py \
-    --model Qwen/Qwen3.5-4B \
-    --concurrency 128 \
-    --max-tokens 4096 \
-    --server-address localhost:30000 localhost:30010 localhost:30020 localhost:30030 localhost:30040 localhost:30050 localhost:30060 localhost:30070 \
-    --temperature 0.7 \
-    --top-p 0.8 \
-    --top-k 20 \
-    --input-file-path /local_home1/fengsicheng/specforge/data/sharegpt4v_train.jsonl \
-    --output-file-path /local_home1/fengsicheng/specforge/regen_data/sharegpt4v_regen_first_turn.jsonl \
-    --resume \
-    --reasoning disable
-
-Multimodal rows (produced by prepare_data_mm.py) carry a top-level `image`
-path and an `<image>` placeholder inside a user turn's text. Multimodal
-regeneration is restricted to Qwen3.5 chat/instruct checkpoints (see
-SUPPORTED_MM_MODELS below); "-Base" checkpoints are not chat-aligned and are
-rejected.
-"""
-
 import argparse
 import base64
 import json
 import mimetypes
 import os
 import random
+import re
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Sequence
@@ -222,6 +183,352 @@ def apply_math_cot_prompt(
         message["content"] = content.rstrip() + suffix
         return True
     return False
+
+#: Answer-format instructions that pin the response down to a word, a phrase,
+#: a yes/no or an option letter. `--align-prompts` REPLACES these with
+#: MATH_COT_SUFFIX instead of appending to it: the two contradict, and the
+#: boxed wording is what the benchmarks send, so a row that kept its terse
+#: instruction would train the draft model on a prompt shape it never meets.
+#:
+#: The list is exact, closed, and was read off the corpus rather than guessed:
+#: every sentence that ends a prompt in >= 20 rows of
+#: llava-ov15-1M_train.jsonl (293 of them) was reviewed, and these are the ones
+#: that constrain the ANSWER.
+#:
+#: Exact strings matter more than they look. The blend is full of wording that
+#: reads like a terse instruction but IS the task -- "Please introduce the
+#: image in a concise, factual manner." alone is 96,902 rows, and "Describe the
+#: image concisely.", "Provide a brief description of the given image.",
+#: "Express your answer as a common fraction." and "Answer with detailed
+#: steps." are all tasks too. Matching on "concise"/"short"/"brief", or on any
+#: regex looser than these literals, would rewrite a tenth of the corpus into
+#: maths prompts. None of those near misses ever co-occurs with an instruction
+#: below (measured: 0 rows), so exact matching alone keeps them safe.
+#:
+#: Removed longest-first, so an instruction that contains a shorter one cannot
+#: leave its tail behind.
+TERSE_ANSWER_INSTRUCTIONS = (
+    # -- answer reduced to a word or a phrase
+    "Answer the question with a short phrase.",
+    "Answer the question using a single word or phrase.",
+    "Answer the question with a single word or phrase.",
+    "Answer the question with a single word or short phrase.",
+    "Answer the question with Yes or No.",
+    "Answer this question using the text in the image directly.",
+    "Reply using only a word or a phrase.",
+    "Provide a single-word or phrase answer.",
+    "Give your answer in one word or a phrase.",
+    "Respond with just one word or a short phrase.",
+    "Answer concisely with one word or phrase.",
+    "Please respond briefly.",
+    "Please answer in short and concise manner.",
+    "Answer in brief.",
+    "Answer in a concise manner.",
+    "Answer in a concise, factual manner.",
+    "Provide a concise answer.",
+    # -- answer reduced to an option letter. Replaced for the same reason
+    # benchmarks/mm_benchmarker/mathvision.py drops the task's own "answer with
+    # the option's letter" line: a boxed letter satisfies both, an unboxed one
+    # does not.
+    "Answer with the option's letter from the given choices directly.",
+    "Please select the correct answer by letter.",
+    "Answer with the letter.",
+)
+
+#: The same class of instruction, written as a preamble that WRAPS the question
+#: ("Hint: <instruction>\nQuestion: <question>\nChoices: ...") instead of
+#: trailing it. The whole line goes, not just the sentence, or the "Hint:"
+#: label would dangle.
+TERSE_ANSWER_PREAMBLES = (
+    "Hint: Please answer the question and provide the correct option letter, "
+    "e.g., A, B, C, D, at the end.",
+    "Hint: Please answer the question and provide the final answer at the end.",
+    "First conduct reasoning for the text-only mathemtical problem and then "
+    "provide the corret option letter at the end.",
+    "Answer the mathemtical geometry problem and directly provide the correct "
+    "option letter.",
+)
+
+#: The label that pairs with a preamble. In all 11,997 rows carrying one, the
+#: next line is "Question: ...", so once the preamble goes the label is a
+#: vestige -- and dropping it leaves the bare question the benchmarks send.
+#: "Choices:" is NOT dropped: a benchmark prompt keeps its choice block.
+PREAMBLE_QUESTION_LABEL = "Question:"
+
+#: Prompts that prescribe a shape for the WHOLE response -- llava_cot's
+#: <SUMMARY>/<CAPTION> scaffold, ifeval's length/keyword/casing/postscript
+#: constraints, geometry's "Answer: xxx" form. Rewriting these would delete the
+#: task, so a prompt carrying any of these markers is left exactly as it is
+#: even when it also carries a terse instruction (711 rows do).
+STRUCTURED_OUTPUT_MARKERS = (
+    "You are tasked with analyzing images and providing structured responses",
+    "First perform reasoning, then finally select the question from the "
+    "choices in the following format:",
+    "According to the question shown in the image, please first perform "
+    "reasoning, then finally select the right answer from the choices",
+    "Your ENTIRE response should be in",
+    "Your entire response should be in English, and in all lowercase",
+    "Your response should contain at least",
+    "Your answer must contain",
+    "Highlight at least",
+    "Finish your response with this exact phrase",
+    "Include keywords",
+    "At the end of your response, please explicitly add a postscript",
+    "Answer with one of the following options:",
+    "Answer with at least",
+)
+
+#: Case-insensitive, because ifeval ships a lowercased copy of this one.
+STRUCTURED_OUTPUT_MARKERS_CASEFOLD = ("No other words should follow this phrase.",)
+
+
+def carries_structured_template(text: str) -> bool:
+    """Whether a prompt prescribes the shape of the whole response."""
+    if any(marker in text for marker in STRUCTURED_OUTPUT_MARKERS):
+        return True
+    lowered = text.lower()
+    return any(
+        marker.lower() in lowered for marker in STRUCTURED_OUTPUT_MARKERS_CASEFOLD
+    )
+
+
+def strip_terse_answer_instructions(text: str) -> tuple[str, list[str]]:
+    """Remove every terse answer-format instruction, and say which ones went.
+
+    Returns the remaining prompt and the instructions removed. The prompt comes
+    back unchanged (and the list empty) when it carries none, so the caller can
+    tell a rewrite from a no-op.
+
+    Both shapes are handled. A preamble owns a whole line, but not always the
+    first one -- an image row leads with the <image> placeholder, so the
+    instruction sits on line two -- hence matching line by line; the
+    "Question:" label it left behind goes with it. A trailing or inline
+    instruction is cut where it stands, every occurrence of it: some rows stack
+    two with no separator ("...single word or phrase.Provide a single-word or
+    phrase answer.").
+    """
+    removed: list[str] = []
+
+    for preamble in TERSE_ANSWER_PREAMBLES:
+        if preamble not in text:
+            continue
+        lines: list[str] = []
+        dropped = False
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not dropped and stripped.startswith(preamble):
+                remainder = stripped[len(preamble) :].strip()
+                # geo3k writes the label on the SAME line as its preamble
+                if remainder.startswith(PREAMBLE_QUESTION_LABEL):
+                    remainder = remainder[len(PREAMBLE_QUESTION_LABEL) :].strip()
+                dropped = True
+                if remainder:
+                    lines.append(remainder)
+                continue
+            if dropped and stripped.startswith(PREAMBLE_QUESTION_LABEL):
+                # the label only existed to pair with the preamble
+                lines.append(stripped[len(PREAMBLE_QUESTION_LABEL) :].strip())
+                continue
+            lines.append(line)
+        if dropped:
+            text = "\n".join(lines)
+            removed.append(preamble)
+
+    # longest first: no instruction may leave the tail of another behind
+    for instruction in sorted(TERSE_ANSWER_INSTRUCTIONS, key=len, reverse=True):
+        if instruction in text:
+            text = text.replace(instruction, " ")
+            removed.append(instruction)
+
+    return text, removed
+
+
+def rewrite_terse_answer_prompt(data: Any, suffix: str) -> bool:
+    """Replace a row's terse answer-format instruction with the boxed one.
+
+    Only the first user message is rewritten, for the reason
+    apply_math_cot_prompt gives: these rows are one question each, and what
+    matters is that the target answers the prompt the draft is later
+    benchmarked on.
+
+    Returns whether the row was rewritten. It is not when the prompt carries no
+    terse instruction, when it prescribes a response shape
+    (`carries_structured_template`), when the boxed suffix is already there --
+    so a resumed run never stacks it -- or when removing the instruction would
+    leave nothing to ask, which would turn the row into a bare image.
+
+    What was removed is recorded on the row under `prompt_rewrite`, so the
+    output file carries the evidence that the replacement was complete and not
+    merely its result.
+    """
+    if not suffix or not isinstance(data, dict):
+        return False
+    conversations = data.get("conversations")
+    if not isinstance(conversations, list):
+        return False
+
+    for message in conversations:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            return False
+        if carries_structured_template(content):
+            return False
+        if content.rstrip().endswith(suffix.strip()):
+            return False
+
+        stripped, removed = strip_terse_answer_instructions(content)
+        if not removed:
+            return False
+
+        # tidy the whitespace the removals left, without touching the
+        # question's own line breaks
+        stripped = "\n".join(line.rstrip() for line in stripped.split("\n"))
+        while "\n\n\n" in stripped:
+            stripped = stripped.replace("\n\n\n", "\n\n")
+        stripped = stripped.strip()
+
+        # a prompt that was nothing but its instruction has no question left,
+        # and MATH_COT_SUFFIX alone is not one
+        if not stripped.replace(IMAGE_PLACEHOLDER, "").strip():
+            return False
+
+        message["content"] = stripped + suffix
+        data["prompt_rewrite"] = {"rule": "terse-answer", "removed": removed}
+        return True
+    return False
+
+
+#: LLaVA-OneVision configs whose questions expect a short factual answer -- a
+#: value read off a chart, a count, a table cell, a geometry result -- but whose
+#: prompts carry no answer-format instruction at all. `--align-prompts` APPENDS
+#: MATH_COT_SUFFIX to their question rows, so they train the draft model on the
+#: same prompt shape as the rows whose terse instruction was replaced.
+#:
+#: The list is by config, not by text: these rows have no instruction sentence
+#: to match. It was read off the corpus config by config -- generation-style
+#: subsets (captions, chart summaries, OCR transcription, TikZ/HTML, region
+#: grounding) are deliberately absent.
+SHORT_ANSWER_CONFIGS = frozenset(
+    {
+        # chart values and labels
+        "tinychart_train",
+        "plotqa",
+        "mapqa",
+        "cambrian",
+        # document / text-in-image QA
+        "Docmatix",
+        "allenai_pixmo_docs",
+        "textvqa",
+        "st_vqa",
+        "llavar",
+        "visualmrc",
+        # tables
+        "robut_wikisql",
+        "robut_wtq",
+        "robut_sqa",
+        "hitab",
+        "finqa",
+        "tat_qa",
+        # counting and synthetic attributes
+        "CLEVR",
+        "tallyqa",
+        # geometry and figures
+        "geo170k_align",
+        "geomverse",
+        "intergps",
+        "arxiv_figs",
+        # general knowledge / VQA
+        "aokvqa",
+        "viquae",
+    }
+)
+
+#: The subset of SHORT_ANSWER_CONFIGS whose questions are imperative
+#: computations ("Compute the diagonal ...", "Find y.") rather than questions:
+#: not one of their rows ends with a question mark, so the gate below would
+#: exclude exactly the rows the suffix fits best.
+SHORT_ANSWER_IMPERATIVE_CONFIGS = frozenset({"geomverse", "intergps"})
+
+#: Question-phrased requests for a description, which a boxed final answer does
+#: not fit ("Could you describe the environment shown in the picture?" --
+#: cambrian carries a few hundred). Used only to SKIP appending: a false
+#: positive here merely leaves a row unchanged, which is why this one may be a
+#: heuristic while the replace/append selections must be exact.
+DESCRIPTION_QUESTION = re.compile(
+    r"^(?:can|could|would) you (?:describe|elaborate|discuss|tell me (?:something|more) about)"
+    r"|^what (?:do you (?:see|think is going on)|is happening|are the key elements)"
+    r"|^how would you describe",
+    re.IGNORECASE,
+)
+
+
+def row_config(data: Any) -> str | None:
+    """Which LLaVA-OneVision config a row came from, read off its id."""
+    if not isinstance(data, dict):
+        return None
+    identifier = data.get("id")
+    if not isinstance(identifier, str) or "#" not in identifier:
+        return None
+    return _base_config(identifier.rsplit("#", 1)[0])
+
+
+def append_short_answer_prompt(
+    data: Any, suffix: str, configs: frozenset | set
+) -> bool:
+    """Append the boxed instruction to a short-answer row that carries none.
+
+    Runs AFTER the terse rewrite and the math rule: a row either of them
+    already suffixed ends with `suffix` and is skipped here, so nothing stacks.
+
+    A row is appended to when its config is one of `configs` and its prompt is
+    a question (ends with "?"), or unconditionally for the imperative-math
+    configs. Rows prescribing a response shape, question-phrased description
+    requests, and rows with no text beyond the image placeholder are left
+    alone.
+
+    The append is recorded on the row under `prompt_rewrite`, like the terse
+    rule records its removals.
+    """
+    if not suffix or not isinstance(data, dict):
+        return False
+    config = row_config(data)
+    if config is None or config not in configs:
+        return False
+    conversations = data.get("conversations")
+    if not isinstance(conversations, list):
+        return False
+
+    for message in conversations:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            return False
+        if carries_structured_template(content):
+            return False
+        if content.rstrip().endswith(suffix.strip()):
+            return False
+
+        body = content.replace(IMAGE_PLACEHOLDER, " ").strip()
+        if not body:
+            return False
+        if (
+            not body.endswith("?")
+            and config not in SHORT_ANSWER_IMPERATIVE_CONFIGS
+        ):
+            # statements in these configs are the generation-style remainder
+            # ("Generate underlying data table of the chart."), not questions
+            return False
+        if DESCRIPTION_QUESTION.search(body.split("\n")[-1].strip()):
+            return False
+
+        message["content"] = content.rstrip() + suffix
+        data["prompt_rewrite"] = {"rule": "short-answer-config", "config": config}
+        return True
+    return False
+
 
 # Chat/Instruct Qwen3.5 checkpoints only. "-Base" checkpoints are not
 # chat-aligned and cannot reliably serve /v1/chat/completions requests.
@@ -407,11 +714,20 @@ def parse_arguments():
         help=(
             "Rewrite prompts to the wording the benchmarks use before asking "
             "the target model, instead of regenerating against the prompt the "
-            "JSONL already carries. Today the only rule is math: a row gets "
-            "--math-cot-suffix appended when its LLaVA-OneVision family is a "
-            "--math-family, or its `source` handle is a --math-source. Off by "
-            "default for every blend, so the default run reproduces the "
-            "dataset's own prompts."
+            "JSONL already carries. Two rules run, in this order. Math: a row "
+            "gets --math-cot-suffix APPENDED when its LLaVA-OneVision family "
+            "is a --math-family, or its `source` handle is a --math-source. "
+            "Terse answers: a row whose prompt pins the response to a word, a "
+            "phrase, a yes/no or an option letter has that instruction "
+            "REPLACED by --math-cot-suffix, because the two contradict; "
+            "prompts that prescribe a whole response shape (llava_cot's "
+            "<SUMMARY> scaffold, ifeval's constraints, geometry's "
+            "'Answer: xxx') are left alone, and --no-terse-rewrite turns the "
+            "rule off. Short answers: a question row of a --short-answer-config "
+            "(chart/table/document/counting/geometry subsets whose answers are "
+            "short but whose prompts carry no instruction) gets the suffix "
+            "APPENDED. Off by default for every blend, so the default run "
+            "reproduces the dataset's own prompts."
         ),
     )
     prompt_group.add_argument(
@@ -421,6 +737,29 @@ def parse_arguments():
         help=(
             "With --align-prompts, the instruction appended to a math row's "
             "prompt (default: the gsm8k/math500/aime suffix)."
+        ),
+    )
+    prompt_group.add_argument(
+        "--no-terse-rewrite",
+        action="store_true",
+        help=(
+            "With --align-prompts, keep the terse answer-format instructions "
+            "(the 'short phrase' / 'single word or phrase' suffixes, the "
+            "'Hint: ... provide the final answer at the end.' preamble, and "
+            "the option-letter ones) instead of replacing them with "
+            "--math-cot-suffix. The math rule still runs."
+        ),
+    )
+    prompt_group.add_argument(
+        "--short-answer-config",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "With --align-prompts, LLaVA-OneVision configs whose "
+            "instruction-less question rows get --math-cot-suffix appended "
+            "(default: the built-in short-answer list, see "
+            "SHORT_ANSWER_CONFIGS). Pass with no values to disable the rule."
         ),
     )
     prompt_group.add_argument(
@@ -457,6 +796,17 @@ def parse_arguments():
     args = parser.parse_args()
     if args.math_family is None:
         args.math_family = list(DEFAULT_MATH_FAMILIES)
+    if args.short_answer_config is None:
+        args.short_answer_config = sorted(SHORT_ANSWER_CONFIGS)
+    unknown_configs = sorted(
+        set(args.short_answer_config) - set(LLAVA_OV_FAMILIES)
+    )
+    if unknown_configs:
+        parser.error(
+            f"--short-answer-config: unknown config(s) {unknown_configs}, "
+            "expected LLaVA-OneVision config names (see "
+            "scripts/prepare_data_mm.py::LLAVA_OV_FAMILIES)"
+        )
     unknown = sorted(set(args.math_family) - set(LLAVA_OV_FAMILIES.values()))
     if unknown:
         parser.error(
@@ -847,6 +1197,18 @@ def main():
         print(f"    math families: {', '.join(args.math_family)}")
         print(f"    math sources : {' '.join(args.math_source)}")
         print(f"    math suffix  : {args.math_cot_suffix.strip()!r}")
+        print(
+            "    terse rewrite: "
+            + ("off (--no-terse-rewrite)" if args.no_terse_rewrite else "on")
+        )
+        print(
+            "    short answers: "
+            + (
+                f"{len(args.short_answer_config)} configs"
+                if args.short_answer_config
+                else "off (--short-answer-config with no values)"
+            )
+        )
         labelling = input_math_annotation(args.input_file_path)
         if labelling is None:
             print(
@@ -926,6 +1288,10 @@ def main():
     skipped_samples = 0
     submitted_samples = 0
     aligned_samples = 0
+    terse_rewritten_samples = 0
+    terse_removed: Counter[str] = Counter()
+    short_answer_samples = 0
+    short_answer_configs_hit: Counter[str] = Counter()
 
     # Create progress bar
     with (
@@ -956,9 +1322,33 @@ def main():
             data = json.loads(line.strip())
             unusable = sanitize_regen_row(data)
             if unusable is None and args.align_prompts:
+                # The terse rule runs FIRST. A text-math row can carry a terse
+                # preamble ("First conduct reasoning ... provide the corret
+                # option letter at the end."), and the math rule would append
+                # the boxed suffix to it; the terse rule then bails on the
+                # suffix it finds and leaves the contradicting preamble in
+                # place. Rewriting first strips the preamble and appends the
+                # suffix itself, after which the math rule no-ops on it.
+                if not args.no_terse_rewrite:
+                    rewritten = rewrite_terse_answer_prompt(
+                        data, args.math_cot_suffix
+                    )
+                    terse_rewritten_samples += rewritten
+                    if rewritten:
+                        for instruction in data["prompt_rewrite"]["removed"]:
+                            terse_removed[instruction] += 1
                 aligned_samples += apply_math_cot_prompt(
                     data, args.math_cot_suffix, args.math_family, args.math_source
                 )
+                if args.short_answer_config:
+                    appended = append_short_answer_prompt(
+                        data, args.math_cot_suffix, set(args.short_answer_config)
+                    )
+                    short_answer_samples += appended
+                    if appended:
+                        short_answer_configs_hit[
+                            data["prompt_rewrite"]["config"]
+                        ] += 1
             invalid_reason = unusable or validate_regen_input(data)
             if invalid_reason is not None:
                 skipped_file_handle.write(
@@ -1080,6 +1470,20 @@ def main():
         )
     if args.align_prompts:
         print(f"  Prompts rewritten as math: {aligned_samples}")
+        if not args.no_terse_rewrite:
+            print(
+                "  Terse answer instructions replaced: "
+                f"{terse_rewritten_samples}"
+            )
+            for instruction, count in terse_removed.most_common():
+                print(f"    {count:>8,}  {instruction!r}")
+        if args.short_answer_config:
+            print(
+                "  Short-answer prompts appended: "
+                f"{short_answer_samples}"
+            )
+            for config, count in short_answer_configs_hit.most_common():
+                print(f"    {count:>8,}  {config}")
 
     if args.num_samples is not None:
         # A partial run's file is not the training set, so rewriting it in

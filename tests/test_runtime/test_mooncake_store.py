@@ -295,9 +295,10 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         _, handle = fs.get(ref)
         fs.release(handle)
         self.assertEqual(fs.health()["release_pending"], 1)
-        # get() and release-time failure each probe once. Drain retries must not
-        # probe again, or each probe would move lease_until forward forever.
-        expected_probes = 2 * len(ref.feature_keys)
+        # Only get() probes, once per key. The release-time failure no longer
+        # probes at all and neither do the drain retries, so nothing after the
+        # read can move lease_until forward and the retries can outlast it.
+        expected_probes = len(ref.feature_keys)
         self.assertEqual(fake.exists_calls, expected_probes)
 
         report = drain_feature_store_removals(
@@ -312,6 +313,47 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertEqual(fs.health()["release_pending"], 0)
         self.assertEqual(fs.health()["force_freed_total"], 1)
         self.assertFalse(_phys_resident(fake))
+
+    def test_remove_status_classifies_already_gone_without_probing(self):
+        """A key freed remotely is settled by the status code, not by is_exist.
+
+        This is what replaced the old post-failure ``is_exist`` probe: the
+        probe classified "already gone" as freed, but it also granted a fresh
+        read lease that made the next remove fail. Mooncake answers
+        OBJECT_NOT_FOUND for a key that is not there, which carries the same
+        information and grants nothing.
+        """
+
+        class NotFoundFake(_FakeMooncakeStore):
+            def __init__(self):
+                super().__init__()
+                self.exists_calls = 0
+
+            def is_exist(self, key):
+                self.exists_calls += 1
+                return super().is_exist(key)
+
+            def remove(self, key):
+                self.remove_calls += 1
+                if key not in self._d:
+                    return -704  # OBJECT_NOT_FOUND
+                self._d.pop(key, None)
+                return 0
+
+        fake = NotFoundFake()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        _, handle = fs.get(ref)
+        probes_after_read = fake.exists_calls
+        fake._d.clear()  # someone else reclaimed the objects
+
+        fs.release(handle)
+
+        # Settled immediately: nothing parked for retry, nothing still tracked,
+        # and not one extra probe issued to work that out.
+        self.assertEqual(fs.health()["release_pending"], 0)
+        self.assertEqual(fs.health()["resident_samples"], 0)
+        self.assertEqual(fake.exists_calls, probes_after_read)
 
     def test_lifecycle_drain_is_bounded_and_never_hides_remote_leak(self):
         fake = _FakeMooncakeStore()

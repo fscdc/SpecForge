@@ -2,19 +2,19 @@
 # Uncomment ONE launch block below; the health poll and the benchmark call at
 # the bottom are shared and only read ${NAME}.
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 GPU_IDS=(0)
 
 
 # for deep100
-# export LD_LIBRARY_PATH="/home/svu/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
-# export FLASHINFER_USE_CUDA_NORM=1
-# export NVCC_PREPEND_FLAGS="-ccbin g++-11"
+export LD_LIBRARY_PATH="/home/svu/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
+export FLASHINFER_USE_CUDA_NORM=1
+export NVCC_PREPEND_FLAGS="-ccbin g++-11"
 
 # for hopper
-export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
-export FLASHINFER_USE_CUDA_NORM=1
+# export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
+# export FLASHINFER_USE_CUDA_NORM=1
 
 EAGLE3_DRAFT_MODEL_PATH="${EAGLE3_DRAFT_MODEL_PATH:-/TODO/exports/qwen3.5-4b-eagle3-sglang}"
 
@@ -45,7 +45,7 @@ IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 #         echo "GPU ${GPU_IDS[$idx]} is not among the ${#VISIBLE_GPUS[@]} GPU(s) of this job" >&2
 #         exit 1
 #     fi
-#     port=$((30000 + idx * 10))
+#     port=$((31000 + idx * 10))
 #     SERVER_ADDRESSES+=("localhost:${port}")
 #     PORTS+=("${port}")
 #     BASE_URLS+=("http://localhost:${port}")
@@ -83,7 +83,7 @@ IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 #         echo "GPU ${GPU_IDS[$idx]} is not among the ${#VISIBLE_GPUS[@]} GPU(s) of this job" >&2
 #         exit 1
 #     fi
-#     port=$((30000 + idx * 10))
+#     port=$((31000 + idx * 10))
 #     SERVER_ADDRESSES+=("localhost:${port}")
 #     PORTS+=("${port}")
 #     BASE_URLS+=("http://localhost:${port}")
@@ -125,7 +125,9 @@ IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
         # --speculative-eagle-topk 1 \
         # --speculative-num-draft-tokens 16 \
 
-NAME=baseline_nextn_qwen35-4B_concurrency1
+NAME=mtp-15step_qwen35-4B_concurrency1
+# NAME=mtp-7step_qwen35-4B_concurrency1
+# NAME=mtp-3step_qwen35-4B_concurrency1
 
 SERVER_ADDRESSES=()
 PORTS=()
@@ -136,7 +138,7 @@ for idx in "${!GPU_IDS[@]}"; do
         echo "GPU ${GPU_IDS[$idx]} is not among the ${#VISIBLE_GPUS[@]} GPU(s) of this job" >&2
         exit 1
     fi
-    port=$((30000 + idx * 10))
+    port=$((31000 + idx * 10))
     SERVER_ADDRESSES+=("localhost:${port}")
     PORTS+=("${port}")
     BASE_URLS+=("http://localhost:${port}")
@@ -208,18 +210,19 @@ fi
 
 
 # temperature = 0.0
+# --save-generations \
+
 NAME="${NAME}_temp0"
 python benchmarks/bench_mm.py \
     --model Qwen/Qwen3.5-4B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
-    --benchmark-list chartqa:200 mmstar:200 \
+    --benchmark-list chartqa:200 mmstar:200 realworldqa:200 mmmu:200 textvqa:200 seedbench-image:200 mathvision:200 \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 8192 \
-    --save-generations \
     --name "${NAME}"
 
 

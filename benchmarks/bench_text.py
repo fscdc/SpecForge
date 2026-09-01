@@ -61,6 +61,9 @@ from benchmarker.utils import (
     format_length_summary,
     format_throughput_summary,
     length_summary,
+    load_results,
+    results_path,
+    save_results,
     throughput_summary,
 )
 from tqdm import tqdm
@@ -223,7 +226,11 @@ def parse_args() -> argparse.Namespace:
         "--name",
         type=str,
         default=None,
-        help="Name of this run, added to the output file names.",
+        help=(
+            "Name of this run, added to the output file names. Reusing it "
+            "resumes that run's results file: the benchmarks already recorded "
+            "in it are skipped."
+        ),
     )
     benchmark_group.add_argument(
         "--save-generations",
@@ -231,8 +238,8 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=(
             "Write what the model generated for every question next to the "
-            "results, as <benchmark>_generations_<timestamp>.jsonl, together "
-            "with its prompt and per-sample decoding counters."
+            "results, as <benchmark>_generations.jsonl, together with its "
+            "prompt and per-sample decoding counters."
         ),
     )
     benchmark_group.add_argument(
@@ -841,7 +848,7 @@ def main() -> None:
             continue
         sampling_params[name] = value
 
-    results: Dict[str, Any] = {
+    metadata: Dict[str, Any] = {
         "model": args.model,
         "base_urls": base_urls,
         "concurrency": concurrency,
@@ -853,7 +860,37 @@ def main() -> None:
         "transport": "openai-chat-completions",
     }
 
+    # one file per --name, written again after every benchmark. A rerun keeps
+    # the benchmarks it already holds and only measures the missing ones, so a
+    # suite that dies halfway (or a benchmark added to --benchmark-list later)
+    # costs only what has not been run yet.
+    result_file = results_path(args.output_dir, args.name)
+    results, done = load_results(result_file, metadata)
+    if done:
+        print(
+            f"Resuming {result_file}: {len(done)} benchmark(s) already recorded "
+            f"({', '.join(sorted(done))})"
+        )
+
     for benchmark_name, num_prompts, subset in benchmark_list:
+        if benchmark_name in done:
+            recorded = results[benchmark_name]
+            recorded_questions = (
+                recorded[-1].get("num_questions")
+                if isinstance(recorded, list) and isinstance(recorded[-1], dict)
+                else None
+            )
+            print(
+                f"Skipping {benchmark_name}: already in {result_file}"
+                + (
+                    f" ({recorded_questions} questions)"
+                    if recorded_questions is not None
+                    else ""
+                )
+                + ". Delete its key in that file to measure it again."
+            )
+            continue
+
         print(
             f"Running benchmark {benchmark_name} with {num_prompts} prompts, "
             f"concurrency {concurrency} x {len(base_urls)} server(s), "
@@ -999,7 +1036,7 @@ def main() -> None:
             dump_path = os.path.join(
                 args.output_dir,
                 f"{args.name + '_' if args.name else ''}{benchmark_name}"
-                f"_generations_{time.strftime('%Y%m%d_%H%M%S')}.jsonl",
+                "_generations.jsonl",
             )
             written = dump_generations(dump_path, stats, contexts)
             print(f"Saved {written} generations to {dump_path}")
@@ -1037,15 +1074,16 @@ def main() -> None:
             )
         )
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    result_file = os.path.join(
-        args.output_dir,
-        f"{args.name + '_' if args.name else ''}results_"
-        f"{time.strftime('%Y%m%d_%H%M%S')}.jsonl",
-    )
-    with open(result_file, "w") as handle:
-        json.dump(results, handle, indent=4, default=str)
-    print(f"Results saved to {result_file}")
+        # written here rather than after the loop, so that a suite killed in a
+        # later benchmark keeps everything measured up to this point
+        save_results(result_file, results)
+        done.add(benchmark_name)
+        print(f"Saved {benchmark_name} to {result_file}")
+
+    if os.path.exists(result_file):
+        print(f"Results saved to {result_file}")
+    else:
+        print("No benchmark produced results, nothing was written.")
 
 
 if __name__ == "__main__":

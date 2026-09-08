@@ -33,6 +33,7 @@ training:
   log_interval: 50
   dist_timeout: 30
   seed: 42
+
 tracking:
   report_to: "tensorboard"
 run_id: "qwen3.5-4b-dflash-baseline-llava-ov15-1M"

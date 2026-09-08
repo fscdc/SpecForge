@@ -1,0 +1,347 @@
+==================================================================
+  project    : /home/svu/fengsicheng/Projects/SpecForge
+  target     : Qwen/Qwen3.5-4B  (as Qwen3.5-4B)
+  benchmarks : 8  ->  chartqa mmstar realworldqa seedbench-image textvqa mmmu mathvision dynamath
+  drafts     : 3  ->  zlab mmflash llava-ov-1M-100k
+  pairs      : 24   (200 samples, 128 anchors each)
+  budget     : 1024 new tokens (mmmu=3072 mathvision=3072 dynamath=3072), max_length 8192
+  results    : /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/accept_metrics.jsonl
+  force      : 0      dry run: 0
+==================================================================
+
+==================================================================
+  [1/24] chartqa/test x zlab @1024tok
+                 z-lab/Qwen3.5-4B-DFlash
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/chartqa-Qwen3.5-4B-zlab-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: chartqa/test x zlab @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/chartqa-Qwen3.5-4B-zlab-test-200/probe.log
+
+==================================================================
+  [2/24] chartqa/test x mmflash @1024tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-120000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/chartqa-Qwen3.5-4B-mmflash-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: chartqa/test x mmflash @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/chartqa-Qwen3.5-4B-mmflash-test-200/probe.log
+
+==================================================================
+  [3/24] chartqa/test x llava-ov-1M-100k @1024tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-100000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/chartqa-Qwen3.5-4B-llava-ov-1M-100k-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: chartqa/test x llava-ov-1M-100k @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/chartqa-Qwen3.5-4B-llava-ov-1M-100k-test-200/probe.log
+
+==================================================================
+  [4/24] mmstar/val x zlab @1024tok
+                 z-lab/Qwen3.5-4B-DFlash
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mmstar-Qwen3.5-4B-zlab-val-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: mmstar/val x zlab @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mmstar-Qwen3.5-4B-zlab-val-200/probe.log
+
+==================================================================
+  [5/24] mmstar/val x mmflash @1024tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-120000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mmstar-Qwen3.5-4B-mmflash-val-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: mmstar/val x mmflash @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mmstar-Qwen3.5-4B-mmflash-val-200/probe.log
+
+==================================================================
+  [6/24] mmstar/val x llava-ov-1M-100k @1024tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-100000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mmstar-Qwen3.5-4B-llava-ov-1M-100k-val-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: mmstar/val x llava-ov-1M-100k @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mmstar-Qwen3.5-4B-llava-ov-1M-100k-val-200/probe.log
+
+==================================================================
+  [7/24] realworldqa/test x zlab @1024tok
+                 z-lab/Qwen3.5-4B-DFlash
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/realworldqa-Qwen3.5-4B-zlab-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: realworldqa/test x zlab @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/realworldqa-Qwen3.5-4B-zlab-test-200/probe.log
+
+==================================================================
+  [8/24] realworldqa/test x mmflash @1024tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-120000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/realworldqa-Qwen3.5-4B-mmflash-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: realworldqa/test x mmflash @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/realworldqa-Qwen3.5-4B-mmflash-test-200/probe.log
+
+==================================================================
+  [9/24] realworldqa/test x llava-ov-1M-100k @1024tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-100000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/realworldqa-Qwen3.5-4B-llava-ov-1M-100k-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: realworldqa/test x llava-ov-1M-100k @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/realworldqa-Qwen3.5-4B-llava-ov-1M-100k-test-200/probe.log
+
+==================================================================
+  [10/24] seedbench-image/test x zlab @1024tok
+                 z-lab/Qwen3.5-4B-DFlash
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/seedbench-image-Qwen3.5-4B-zlab-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: seedbench-image/test x zlab @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/seedbench-image-Qwen3.5-4B-zlab-test-200/probe.log
+
+==================================================================
+  [11/24] seedbench-image/test x mmflash @1024tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-120000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/seedbench-image-Qwen3.5-4B-mmflash-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: seedbench-image/test x mmflash @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/seedbench-image-Qwen3.5-4B-mmflash-test-200/probe.log
+
+==================================================================
+  [12/24] seedbench-image/test x llava-ov-1M-100k @1024tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-100000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/seedbench-image-Qwen3.5-4B-llava-ov-1M-100k-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: seedbench-image/test x llava-ov-1M-100k @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/seedbench-image-Qwen3.5-4B-llava-ov-1M-100k-test-200/probe.log
+
+==================================================================
+  [13/24] textvqa/test x zlab @1024tok
+                 z-lab/Qwen3.5-4B-DFlash
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/textvqa-Qwen3.5-4B-zlab-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: textvqa/test x zlab @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/textvqa-Qwen3.5-4B-zlab-test-200/probe.log
+
+==================================================================
+  [14/24] textvqa/test x mmflash @1024tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-120000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/textvqa-Qwen3.5-4B-mmflash-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: textvqa/test x mmflash @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/textvqa-Qwen3.5-4B-mmflash-test-200/probe.log
+
+==================================================================
+  [15/24] textvqa/test x llava-ov-1M-100k @1024tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-100000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/textvqa-Qwen3.5-4B-llava-ov-1M-100k-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 1024 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: textvqa/test x llava-ov-1M-100k @1024tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/textvqa-Qwen3.5-4B-llava-ov-1M-100k-test-200/probe.log
+
+==================================================================
+  [16/24] mmmu/test x zlab @3072tok
+                 z-lab/Qwen3.5-4B-DFlash
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mmmu-Qwen3.5-4B-zlab-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 3072 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: mmmu/test x zlab @3072tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mmmu-Qwen3.5-4B-zlab-test-200/probe.log
+
+==================================================================
+  [17/24] mmmu/test x mmflash @3072tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-120000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mmmu-Qwen3.5-4B-mmflash-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 3072 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: mmmu/test x mmflash @3072tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mmmu-Qwen3.5-4B-mmflash-test-200/probe.log
+
+==================================================================
+  [18/24] mmmu/test x llava-ov-1M-100k @3072tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-100000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mmmu-Qwen3.5-4B-llava-ov-1M-100k-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 3072 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: mmmu/test x llava-ov-1M-100k @3072tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mmmu-Qwen3.5-4B-llava-ov-1M-100k-test-200/probe.log
+
+==================================================================
+  [19/24] mathvision/test x zlab @3072tok
+                 z-lab/Qwen3.5-4B-DFlash
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mathvision-Qwen3.5-4B-zlab-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 3072 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: mathvision/test x zlab @3072tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mathvision-Qwen3.5-4B-zlab-test-200/probe.log
+
+==================================================================
+  [20/24] mathvision/test x mmflash @3072tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-120000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mathvision-Qwen3.5-4B-mmflash-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 3072 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: mathvision/test x mmflash @3072tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mathvision-Qwen3.5-4B-mmflash-test-200/probe.log
+
+==================================================================
+  [21/24] mathvision/test x llava-ov-1M-100k @3072tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-100000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mathvision-Qwen3.5-4B-llava-ov-1M-100k-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 3072 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: mathvision/test x llava-ov-1M-100k @3072tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/mathvision-Qwen3.5-4B-llava-ov-1M-100k-test-200/probe.log
+
+==================================================================
+  [22/24] dynamath/test x zlab @3072tok
+                 z-lab/Qwen3.5-4B-DFlash
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/dynamath-Qwen3.5-4B-zlab-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 3072 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: dynamath/test x zlab @3072tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/dynamath-Qwen3.5-4B-zlab-test-200/probe.log
+
+==================================================================
+  [23/24] dynamath/test x mmflash @3072tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-120000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/dynamath-Qwen3.5-4B-mmflash-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 3072 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: dynamath/test x mmflash @3072tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/dynamath-Qwen3.5-4B-mmflash-test-200/probe.log
+
+==================================================================
+  [24/24] dynamath/test x llava-ov-1M-100k @3072tok
+                 /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-100000
+                 /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/dynamath-Qwen3.5-4B-llava-ov-1M-100k-test-200
+==================================================================
+[probe] generating up to 200 answers of <= 3072 tokens
+Traceback (most recent call last):
+  File "/nfs/home/svu/fengsicheng/Projects/SpecForge/scripts/analyze_dflash_accept.py", line 69, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[probe] ERROR: dynamath/test x llava-ov-1M-100k @3072tok failed; see /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/dynamath-Qwen3.5-4B-llava-ov-1M-100k-test-200/probe.log
+
+==================================================================
+  measured 0 / 24   skipped 0   failed 24
+==================================================================
+  FAILED  chartqa/test x zlab @1024tok
+  FAILED  chartqa/test x mmflash @1024tok
+  FAILED  chartqa/test x llava-ov-1M-100k @1024tok
+  FAILED  mmstar/val x zlab @1024tok
+  FAILED  mmstar/val x mmflash @1024tok
+  FAILED  mmstar/val x llava-ov-1M-100k @1024tok
+  FAILED  realworldqa/test x zlab @1024tok
+  FAILED  realworldqa/test x mmflash @1024tok
+  FAILED  realworldqa/test x llava-ov-1M-100k @1024tok
+  FAILED  seedbench-image/test x zlab @1024tok
+  FAILED  seedbench-image/test x mmflash @1024tok
+  FAILED  seedbench-image/test x llava-ov-1M-100k @1024tok
+  FAILED  textvqa/test x zlab @1024tok
+  FAILED  textvqa/test x mmflash @1024tok
+  FAILED  textvqa/test x llava-ov-1M-100k @1024tok
+  FAILED  mmmu/test x zlab @3072tok
+  FAILED  mmmu/test x mmflash @3072tok
+  FAILED  mmmu/test x llava-ov-1M-100k @3072tok
+  FAILED  mathvision/test x zlab @3072tok
+  FAILED  mathvision/test x mmflash @3072tok
+  FAILED  mathvision/test x llava-ov-1M-100k @3072tok
+  FAILED  dynamath/test x zlab @3072tok
+  FAILED  dynamath/test x mmflash @3072tok
+  FAILED  dynamath/test x llava-ov-1M-100k @3072tok
+
+  All runs, one line each: /home/svu/fengsicheng/Projects/SpecForge/accept_analysis/accept_metrics.jsonl
+  Re-derive any record without a GPU:
+    python3 scripts/analyze_dflash_accept.py --metrics-only --output-dir <run dir>
+  Resubmit to retry the failures; everything already measured is skipped.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+			Resource Usage on 2026-09-05 02:06:56.975844:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	JobId: 601480.hopper-m-02
+	Project: CFP04-CF-054
+	Exit Status: 1
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	NCPUs: Requested(12), Used(12)
+	CPU Time Used: 00:00:02
+	Memory: Requested(225gb), Used(142408kb)
+	Vmem Used: 0kb
+	Walltime: Requested(24:00:00), Used(00:00:09)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	Execution Nodes Used: (hopper-21:ngpus=1:ncpus=12:mem=235929600kb)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	No GPU-related information available for this job.

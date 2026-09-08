@@ -34,13 +34,24 @@ read from.
 
 The per-anchor JSONL is the artifact; the printed summary is a first look at it.
 
+The benchmark questions, images and prompts come from the benchmark classes in
+``benchmarks/mm_benchmarker`` -- the same objects ``bench_mm.py`` serves -- so the
+accept numbers here explain the throughput numbers there rather than those of a
+paraphrase. ``--benchmark`` accepts any name in ``BENCHMARKS`` below (chartqa,
+mmstar, realworldqa, seedbench-image, textvqa, mmmu, mathvision, dynamath) and
+``--split`` defaults to whatever that benchmark itself defaults to.
+
 Usage (one GPU is enough for a 4B target):
 
     python scripts/analyze_dflash_accept.py \\
         --draft-model-path /path/to/qwen3.5-4b-mmflash-sharegpt4v-pt-120000 \\
         --target-model-path Qwen/Qwen3.5-4B \\
+        --benchmark mmstar \\
         --num-samples 200 \\
         --output-dir ./cache/accept_analysis
+
+``scripts/analyze_accept_hpc.sh`` sweeps this over benchmarks x drafts and knows
+how to resume a partial sweep.
 
 Re-run the scoring without regenerating by passing ``--generations`` the
 ``generations.jsonl`` of an earlier run.
@@ -57,29 +68,116 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 
-BENCHMARK_INSTRUCTIONS = {
-    # benchmarks/mm_benchmarker/chartqa.py::CHARTQA_INSTRUCTION, whose
-    # "describe the image, then reason" shape is what makes one generation
-    # contain both a grounded and an ungrounded stretch.
-    "chartqa": (
-        "Analyze the image and question carefully, using step-by-step reasoning.\n"
-        "First, describe any image provided in detail. Then, present your "
-        "reasoning. And finally your final answer in this format:\n"
-        "Final Answer: <answer>\n"
-        "where <answer> follows the following instructions:\n"
-        "- <answer> should should be a single phrase or number.\n"
-        "- <answer> should not paraphrase or reformat the text in the image.\n"
-        "- If <answer> is a ratio, it should be a decimal value like 0.25 instead "
-        "of 1:4.\n"
-        "If the question is a Yes/No question, <answer> should be Yes or No.\n"
-        "- If <answer> is a number, it should not contain any units.\n"
-        "- If <answer> is a percentage, it should include a % sign.\n"
-        "- If <answer> is an entity, it should include the full label from the "
-        "graph.\n"
-        "IMPORTANT: Remember, to end your answer, start your final answer with "
-        '"Final Answer:".'
-    ),
+#: Every multimodal benchmark this probe can measure, with the HF corpus behind
+#: it (recorded into the metrics file so a run says where its samples came from)
+#: and the split its `benchmarks/mm_benchmarker` implementation defaults to.
+#:
+#: The prompts are NOT written here. They come from the benchmark classes in
+#: `benchmarks/mm_benchmarker`, the same objects `bench_mm.py` serves, so an
+#: accept measurement explains the throughput numbers of that benchmark rather
+#: than of a paraphrase. A private copy of ChartQA's instruction used to live
+#: here and had drifted two lines from the real one -- exactly the failure this
+#: table is now shaped to prevent.
+BENCHMARKS = {
+    # ChartQA's "describe the image, then reason" instruction is what makes one
+    # generation contain both a visually grounded and an ungrounded stretch,
+    # which is why it was the first benchmark this probe supported.
+    "chartqa": {"dataset": "HuggingFaceM4/ChartQA", "split": "test"},
+    "mmstar": {"dataset": "Lin-Chen/MMStar", "split": "val"},
+    "realworldqa": {"dataset": "xai-org/RealworldQA", "split": "test"},
+    "seedbench-image": {"dataset": "lmms-lab-encoder/SEED-Bench", "split": "test"},
+    "textvqa": {"dataset": "lmms-lab-encoder/textvqa", "split": "test"},
+    "mathvision": {"dataset": "MathLLMs/MathVision", "split": "test"},
+    "dynamath": {"dataset": "kcz358/DynaMath", "split": "test"},
+    # MMMU interleaves up to seven images into one question. This probe encodes
+    # a single leading image, so it is loaded with the benchmark's own
+    # `single_image_only` filter and the remaining question is linearised; see
+    # `linearise_parts`.
+    "mmmu": {"dataset": "MMMU/MMMU", "split": "test", "single_image_only": True},
 }
+
+#: Kept as a name->dataset mapping because `build_run_meta` and older run
+#: records read it that way.
+BENCHMARK_DATASETS = {
+    name: spec["dataset"] for name, spec in BENCHMARKS.items()
+}
+
+#: Written into every run_meta so a resume can tell a run made with the
+#: benchmark classes from one made with this file's old private prompt table.
+PROMPT_SOURCE = "mm_benchmarker"
+
+
+def default_split(benchmark: str) -> str:
+    """The split the benchmark's own implementation defaults to."""
+    return BENCHMARKS[benchmark]["split"]
+
+
+def _import_mm_benchmarks():
+    """The `MM_BENCHMARKS` registry, with `benchmarks/` put on the path first.
+
+    `bench_mm.py` imports `mm_benchmarker` as a top-level package because it
+    lives inside `benchmarks/`; this script does not, so the directory has to be
+    added explicitly. Prepending is deliberate: it must beat any same-named
+    package that happens to be installed.
+    """
+    import sys
+
+    benchmarks_dir = Path(__file__).resolve().parent.parent / "benchmarks"
+    if not benchmarks_dir.is_dir():
+        raise SystemExit(
+            f"cannot find the benchmark implementations at {benchmarks_dir}"
+        )
+    if str(benchmarks_dir) not in sys.path:
+        sys.path.insert(0, str(benchmarks_dir))
+
+    # `sglang/test/test_utils.py` picks a default test port at import time with
+    #     20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
+    # which raises ValueError as soon as the scheduler names the GPU by UUID
+    # ("GPU-xxxxxxxx-...") instead of by index, as PBS does on this cluster.
+    # `mm_benchmarker` reaches that module through `benchmarker.base`, so a
+    # non-numeric value is masked for the duration of the import and put back
+    # immediately. Nothing is allocated behind that name -- it only feeds an
+    # integer into a port number -- and CUDA is already initialised by the time
+    # this runs (the target model is loaded first), which the warm-up below
+    # guarantees even if that order ever changes.
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.current_device()
+        except Exception:  # no CUDA context to pin; nothing to protect
+            pass
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    mask = visible is not None and not visible[:1].isdigit()
+    if mask:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    try:
+        from mm_benchmarker import MM_BENCHMARKS  # noqa: PLC0415
+    finally:
+        if mask:
+            os.environ["CUDA_VISIBLE_DEVICES"] = visible
+
+    return MM_BENCHMARKS
+
+
+def linearise_parts(parts: Sequence[Tuple[str, str]]) -> Tuple[Optional[str], str]:
+    """An MMMU ("text"/"image") part list as one (image, question) pair.
+
+    MMMU sends each image where its ``<image i>`` placeholder stood. This probe
+    encodes one leading image, matching every other benchmark and matching the
+    training records, so the text parts are joined in order and the single image
+    is hoisted to the front. Only reached for questions the benchmark's
+    ``single_image_only`` filter kept, so at most one image is ever dropped from
+    its position -- never dropped from the request.
+    """
+    image_path: Optional[str] = None
+    text: List[str] = []
+    for kind, value in parts:
+        if kind == "image":
+            if image_path is None:
+                image_path = value
+        else:
+            text.append(value)
+    return image_path, "".join(text).strip()
 
 
 def report_specforge_source() -> None:
@@ -112,17 +210,25 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
 
     model = parser.add_argument_group("models")
-    model.add_argument("--draft-model-path", required=True)
+    model.add_argument(
+        "--draft-model-path",
+        default=None,
+        help="Required unless --metrics-only recomputes from an existing run",
+    )
     model.add_argument("--target-model-path", default="Qwen/Qwen3.5-4B")
     model.add_argument("--device", default="cuda")
     model.add_argument("--dtype", default="bfloat16")
     model.add_argument("--trust-remote-code", action="store_true", default=True)
 
     data = parser.add_argument_group("data")
+    data.add_argument("--benchmark", default="chartqa", choices=sorted(BENCHMARKS))
     data.add_argument(
-        "--benchmark", default="chartqa", choices=sorted(BENCHMARK_INSTRUCTIONS)
+        "--split",
+        default=None,
+        help="dataset split; defaults to what the benchmark's own "
+        "implementation uses (%s)"
+        % ", ".join(f"{k}={v['split']}" for k, v in sorted(BENCHMARKS.items())),
     )
-    data.add_argument("--split", default="val")
     data.add_argument("--num-samples", type=int, default=200)
     data.add_argument("--max-new-tokens", type=int, default=512)
     data.add_argument("--max-length", type=int, default=4096)
@@ -187,7 +293,36 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--output-dir", default="./cache/accept_analysis")
-    return parser.parse_args()
+
+    metrics = parser.add_argument_group("metrics")
+    metrics.add_argument(
+        "--run-name",
+        default=None,
+        help="Short label stored in the metrics record (e.g. zlab, mmflash)",
+    )
+    metrics.add_argument(
+        "--results-jsonl",
+        default=None,
+        help=(
+            "Append this run's metrics record as one JSON line here, so every "
+            "run of every draft/target lands in a single comparable file"
+        ),
+    )
+    metrics.add_argument(
+        "--metrics-only",
+        action="store_true",
+        help=(
+            "Skip both models and recompute metrics from the "
+            "per_anchor_accept.jsonl already in --output-dir. Needs no GPU"
+        ),
+    )
+
+    args = parser.parse_args()
+    if not args.metrics_only and not args.draft_model_path:
+        parser.error("--draft-model-path is required unless --metrics-only")
+    if args.split is None:
+        args.split = default_split(args.benchmark)
+    return args
 
 
 # --------------------------------------------------------------------------
@@ -196,31 +331,56 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_benchmark_rows(args) -> List[Dict[str, Any]]:
-    """Materialize the images and pair each with the benchmark's instruction."""
-    from datasets import load_dataset
+    """Ask the benchmark itself for its (image, prompt) pairs.
 
-    image_dir = os.path.join(args.output_dir, "images")
-    os.makedirs(image_dir, exist_ok=True)
+    The benchmark classes under `benchmarks/mm_benchmarker` are what
+    `bench_mm.py` serves, so going through them makes this probe's prompts
+    byte-identical to the ones behind the throughput numbers it is meant to
+    explain. They materialise their images into their own `.cache/<name>_specforge`
+    directory and return `[{"image_path", "question"}]` -- except MMMU, which
+    returns interleaved `{"parts"}` and is linearised here.
 
-    dataset = load_dataset("HuggingFaceM4/ChartQA")[args.split]
-    if args.num_samples is not None:
-        dataset = dataset.select(range(min(args.num_samples, len(dataset))))
+    A question the benchmark yields without an image is dropped: the probe's
+    whole subject is visual grounding, and an imageless row has none.
+    """
+    registry = _import_mm_benchmarks()
+    spec = BENCHMARKS[args.benchmark]
+    kwargs: Dict[str, Any] = {"num_samples": args.num_samples, "split": args.split}
+    if "single_image_only" in spec:
+        kwargs["single_image_only"] = spec["single_image_only"]
 
-    instruction = BENCHMARK_INSTRUCTIONS[args.benchmark]
-    rows = []
-    for index, row in enumerate(dataset):
-        image_path = os.path.join(image_dir, f"{index:06d}.png")
-        if not os.path.exists(image_path):
-            row["image"].convert("RGB").save(image_path, "PNG")
-        label = row.get("label")
+    benchmark = registry.get(args.benchmark)(**kwargs)
+    questions, labels = benchmark.load_data()
+    print(
+        f"[data] {args.benchmark}/{args.split}: {len(questions)} questions from "
+        f"{spec['dataset']} via {type(benchmark).__name__}"
+    )
+
+    rows: List[Dict[str, Any]] = []
+    dropped = 0
+    for index, question in enumerate(questions):
+        if "parts" in question:
+            image_path, prompt = linearise_parts(question["parts"])
+        else:
+            image_path, prompt = question.get("image_path"), question["question"]
+        if not image_path:
+            dropped += 1
+            continue
+        label = labels[index] if index < len(labels) else None
         rows.append(
             {
                 "id": f"{args.benchmark}-{index:06d}",
                 "image": image_path,
-                "question": str(row["query"]),
-                "prompt": f"{row['query']}\n{instruction}",
+                "question": prompt,
+                "prompt": prompt,
                 "reference": label[0] if isinstance(label, list) and label else label,
             }
+        )
+    if dropped:
+        print(f"[data] dropped {dropped} question(s) that carry no image")
+    if not rows:
+        raise SystemExit(
+            f"{args.benchmark}/{args.split} yielded no usable image questions"
         )
     return rows
 
@@ -1019,9 +1179,598 @@ def check_header_alignment(
     )
 
 
+# --------------------------------------------------------------------------
+# stage 3: the metrics record
+#
+# Everything below reads only the per-anchor rows, so it re-runs on a login
+# node without a GPU (--metrics-only). The quartile convention here (cuts at
+# n//4 indices, `value <= cut` buckets) deliberately matches the ad-hoc
+# analyses these functions consolidate; it differs at ties from `_bucket_of`
+# above, and with a corpus where half the KL values are ~0, ties matter.
+# --------------------------------------------------------------------------
+
+
+def _metric_cuts(values: Sequence[float]) -> List[float]:
+    ordered = sorted(values)
+    n = len(ordered)
+    return [ordered[n // 4], ordered[n // 2], ordered[3 * n // 4]]
+
+
+def _metric_bucket(value: Optional[float], cuts: Sequence[float]) -> Optional[int]:
+    if value is None:
+        return None
+    if value <= cuts[0]:
+        return 1
+    if value <= cuts[1]:
+        return 2
+    if value <= cuts[2]:
+        return 3
+    return 4
+
+
+def _rate(hits: int, total: int) -> Optional[float]:
+    return hits / total if total else None
+
+
+def _mean(values: Sequence[float]) -> Optional[float]:
+    return statistics.fmean(values) if values else None
+
+
+def _first_miss(correct: Sequence[bool]) -> Optional[int]:
+    """Slot of the first rejected prediction, or None for a clean block."""
+    for slot in range(1, len(correct)):
+        if not correct[slot]:
+            return slot
+    return None
+
+
+def _token_pairs(rows, value_key: str):
+    """(value, hit) over every slot that carries the per-slot value.
+
+    The per-slot lists hold None outside the valid span, so filtering on the
+    value is also what restricts this to scored slots.
+    """
+    pairs = []
+    for row in rows:
+        values = row.get(value_key) or []
+        correct = row.get("correct") or []
+        for value, hit in zip(values, correct):
+            if value is not None:
+                pairs.append((value, bool(hit)))
+    return pairs
+
+
+def _quartile_hit_rates(pairs) -> Optional[Dict[str, Any]]:
+    if len(pairs) < 8:
+        return None
+    cuts = _metric_cuts([value for value, _ in pairs])
+    hits = {b: [0, 0] for b in (1, 2, 3, 4)}
+    for value, hit in pairs:
+        bucket = _metric_bucket(value, cuts)
+        hits[bucket][0] += hit
+        hits[bucket][1] += 1
+    return {
+        "cuts": cuts,
+        "tokens": {f"q{b}": hits[b][1] for b in (1, 2, 3, 4)},
+        "hit_rate": {f"q{b}": _rate(*hits[b]) for b in (1, 2, 3, 4)},
+    }
+
+
+def metric_overview(rows) -> Dict[str, Any]:
+    block = len(rows[0]["correct"]) if rows else 0
+    accepts = [row["accept_len"] for row in rows]
+    histogram: Dict[str, int] = {}
+    for value in accepts:
+        key = str(int(value))
+        histogram[key] = histogram.get(key, 0) + 1
+    # how much of the accept length the early slots carry: share of accepted
+    # tokens sitting at slot <= k
+    total = sum(accepts)
+    cumulative_share = {
+        str(k): (sum(min(a, k) for a in accepts) / total if total else None)
+        for k in (1, 3, 7, block - 1 if block else 0)
+    }
+    return {
+        "anchor_records": len(rows),
+        "generations_scored": len({row["id"] for row in rows}),
+        "block_size": block,
+        "accept_len_mean": _mean(accepts),
+        "accept_len_median": statistics.median(accepts) if accepts else None,
+        "accept_len_histogram": histogram,
+        "accepted_tokens_total": total,
+        "accept_share_up_to_slot": cumulative_share,
+        "mean_valid_slots": _mean([row["n_valid"] for row in rows]),
+    }
+
+
+def metric_slot_by_kl(rows, cuts) -> Dict[str, Any]:
+    """Hit rate per (slot bin x KL quartile): the monotone-in-both table."""
+    block = len(rows[0]["correct"]) if rows else 16
+    bins = [(1, 3), (4, 7), (8, 11), (12, block - 1)]
+    table: Dict[str, Dict[str, Any]] = {}
+    for low, high in bins:
+        if low >= block:
+            continue
+        cells = {b: [0, 0] for b in (1, 2, 3, 4)}
+        for row in rows:
+            values = row.get("kl_per_slot") or []
+            for slot in range(low, min(high, len(values) - 1) + 1):
+                bucket = _metric_bucket(values[slot], cuts)
+                if bucket is None:
+                    continue
+                cells[bucket][0] += bool(row["correct"][slot])
+                cells[bucket][1] += 1
+        table[f"slot_{low}_{high}"] = {
+            f"q{b}": {"hit_rate": _rate(*cells[b]), "n": cells[b][1]}
+            for b in (1, 2, 3, 4)
+        }
+    return table
+
+
+def metric_truncation(rows, cuts) -> Dict[str, Any]:
+    """Prefix-match economics: who truncates blocks, and what that discards.
+
+    A rejected slot throws away every later slot of its block, correct or not.
+    `discarded_correct` counts the correct ones, attributed to the truncating
+    slot's KL quartile -- the "only 25% of tokens, half the truncations" claim
+    is read straight off `culprit_share`.
+    """
+    accepted = 0
+    culprit: Dict[Any, int] = {}
+    discarded_by_own: Dict[Any, int] = {}
+    discarded_by_culprit: Dict[Any, int] = {}
+    truncated_blocks = 0
+    for row in rows:
+        correct = row["correct"]
+        kl = row.get("kl_per_slot") or [None] * len(correct)
+        miss = _first_miss(correct)
+        if miss is None:
+            accepted += len(correct) - 1
+            continue
+        accepted += miss - 1
+        truncated_blocks += 1
+        culprit_bucket = _metric_bucket(kl[miss] if miss < len(kl) else None, cuts)
+        culprit[culprit_bucket] = culprit.get(culprit_bucket, 0) + 1
+        for slot in range(miss + 1, len(correct)):
+            if correct[slot]:
+                own = _metric_bucket(kl[slot] if slot < len(kl) else None, cuts)
+                discarded_by_own[own] = discarded_by_own.get(own, 0) + 1
+                discarded_by_culprit[culprit_bucket] = (
+                    discarded_by_culprit.get(culprit_bucket, 0) + 1
+                )
+
+    bucketed_culprits = sum(culprit.get(b, 0) for b in (1, 2, 3, 4))
+    discarded_total = sum(discarded_by_own.values())
+    blocked_q3q4 = discarded_by_culprit.get(3, 0) + discarded_by_culprit.get(4, 0)
+    return {
+        "accepted_tokens": accepted,
+        "truncated_blocks": truncated_blocks,
+        "discarded_correct_tokens": discarded_total,
+        "discarded_over_accepted": (
+            discarded_total / accepted if accepted else None
+        ),
+        "culprit_counts": {f"q{b}": culprit.get(b, 0) for b in (1, 2, 3, 4)},
+        "culprit_unbucketed": culprit.get(None, 0),
+        "culprit_share": {
+            f"q{b}": _rate(culprit.get(b, 0), bucketed_culprits) for b in (1, 2, 3, 4)
+        },
+        "discarded_by_own_quartile": {
+            f"q{b}": discarded_by_own.get(b, 0) for b in (1, 2, 3, 4)
+        },
+        "discarded_by_culprit_quartile": {
+            f"q{b}": discarded_by_culprit.get(b, 0) for b in (1, 2, 3, 4)
+        },
+        "oracle_fix_q4": {
+            "tokens": discarded_by_culprit.get(4, 0),
+            "gain_over_accepted": (
+                discarded_by_culprit.get(4, 0) / accepted if accepted else None
+            ),
+        },
+        "oracle_fix_q3_q4": {
+            "tokens": blocked_q3q4,
+            "gain_over_accepted": blocked_q3q4 / accepted if accepted else None,
+        },
+    }
+
+
+def metric_marginal_gain(rows, cuts) -> Dict[str, Any]:
+    """What fixing one truncating token actually unlocks, by its quartile.
+
+    The gain is the token itself plus the contiguous correct run behind it --
+    the counterfactual accept length had only that slot been right. Per token
+    Q4 buys LESS than Q1 (visual tokens cluster, so the run behind one is
+    short); Q4 matters through how often it is the bottleneck, and the
+    decomposition states both factors explicitly.
+    """
+    gains: Dict[int, List[int]] = {1: [], 2: [], 3: [], 4: []}
+    by_slot: Dict[int, Dict[int, List[int]]] = {}
+    for row in rows:
+        correct = row["correct"]
+        kl = row.get("kl_per_slot") or [None] * len(correct)
+        miss = _first_miss(correct)
+        if miss is None:
+            continue
+        bucket = _metric_bucket(kl[miss] if miss < len(kl) else None, cuts)
+        if bucket is None:
+            continue
+        gain = 1
+        slot = miss + 1
+        while slot < len(correct) and correct[slot]:
+            gain += 1
+            slot += 1
+        gains[bucket].append(gain)
+        by_slot.setdefault(miss, {}).setdefault(bucket, []).append(gain)
+
+    per_bucket = {
+        f"q{b}": {
+            "n": len(gains[b]),
+            "mean_gain": _mean(gains[b]),
+            "total_gain": sum(gains[b]),
+        }
+        for b in (1, 2, 3, 4)
+    }
+    ratio = None
+    if gains[1] and gains[4]:
+        ratio = _mean(gains[4]) / _mean(gains[1])
+    # same-slot comparison, so "visual tokens sit early and early slots have
+    # longer tails" cannot be what drives the per-fix numbers
+    controlled = []
+    q4_wins = 0
+    for slot in sorted(by_slot):
+        q1 = by_slot[slot].get(1, [])
+        q4 = by_slot[slot].get(4, [])
+        if len(q1) >= 60 and len(q4) >= 60:
+            entry = {
+                "slot": slot,
+                "q1_mean": _mean(q1),
+                "q4_mean": _mean(q4),
+                "q1_n": len(q1),
+                "q4_n": len(q4),
+            }
+            controlled.append(entry)
+            q4_wins += entry["q4_mean"] > entry["q1_mean"]
+    decomposition = None
+    if gains[1] and gains[4]:
+        decomposition = {
+            "total_gain_ratio_q4_over_q1": (
+                sum(gains[4]) / sum(gains[1]) if sum(gains[1]) else None
+            ),
+            "frequency_ratio": len(gains[4]) / len(gains[1]),
+            "per_fix_ratio": ratio,
+        }
+    return {
+        "per_culprit_quartile": per_bucket,
+        "per_fix_gain_ratio_q4_over_q1": ratio,
+        "decomposition": decomposition,
+        "slot_controlled": controlled,
+        "slot_controlled_q4_wins": f"{q4_wins}/{len(controlled)}",
+    }
+
+
+def metric_conditional(rows, cuts) -> Dict[str, Any]:
+    """Whether a hit on a visual slot predicts hits on later easy slots.
+
+    The control conditions on an EARLY Q1 slot instead. It came out stronger
+    than the Q4 version on both drafts, which is what killed "visual tokens
+    unlock the rest" as a motivation: the shared factor is block difficulty,
+    not anything visual, and this record keeps that check attached.
+    """
+
+    def conditioned(front_bucket: int) -> Dict[str, Any]:
+        given = {True: [0, 0], False: [0, 0]}
+        for row in rows:
+            kl = row.get("kl_per_slot") or []
+            correct = row["correct"]
+            front = [
+                i for i, v in enumerate(kl) if _metric_bucket(v, cuts) == front_bucket
+            ]
+            behind = [i for i, v in enumerate(kl) if _metric_bucket(v, cuts) == 1]
+            for k in front:
+                for j in behind:
+                    if j <= k:
+                        continue
+                    outcome = given[bool(correct[k])]
+                    outcome[0] += bool(correct[j])
+                    outcome[1] += 1
+        return {
+            "later_q1_hit_given_hit": _rate(*given[True]),
+            "later_q1_hit_given_miss": _rate(*given[False]),
+            "n_given_hit": given[True][1],
+            "n_given_miss": given[False][1],
+        }
+
+    return {"front_q4": conditioned(4), "control_front_q1": conditioned(1)}
+
+
+def metric_per_generation_sign(rows, cuts, min_tokens: int = 5) -> Dict[str, Any]:
+    """How many generations individually reproduce hit(Q4) < hit(Q1)."""
+    per_id: Dict[str, Dict[int, List[bool]]] = {}
+    for row in rows:
+        store = per_id.setdefault(row["id"], {1: [], 4: []})
+        for value, hit in zip(row.get("kl_per_slot") or [], row["correct"]):
+            bucket = _metric_bucket(value, cuts)
+            if bucket in (1, 4):
+                store[bucket].append(bool(hit))
+    evaluated = 0
+    sign_holds = 0
+    for store in per_id.values():
+        if len(store[1]) < min_tokens or len(store[4]) < min_tokens:
+            continue
+        evaluated += 1
+        sign_holds += _mean(store[4]) < _mean(store[1])
+    return {
+        "min_tokens_per_bucket": min_tokens,
+        "generations_evaluated": evaluated,
+        "sign_holds": sign_holds,
+        "sign_rate": _rate(sign_holds, evaluated),
+    }
+
+
+def metric_correlations(rows) -> Dict[str, Any]:
+    """Token- and block-level correlations, with each control attached."""
+    both = []
+    for row in rows:
+        kls = row.get("kl_per_slot") or []
+        ents = row.get("entropy_per_slot") or []
+        for kl, ent, hit in zip(kls, ents, row["correct"]):
+            if kl is not None and ent is not None:
+                both.append((float(hit), kl, ent))
+    token: Dict[str, Any] = {"n_tokens": len(both)}
+    if len(both) >= 8:
+        hits = [x[0] for x in both]
+        kls = [x[1] for x in both]
+        ents = [x[2] for x in both]
+        r_hk = _pearson(hits, kls)
+        r_he = _pearson(hits, ents)
+        r_ke = _pearson(kls, ents)
+        token.update(
+            {
+                "corr_hit_kl": r_hk,
+                "corr_hit_entropy": r_he,
+                "corr_kl_entropy": r_ke,
+            }
+        )
+        if None not in (r_hk, r_he, r_ke):
+            denominator_k = (1 - r_he**2) * (1 - r_ke**2)
+            denominator_e = (1 - r_hk**2) * (1 - r_ke**2)
+            token["partial_hit_kl_given_entropy"] = (
+                (r_hk - r_he * r_ke) / denominator_k**0.5 if denominator_k > 0 else None
+            )
+            token["partial_hit_entropy_given_kl"] = (
+                (r_he - r_hk * r_ke) / denominator_e**0.5 if denominator_e > 0 else None
+            )
+
+    def block_corr(key: str) -> Optional[float]:
+        pairs = [
+            (row["accept_len"], row[key])
+            for row in rows
+            if row.get(key) is not None
+        ]
+        if len(pairs) < 8:
+            return None
+        return _pearson([p[0] for p in pairs], [p[1] for p in pairs])
+
+    block = {
+        "corr_accept_visual_kl": block_corr("visual_kl"),
+        "corr_accept_visual_kl_first": block_corr("visual_kl_first"),
+        "corr_accept_entropy": block_corr("entropy"),
+        "corr_accept_visual_rel": block_corr("visual_rel"),
+    }
+    rel_pairs = [
+        (row["visual_kl"], row["visual_rel"])
+        for row in rows
+        if row.get("visual_kl") is not None and row.get("visual_rel") is not None
+    ]
+    if len(rel_pairs) >= 8:
+        block["corr_visual_kl_visual_rel"] = _pearson(
+            [p[0] for p in rel_pairs], [p[1] for p in rel_pairs]
+        )
+    return {"token_level": token, "block_level": block}
+
+
+def metric_accept_by_block_kl(rows) -> Dict[str, Any]:
+    """Mean accept length by quartile of a block's own visual dependence."""
+
+    def table(key: str) -> Optional[Dict[str, Any]]:
+        pairs = [
+            (row[key], row["accept_len"]) for row in rows if row.get(key) is not None
+        ]
+        if len(pairs) < 8:
+            return None
+        cuts = _metric_cuts([value for value, _ in pairs])
+        cells = {b: [] for b in (1, 2, 3, 4)}
+        for value, accept in pairs:
+            cells[_metric_bucket(value, cuts)].append(accept)
+        return {
+            f"q{b}": {"mean_accept_len": _mean(cells[b]), "n": len(cells[b])}
+            for b in (1, 2, 3, 4)
+        }
+
+    return {
+        "by_visual_kl": table("visual_kl"),
+        "by_visual_kl_first": table("visual_kl_first"),
+        "by_entropy": table("entropy"),
+    }
+
+
+def compute_metrics_record(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Every number this analysis produces, as one JSON-safe object."""
+    record: Dict[str, Any] = {"overview": metric_overview(rows)}
+    if not rows:
+        return record
+
+    kl_pairs = _token_pairs(rows, "kl_per_slot")
+    record["kl_token_level"] = _quartile_hit_rates(kl_pairs)
+    record["entropy_token_level"] = _quartile_hit_rates(
+        _token_pairs(rows, "entropy_per_slot")
+    )
+    record["correlations"] = metric_correlations(rows)
+    record["accept_by_block"] = metric_accept_by_block_kl(rows)
+
+    if record["kl_token_level"]:
+        cuts = record["kl_token_level"]["cuts"]
+        record["slot_by_kl"] = metric_slot_by_kl(rows, cuts)
+        record["truncation"] = metric_truncation(rows, cuts)
+        record["marginal_gain"] = metric_marginal_gain(rows, cuts)
+        record["conditional"] = metric_conditional(rows, cuts)
+        record["per_generation_sign"] = metric_per_generation_sign(rows, cuts)
+    return record
+
+
+def print_metrics_headlines(metrics: Dict[str, Any]) -> None:
+    """The dozen numbers worth seeing in a qsub log without opening the JSON."""
+    overview = metrics.get("overview", {})
+    print(
+        f"\n[metrics] {overview.get('anchor_records', 0):,} blocks over "
+        f"{overview.get('generations_scored', 0):,} generations, mean accept "
+        f"{overview.get('accept_len_mean') or float('nan'):.3f}"
+    )
+    kl = metrics.get("kl_token_level")
+    if kl:
+        rates = kl["hit_rate"]
+        print(
+            "[metrics] token-level hit by KL quartile: "
+            + "  ".join(
+                f"Q{b} {rates[f'q{b}']:.1%}" if rates[f"q{b}"] is not None else f"Q{b} -"
+                for b in (1, 2, 3, 4)
+            )
+        )
+    truncation = metrics.get("truncation")
+    if truncation:
+        share = truncation["culprit_share"]
+        q4 = share.get("q4")
+        oracle = truncation["oracle_fix_q3_q4"]["gain_over_accepted"]
+        print(
+            f"[metrics] Q4 causes {q4:.1%} of truncations; "
+            f"{truncation['discarded_correct_tokens']:,} correct tokens "
+            f"discarded behind misses; fixing Q3+Q4 culprits = "
+            f"+{oracle:.0%} accept length"
+            if q4 is not None and oracle is not None
+            else "[metrics] truncation attribution incomplete"
+        )
+    marginal = metrics.get("marginal_gain", {})
+    if marginal.get("per_fix_gain_ratio_q4_over_q1") is not None:
+        print(
+            f"[metrics] per-fix gain Q4/Q1 = "
+            f"{marginal['per_fix_gain_ratio_q4_over_q1']:.2f} "
+            f"(same-slot Q4 wins {marginal['slot_controlled_q4_wins']})"
+        )
+    sign = metrics.get("per_generation_sign", {})
+    if sign.get("sign_rate") is not None:
+        print(
+            f"[metrics] hit(Q4) < hit(Q1) holds in {sign['sign_rate']:.0%} of "
+            f"{sign['generations_evaluated']} generations"
+        )
+
+
+def build_run_meta(
+    args, *, generations: int, anchor_records: int, probe=None
+) -> Dict[str, Any]:
+    """Where these numbers came from: models, data, knobs, environment."""
+    import datetime
+    import socket
+    import subprocess
+
+    import transformers
+
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip() or None
+    except Exception:
+        commit = None
+
+    import specforge
+
+    meta: Dict[str, Any] = {
+        "run_name": args.run_name,
+        "timestamp": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "hostname": socket.gethostname(),
+        "output_dir": os.path.abspath(args.output_dir),
+        "draft_model_path": args.draft_model_path,
+        "target_model_path": args.target_model_path,
+        "benchmark": args.benchmark,
+        "dataset": BENCHMARK_DATASETS.get(args.benchmark),
+        "prompt_source": PROMPT_SOURCE,
+        "split": args.split,
+        "num_samples_requested": args.num_samples,
+        "generations_scored": generations,
+        "anchor_records": anchor_records,
+        "max_new_tokens": args.max_new_tokens,
+        "max_length": args.max_length,
+        "num_anchors": args.num_anchors,
+        "attention_backend": args.attention_backend,
+        "dtype": args.dtype,
+        "seed": args.seed,
+        "enable_thinking": args.enable_thinking,
+        "visual_kl": not args.no_visual_kl,
+        "visual_relevance": not args.no_visual_relevance,
+        "visual_top_n": args.visual_top_n,
+        "specforge_path": str(Path(specforge.__file__).resolve().parent),
+        "git_commit": commit,
+        "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
+    }
+    if probe is not None:
+        meta["block_size"] = probe.block_size
+        meta["target_layer_ids"] = list(probe.draft_model.target_layer_ids)
+    return meta
+
+
+def finalize_metrics(args, rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> None:
+    """Write metrics.json beside the anchors and append to the shared JSONL."""
+    metrics = compute_metrics_record(rows)
+    print_metrics_headlines(metrics)
+
+    record = {"run_meta": meta, "metrics": metrics}
+    metrics_path = os.path.join(args.output_dir, "metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    print(f"[metrics] wrote {metrics_path}")
+
+    if args.results_jsonl:
+        os.makedirs(os.path.dirname(os.path.abspath(args.results_jsonl)), exist_ok=True)
+        with open(args.results_jsonl, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"[metrics] appended to {args.results_jsonl}")
+
+
+def run_metrics_only(args) -> None:
+    """Recompute the record from an existing run directory, models untouched."""
+    anchors_path = os.path.join(args.output_dir, "per_anchor_accept.jsonl")
+    if not os.path.exists(anchors_path):
+        raise SystemExit(f"--metrics-only found no {anchors_path}")
+    rows = read_jsonl(anchors_path)
+    print(f"[metrics] recomputing from {len(rows):,} rows in {anchors_path}")
+
+    meta_path = os.path.join(args.output_dir, "run_meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path, encoding="utf-8") as handle:
+            meta = json.load(handle)
+        meta["recomputed"] = True
+        if args.run_name:
+            meta["run_name"] = args.run_name
+    else:
+        # a run from before run_meta.json existed: record what the CLI knows
+        # and say so, rather than presenting guesses as provenance
+        meta = build_run_meta(
+            args, generations=len({row["id"] for row in rows}), anchor_records=len(rows)
+        )
+        meta["run_meta_source"] = "reconstructed by --metrics-only"
+    finalize_metrics(args, rows, meta)
+
+
 def main() -> None:
     args = parse_args()
     report_specforge_source()
+    if args.metrics_only:
+        run_metrics_only(args)
+        return
     torch.manual_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -1230,6 +1979,16 @@ def main() -> None:
     for reason, count in sorted(skipped.items(), key=lambda item: -item[1]):
         print(f"  {count:>5}  {reason}")
     summarize(rows)
+
+    meta = build_run_meta(
+        args, generations=len(records), anchor_records=len(rows), probe=probe
+    )
+    meta["skipped_generations"] = dict(skipped)
+    meta_path = os.path.join(args.output_dir, "run_meta.json")
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(meta, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    finalize_metrics(args, rows, meta)
 
 
 if __name__ == "__main__":

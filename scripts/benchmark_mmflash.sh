@@ -5,7 +5,7 @@
 #   --draft-config configs/qwen3.5-4b-dflash.json \
 #   --output-dir /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-160000
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 GPU_IDS=(0)
 
@@ -18,13 +18,14 @@ GPU_IDS=(0)
 # for hopper
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
 export FLASHINFER_USE_CUDA_NORM=1
-
+export SGLANG_NUMA_BIND_V2=0
 
 # export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 
 # z-lab/Qwen3.5-4B-DFlash
 # /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v
 # /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-hf 这个是一个只有1000step的test版本
+# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-50000 用llava那个数据集训的baseline版本，数据没有改prompt
 
 BLOCK_SIZE=16
 
@@ -52,7 +53,7 @@ for idx in "${!GPU_IDS[@]}"; do
     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
         --model Qwen/Qwen3.5-4B \
         --speculative-algorithm DFLASH \
-        --speculative-draft-model-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-120000 \
+        --speculative-draft-model-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-50000 \
         --speculative-dflash-block-size ${BLOCK_SIZE} \
         --mem-fraction-static 0.7 \
         --tp 1 \
@@ -102,15 +103,13 @@ python benchmarks/bench_mm.py \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
     --block-size ${BLOCK_SIZE} \
-    --benchmark-list chartqa:200 mmstar:200 realworldqa:200 mmmu:200 textvqa:200 seedbench-image:200 mathvision:200 \
+    --benchmark-list chartqa:200 mmstar:200 realworldqa:200 mmmu:200 textvqa:200 dynamath:200 seedbench-image:200 mathvision:200 \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 8192 \
-    --save-generations \
-    --name mmflash_qwen35-4B_concurrency1_temp0
-
+    --name dflash_baseline_llava_ov_1M_step50000_qwen35-4B_concurrency1_temp0
 
 # # for text benchmark
 # python benchmarks/bench_text.py \
@@ -124,7 +123,6 @@ python benchmarks/bench_mm.py \
 #     --top-p 0.95 \
 #     --top-k 20 \
 #     --max-tokens 8192 \
-#     --save-generations \
 #     --name dflash_qwen35-4B_concurrency1
 
 

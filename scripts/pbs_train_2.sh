@@ -4,8 +4,8 @@
 #PBS -k oed
 #PBS -N pytorch
 #PBS -q auto
-#PBS -l select=1:ngpus=4
-#PBS -l walltime=96:00:00
+#PBS -l select=1:ngpus=8
+#PBS -l walltime=48:00:00
 
 cd $PBS_O_WORKDIR;
 

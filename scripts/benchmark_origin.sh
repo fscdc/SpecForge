@@ -4,13 +4,13 @@ GPU_IDS=(0)
 
 
 # for deep100
-export LD_LIBRARY_PATH="/home/svu/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
-export FLASHINFER_USE_CUDA_NORM=1
-export NVCC_PREPEND_FLAGS="-ccbin g++-11"
+# export LD_LIBRARY_PATH="/home/svu/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
+# export FLASHINFER_USE_CUDA_NORM=1
+# export NVCC_PREPEND_FLAGS="-ccbin g++-11"
 
 # for hopper
-# export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
-# export FLASHINFER_USE_CUDA_NORM=1
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
+export FLASHINFER_USE_CUDA_NORM=1
 
 export HF_HUB_DISABLE_XET=1
 
@@ -100,13 +100,13 @@ fi
 
 # temperature = 0.0
 #     --save-generations \
-# chartqa:200 mmstar:200 realworldqa:200 mmmu:200 textvqa:200 seedbench-image:200 mathvision:200 vdc:20
+# chartqa:200 mmstar:200 realworldqa:200 mmmu:200 textvqa:200 dynamath:200 seedbench-image:200 mathvision:200 vdc:20
 python benchmarks/bench_mm.py \
     --model Qwen/Qwen3.5-4B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
     --block-size 0 \
-    --benchmark-list dynamath:200 seedbench-image:200 \
+    --benchmark-list chartqa:200 mmstar:200 realworldqa:200 mmmu:200 textvqa:200 dynamath:200 seedbench-image:200 mathvision:200 \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \

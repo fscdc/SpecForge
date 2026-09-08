@@ -59,7 +59,7 @@ export NVCC_PREPEND_FLAGS="-ccbin g++-11"
 # export FLASHINFER_USE_CUDA_NORM=1
 
 export PYTHONUNBUFFERED=1
-GPU_IDS=(0 1 2 3)
+GPU_IDS=(0 1)
 
 JOB_ID="${PBS_JOBID:-${SLURM_JOB_ID:-local}}"
 LOG_DIR="logs/regen_${JOB_ID}"
@@ -174,10 +174,11 @@ if python3 scripts/regenerate_train_data.py \
     --temperature 0.0 \
     --top-p 0.95 \
     --top-k 20 \
-    --input-file-path /local_home2/fengsicheng/specforge/data/llava-ov15-1M_train.jsonl \
-    --output-file-path /local_home2/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M_regen_first_turn.jsonl \
+    --input-file-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/data/llava-ov15-1M_train.jsonl \
+    --output-file-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M-prompted_regen_first_turn.jsonl \
     --resume \
     --reasoning disable \
+    --align-prompts \
     > "${LOG_DIR}/regen.log" 2>&1
 then
     echo "[done] regeneration finished successfully"

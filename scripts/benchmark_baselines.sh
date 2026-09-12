@@ -35,37 +35,37 @@ IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 # No draft model. Note: --speculative-ngram-max-bfs-breadth > 1 together with
 # --page-size > 1 would require --attention-backend flashinfer; page_size is
 # left at its default of 1, so triton is fine.
-NAME=mtp_ngram16_qwen35-4B_concurrency1
+# NAME=mtp_ngram16_qwen35-4B_concurrency1
 
-SERVER_ADDRESSES=()
-PORTS=()
-BASE_URLS=()
-for idx in "${!GPU_IDS[@]}"; do
-    gpu_id="${VISIBLE_GPUS[${GPU_IDS[$idx]}]:-}"
-    if [ -z "${gpu_id}" ]; then
-        echo "GPU ${GPU_IDS[$idx]} is not among the ${#VISIBLE_GPUS[@]} GPU(s) of this job" >&2
-        exit 1
-    fi
-    port=$((31000 + idx * 10))
-    SERVER_ADDRESSES+=("localhost:${port}")
-    PORTS+=("${port}")
-    BASE_URLS+=("http://localhost:${port}")
-    CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
-        --model Qwen/Qwen3.5-4B \
-        --speculative-algorithm NGRAM \
-        --speculative-num-draft-tokens 16 \
-        --speculative-ngram-max-bfs-breadth 10 \
-        --mem-fraction-static 0.7 \
-        --tp 1 \
-        --trust-remote-code \
-        --cuda-graph-max-bs 128 \
-        --attention-backend fa3 \
-        --mm-attention-backend sdpa \
-        --host 0.0.0.0 \
-        --port ${port} \
-        --dtype bfloat16 \
-        --reasoning-parser qwen3 &
-done
+# SERVER_ADDRESSES=()
+# PORTS=()
+# BASE_URLS=()
+# for idx in "${!GPU_IDS[@]}"; do
+#     gpu_id="${VISIBLE_GPUS[${GPU_IDS[$idx]}]:-}"
+#     if [ -z "${gpu_id}" ]; then
+#         echo "GPU ${GPU_IDS[$idx]} is not among the ${#VISIBLE_GPUS[@]} GPU(s) of this job" >&2
+#         exit 1
+#     fi
+#     port=$((31000 + idx * 10))
+#     SERVER_ADDRESSES+=("localhost:${port}")
+#     PORTS+=("${port}")
+#     BASE_URLS+=("http://localhost:${port}")
+#     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
+#         --model Qwen/Qwen3.5-4B \
+#         --speculative-algorithm NGRAM \
+#         --speculative-num-draft-tokens 16 \
+#         --speculative-ngram-max-bfs-breadth 10 \
+#         --mem-fraction-static 0.7 \
+#         --tp 1 \
+#         --trust-remote-code \
+#         --cuda-graph-max-bs 128 \
+#         --attention-backend fa3 \
+#         --mm-attention-backend sdpa \
+#         --host 0.0.0.0 \
+#         --port ${port} \
+#         --dtype bfloat16 \
+#         --reasoning-parser qwen3 &
+# done
 
 
 # ============================== eagle3 ==============================
@@ -126,41 +126,41 @@ done
         # --speculative-eagle-topk 1 \
         # --speculative-num-draft-tokens 16 \
 
-# # NAME=mtp-15step_qwen35-4B_concurrency1
-# # NAME=mtp-7step_qwen35-4B_concurrency1
+NAME=mtp-15step_qwen35-4B_concurrency1
+# NAME=mtp-7step_qwen35-4B_concurrency1
 # NAME=mtp-3step_qwen35-4B_concurrency1
 
-# SERVER_ADDRESSES=()
-# PORTS=()
-# BASE_URLS=()
-# for idx in "${!GPU_IDS[@]}"; do
-#     gpu_id="${VISIBLE_GPUS[${GPU_IDS[$idx]}]:-}"
-#     if [ -z "${gpu_id}" ]; then
-#         echo "GPU ${GPU_IDS[$idx]} is not among the ${#VISIBLE_GPUS[@]} GPU(s) of this job" >&2
-#         exit 1
-#     fi
-#     port=$((31000 + idx * 10))
-#     SERVER_ADDRESSES+=("localhost:${port}")
-#     PORTS+=("${port}")
-#     BASE_URLS+=("http://localhost:${port}")
-#     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
-#         --model Qwen/Qwen3.5-4B \
-#         --speculative-algorithm NEXTN \
-#         --speculative-num-steps 3 \
-#         --speculative-eagle-topk 1 \
-#         --speculative-num-draft-tokens 4 \
-#         --disable-overlap-schedule \
-#         --mem-fraction-static 0.7 \
-#         --tp 1 \
-#         --trust-remote-code \
-#         --cuda-graph-max-bs 128 \
-#         --attention-backend fa3 \
-#         --mm-attention-backend sdpa \
-#         --host 0.0.0.0 \
-#         --port ${port} \
-#         --dtype bfloat16 \
-#         --reasoning-parser qwen3 &
-# done
+SERVER_ADDRESSES=()
+PORTS=()
+BASE_URLS=()
+for idx in "${!GPU_IDS[@]}"; do
+    gpu_id="${VISIBLE_GPUS[${GPU_IDS[$idx]}]:-}"
+    if [ -z "${gpu_id}" ]; then
+        echo "GPU ${GPU_IDS[$idx]} is not among the ${#VISIBLE_GPUS[@]} GPU(s) of this job" >&2
+        exit 1
+    fi
+    port=$((31000 + idx * 10))
+    SERVER_ADDRESSES+=("localhost:${port}")
+    PORTS+=("${port}")
+    BASE_URLS+=("http://localhost:${port}")
+    CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
+        --model Qwen/Qwen3.5-4B \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 15 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 16 \
+        --disable-overlap-schedule \
+        --mem-fraction-static 0.7 \
+        --tp 1 \
+        --trust-remote-code \
+        --cuda-graph-max-bs 128 \
+        --attention-backend fa3 \
+        --mm-attention-backend sdpa \
+        --host 0.0.0.0 \
+        --port ${port} \
+        --dtype bfloat16 \
+        --reasoning-parser qwen3 &
+done
 
 
 # The servers load in the background, so wait for all of them before benchmarking.
@@ -213,17 +213,17 @@ fi
 # temperature = 0.0
 # --save-generations \
 
-NAME="${NAME}_temp0"
+NAME="${NAME}_temp1_4096"
 python benchmarks/bench_mm.py \
     --model Qwen/Qwen3.5-4B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
-    --benchmark-list chartqa:200 mmstar:200 realworldqa:200 mmmu:200 textvqa:200 dynamath:200 seedbench-image:200 mathvision:200 \
+    --benchmark-list chartqa:200 textvqa:200 mmstar:200 seedbench-image-origin:200 dynamath:200 mathvista:200 mathverse:200 \
     --reasoning off \
-    --temperature 0.0 \
+    --temperature 1.0 \
     --top-p 0.95 \
     --top-k 20 \
-    --max-tokens 8192 \
+    --max-tokens 4096 \
     --name "${NAME}"
 
 

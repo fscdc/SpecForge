@@ -24,6 +24,6 @@ source ~/.bashrc
 
 conda activate specforge
 
-bash ./scripts/mmflash_training.sh > stdout.$PBS_JOBID 2> stderr.$PBS_JOBID
+bash ./scripts/training.sh > stdout.$PBS_JOBID 2> stderr.$PBS_JOBID
 
 EOF

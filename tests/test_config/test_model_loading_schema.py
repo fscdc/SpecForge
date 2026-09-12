@@ -44,7 +44,7 @@ def _payload(strategy: str, **model_overrides):
 
 class ModelLoadingSchemaTest(unittest.TestCase):
     def test_working_legacy_auto_config_strategies_can_omit_source(self):
-        for strategy in ("eagle3", "peagle", "dflash"):
+        for strategy in ("eagle3", "peagle", "dflash", "mmflash"):
             with self.subTest(strategy=strategy):
                 cfg = Config.model_validate(_payload(strategy))
                 resolve_run(cfg)

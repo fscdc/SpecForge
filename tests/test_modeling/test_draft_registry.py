@@ -97,6 +97,7 @@ class DraftRegistryTest(unittest.TestCase):
         self.assertIn("DFlashDraftModel", available_drafts())
         self.assertIn("DominoDraftModel", available_drafts())
         self.assertIn("DSparkDraftModel", available_drafts())
+        self.assertIn("MMFlashDraftModel", available_drafts())
         self.assertIs(resolve_draft("LlamaForCausalLMEagle3"), LlamaForCausalLMEagle3)
         self.assertIs(resolve_draft("DFlashDraftModel"), DFlashDraftModel)
         self.assertIs(resolve_draft("DominoDraftModel"), DominoDraftModel)

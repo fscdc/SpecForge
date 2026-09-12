@@ -3,7 +3,8 @@ Utility functions for the multimodal benchmarks.
 """
 
 import re
-from typing import Any, Callable, List, Optional, Tuple
+from collections import OrderedDict
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import sglang as sgl
 
@@ -262,6 +263,48 @@ def reference_in_prediction(prediction: str, reference: str) -> bool:
         pattern = rf"(?<!\w){re.escape(reference)}(?!\w)"
         return re.search(pattern, prediction) is not None
     return reference in prediction
+
+
+def stratified_indices(labels: Sequence[Any], num_samples: Optional[int]) -> List[int]:
+    """Indices of a subset whose label distribution matches the whole dataset.
+
+    Several of these datasets are stored grouped by category, so taking the
+    first N rows measures one category and calls it the benchmark: MMStar's
+    first 200 rows are 100% coarse-perception out of six equal categories, and
+    ChartQA's are 100% human-written out of a 50/50 split. This picks a
+    proportional slice instead.
+
+    Deterministic by construction -- no RNG, so the same dataset yields the same
+    subset on every machine. Quotas are largest-remainder over the label counts,
+    each stratum contributes its FIRST `quota` rows in dataset order, and the
+    result is returned in dataset order so that callers which slice it further
+    (`bench_mm.py` peels the warmup questions off the end) stay sane.
+
+    A dataset smaller than `num_samples`, or `num_samples=None`, yields every
+    index unchanged.
+    """
+    total = len(labels)
+    if num_samples is None or num_samples >= total:
+        return list(range(total))
+
+    groups: "OrderedDict[Any, List[int]]" = OrderedDict()
+    for index, label in enumerate(labels):
+        groups.setdefault(label, []).append(index)
+
+    exact = {label: len(rows) * num_samples / total for label, rows in groups.items()}
+    quota = {label: int(value) for label, value in exact.items()}
+    # largest remainder: hand the rounding leftovers to the labels the floor
+    # shortchanged most, breaking ties by the label's first appearance so the
+    # outcome does not depend on dict iteration luck
+    order = sorted(
+        groups,
+        key=lambda label: (-(exact[label] - quota[label]), groups[label][0]),
+    )
+    for label in order[: num_samples - sum(quota.values())]:
+        quota[label] += 1
+
+    selected = [index for label, rows in groups.items() for index in rows[: quota[label]]]
+    return sorted(selected)
 
 
 def create_image_sgl_function(

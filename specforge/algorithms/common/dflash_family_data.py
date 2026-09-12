@@ -159,6 +159,61 @@ def build_collator():
     return collate
 
 
+def build_mmflash_collator():
+    """The DFlash-family collator plus MMFlash's optional ``visual_score``.
+
+    ``visual_score`` arrives quantised as int64 (see
+    ``specforge.data.visual_score``). It is padded with the text-only sentinel
+    -- NOT zero -- because zero is a valid score and would turn a short
+    text-only row into a multimodal one, then dequantised to float32 in [0, 1]
+    with the sentinel kept at -1. Batches without the channel (offline files,
+    text-modality capture, evaluation) collate exactly like ``build_collator``.
+    """
+
+    def collate(features):
+        batch = pad_and_concatenate_features(
+            features,
+            sequence_axes={
+                "input_ids": 1,
+                "loss_mask": 1,
+                "hidden_states": 1,
+            },
+            required_keys=("input_ids", "loss_mask", "hidden_states"),
+        )
+        present = [("visual_score" in feature) for feature in features]
+        if not any(present):
+            return batch
+        if not all(present):
+            raise KeyError(
+                "visual_score is present on some samples of the batch but not "
+                "others; every MMFlash image capture must carry the channel"
+            )
+        import torch
+
+        from specforge.data.visual_score import (
+            TEXT_ONLY_SENTINEL,
+            dequantize_visual_score,
+        )
+
+        max_length = int(batch["input_ids"].shape[-1])
+        padded = []
+        for feature in features:
+            tensor = feature["visual_score"]
+            if tensor.dim() != 2 or tensor.shape[0] != 1:
+                raise ValueError(
+                    f"visual_score must be (1, L), got {tuple(tensor.shape)}"
+                )
+            length = int(tensor.shape[1])
+            if length < max_length:
+                fill = tensor.new_full((1, max_length - length), TEXT_ONLY_SENTINEL)
+                tensor = torch.cat([tensor, fill], dim=1)
+            padded.append(tensor)
+        batch["visual_score"] = dequantize_visual_score(torch.cat(padded, dim=0))
+        return batch
+
+    return collate
+
+
 def build_dspark_collator():
     def collate(features):
         return pad_and_concatenate_features(
@@ -185,6 +240,7 @@ __all__ = [
     "NORMALIZER_ID",
     "build_collator",
     "build_dspark_collator",
+    "build_mmflash_collator",
     "build_dspark_offline_normalizer",
     "build_dspark_offline_reader",
     "build_offline_normalizer",

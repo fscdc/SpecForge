@@ -417,6 +417,114 @@ def build_dspark_model(
     )
 
 
+# --- MMFlash: clones of the DFlash builders so the strategy can diverge -------
+# ``dflash_config`` stays: it is the draft-config JSON key the family and SGLang
+# share. ``_build_dflash_family_model`` stays: it is the common assembler.
+
+def mmflash_needs_input_tools(cfg: Config, draft_model: Any) -> bool:
+    method_config = getattr(draft_model.config, "dflash_config", None) or {}
+    needs_mask_fallback = (
+        cfg.model.mask_token_id is None and method_config.get("mask_token_id") is None
+    )
+    return cfg.mode == "online" or needs_mask_fallback
+
+
+def build_mmflash_draft(
+    cfg: Config,
+    draft_config: PretrainedConfig,
+    kernels: Optional[DFlashKernels],
+):
+    from specforge.modeling.auto import AutoDraftModel
+
+    draft_config._attn_implementation = cfg.training.attention_backend
+    draft_model = AutoDraftModel.from_config(
+        draft_config,
+        torch_dtype=_torch_dtype(cfg),
+        mmflash_kernels=kernels,
+    )
+    return _finish_registered_draft(cfg, draft_config, draft_model)
+
+
+def resolve_mmflash_capture_layers(
+    _cfg: Config, draft_config: Any, _target_config: Any
+) -> List[int]:
+    method_config = (
+        draft_config.get("dflash_config", {})
+        if isinstance(draft_config, dict)
+        else getattr(draft_config, "dflash_config", {})
+    ) or {}
+    layers = list(method_config.get("target_layer_ids", []))
+    if not layers:
+        raise ValueError("draft config does not define target capture layer ids")
+    return layers
+
+
+def build_mmflash_model(
+    cfg: Config,
+    draft_model: Any,
+    _draft_config: Any,
+    _target_config: Any,
+    tokenizer: Any,
+) -> AlgorithmModelParts:
+    from specforge.algorithms.common.mmflash_model import OnlineMMFlashModel
+
+    return _build_dflash_family_model(
+        cfg,
+        draft_model,
+        tokenizer,
+        lambda common: OnlineMMFlashModel(
+            **common,
+            loss_type=cfg.training.loss_type,
+            dpace_alpha=cfg.training.dpace_alpha,
+            visual_alpha=cfg.training.visual_alpha,
+        ),
+    )
+
+
+def mmflash_min_loss_tokens(_cfg: Config, draft_config: Any) -> int:
+    block_size = getattr(draft_config, "block_size", None)
+    if (
+        not isinstance(block_size, int)
+        or isinstance(block_size, bool)
+        or block_size < 1
+    ):
+        raise ValueError(
+            "MMFlash draft config must define a positive integer block_size"
+        )
+    return 2 * block_size
+
+
+def populate_mmflash_generated_config(
+    payload: Dict[str, Any], target_config: Any, _cfg: Config
+) -> None:
+    from specforge.modeling.draft.mmflash import build_target_layer_ids
+
+    target_layers = getattr(target_config, "num_hidden_layers", None)
+    if not isinstance(target_layers, int) or target_layers < 1:
+        raise ValueError(
+            "MMFlash auto-generation requires target num_hidden_layers, got "
+            f"{target_layers!r}"
+        )
+    payload["num_target_layers"] = target_layers
+    payload["block_size"] = 16
+    payload["dflash_config"] = {
+        "target_layer_ids": build_target_layer_ids(target_layers, 1)
+    }
+
+
+def apply_mmflash_overrides(cfg: Config, draft_config: Any) -> None:
+    if cfg.model.draft_num_hidden_layers is None:
+        return
+    from specforge.modeling.draft.mmflash import build_target_layer_ids
+
+    target_layers = int(draft_config.num_target_layers)
+    method_config = dict(getattr(draft_config, "dflash_config", None) or {})
+    method_config["target_layer_ids"] = build_target_layer_ids(
+        target_layers, cfg.model.draft_num_hidden_layers
+    )
+    draft_config.dflash_config = method_config
+
+
 def eagle3_strategy_kwargs(cfg: Config) -> Dict[str, Any]:
     return {
         "compact_teacher": cfg.training.compact_teacher,
@@ -478,6 +586,13 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
 __all__ = [
     "AlgorithmModelParts",
     "apply_dflash_overrides",
+    "apply_mmflash_overrides",
+    "build_mmflash_draft",
+    "build_mmflash_model",
+    "mmflash_min_loss_tokens",
+    "mmflash_needs_input_tools",
+    "populate_mmflash_generated_config",
+    "resolve_mmflash_capture_layers",
     "build_dflash_model",
     "build_domino_model",
     "build_dspark_model",

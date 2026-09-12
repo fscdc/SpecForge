@@ -138,8 +138,10 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Benchmarks to run, as <name>:<num-prompts>:<subset>,<subset>. The "
             "first <num-prompts> questions in dataset order are evaluated. "
-            f"Available: {', '.join(sorted(MM_BENCHMARKS.benchmarks))}. Text-only "
-            "benchmarks live in bench_text.py."
+            f"Available: {', '.join(sorted(MM_BENCHMARKS.benchmarks))}. Append "
+            "-origin to a name (mmstar-origin:200) to send the task's own prompt "
+            "instead of the shared step-by-step one, where that original has been "
+            "ported. Text-only benchmarks live in bench_text.py."
         ),
     )
     benchmark_group.add_argument(
@@ -970,6 +972,20 @@ def print_summary(
 # --------------------------------------------------------------------------
 
 
+#: ``<benchmark>-origin`` runs the benchmark under the ORIGINAL prompt of its
+#: task instead of the shared step-by-step boxed one this repository sends. The
+#: results file is keyed by the full name, suffix included, so the two prompts
+#: of one benchmark never overwrite each other.
+ORIGIN_SUFFIX = "-origin"
+
+
+def split_benchmark_name(name: str) -> Tuple[str, bool]:
+    """The registered benchmark behind a list entry, and whether -origin was asked."""
+    if name.endswith(ORIGIN_SUFFIX) and len(name) > len(ORIGIN_SUFFIX):
+        return name[: -len(ORIGIN_SUFFIX)], True
+    return name, False
+
+
 def parse_benchmark_list(
     items: Sequence[str],
 ) -> List[Tuple[str, Optional[int], Optional[List[str]]]]:
@@ -984,11 +1000,13 @@ def parse_benchmark_list(
             name, num_prompts, subset = splits[0], splits[1], splits[2].split(",")
         else:
             raise ValueError(f"Invalid benchmark list format: {item}")
-        if name not in MM_BENCHMARKS.benchmarks:
+        base, _ = split_benchmark_name(name)
+        if base not in MM_BENCHMARKS.benchmarks:
             raise KeyError(
-                f"Unknown multimodal benchmark {name!r}. Available: "
-                f"{', '.join(sorted(MM_BENCHMARKS.benchmarks))}. Text-only "
-                "benchmarks are run by bench_text.py."
+                f"Unknown multimodal benchmark {base!r}. Available: "
+                f"{', '.join(sorted(MM_BENCHMARKS.benchmarks))} (each also as "
+                f"<name>{ORIGIN_SUFFIX} where the task's own prompt was ported). "
+                "Text-only benchmarks are run by bench_text.py."
             )
         parsed.append((name, int(num_prompts) if num_prompts else None, subset))
     return parsed
@@ -1005,14 +1023,37 @@ def instantiate(
 
     `single_image_only` is MMMU's; the chat API can send several images per
     request, so it defaults to False here and only MMMU is asked about it.
+
+    A ``-origin`` name asks the class for ``ORIGINAL_PROMPT_KWARGS``, the
+    constructor arguments that restore the task's own prompt. A benchmark that
+    never had its prompt replaced -- or whose original was not ported -- leaves
+    that attribute None, and the run is refused: measuring the shared prompt
+    under an "-origin" label would be worse than no number at all.
     """
-    cls = MM_BENCHMARKS.get(name)
+    base, origin = split_benchmark_name(name)
+    cls = MM_BENCHMARKS.get(base)
     kwargs: Dict[str, Any] = {"num_samples": num_samples}
     parameters = inspect.signature(cls.__init__).parameters
     if subset is not None:
         kwargs["subset"] = subset
     if "single_image_only" in parameters:
         kwargs["single_image_only"] = single_image_only
+    if origin:
+        original = getattr(cls, "ORIGINAL_PROMPT_KWARGS", None)
+        if original is None:
+            raise ValueError(
+                f"{name}: {base!r} has no ported original prompt "
+                f"({cls.__name__}.ORIGINAL_PROMPT_KWARGS is None). It either "
+                "already sends its task's own prompt -- run it without the "
+                f"{ORIGIN_SUFFIX} suffix -- or the original has yet to be ported."
+            )
+        unknown = sorted(set(original) - set(parameters))
+        if unknown:
+            raise TypeError(
+                f"{cls.__name__}.ORIGINAL_PROMPT_KWARGS names constructor "
+                f"arguments it does not have: {unknown}"
+            )
+        kwargs.update(original)
     return cls(**kwargs)
 
 

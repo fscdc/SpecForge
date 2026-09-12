@@ -453,6 +453,64 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         }
 
 
+class MMFlashTrainStrategy(DraftTrainStrategy):
+    """MMFlash block-parallel strategy wrapping ``OnlineMMFlashModel``.
+
+    A clone of ``DFlashTrainStrategy`` at the fork; free to diverge.
+
+    Shares the trainer/backend/loader/checkpoint spine with EAGLE3; only the
+    per-step forward/loss differs (single block-wise pass, scalar loss, hard
+    real-token labels — no target distribution, no vocab map). ``hidden_states``
+    is the family's schema name, distinct from EAGLE3's ``hidden_state``.
+    """
+
+    name = "mmflash"
+    required_features = {"input_ids", "hidden_states", "loss_mask"}
+
+    def __init__(self, mmflash_model: nn.Module) -> None:
+        self.mmflash_model = mmflash_model
+
+    def trainable_module(self) -> nn.Module:
+        return self.mmflash_model
+
+    def _device(self) -> torch.device:
+        return next(self.mmflash_model.parameters()).device
+
+    def forward_loss(
+        self, batch: TrainBatch, ctx: Optional[StepContext] = None
+    ) -> StepOutput:
+        self.validate_batch(batch)
+        t = batch.tensors
+        device = self._device()
+        # visual_score is optional at the batch level: offline files, text
+        # capture and evaluation batches do not carry it, and the model then
+        # treats every row as text-only (training.loss_type for all rows).
+        visual_score = t.get("visual_score")
+        loss, accuracy, model_metrics = self.mmflash_model(
+            input_ids=t["input_ids"].to(device),
+            hidden_states=t["hidden_states"].to(device),
+            loss_mask=t["loss_mask"].to(device),
+            visual_score=None if visual_score is None else visual_score.to(device),
+        )
+        metrics = {"accuracy": accuracy.detach()}
+        if "accuracy_denom" in model_metrics:
+            metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
+        return StepOutput(
+            loss=loss,
+            metrics=metrics,
+            ratio_metrics=model_metrics.get("ratio_metrics", {}),
+        )
+
+    def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        # Everything trainable lives under draft_model.; the target
+        # embedding/head are a separate module, not persisted as draft weights.
+        return {
+            k.replace("draft_model.", ""): v
+            for k, v in state_dict.items()
+            if "draft_model." in k
+        }
+
+
 class DSparkTrainStrategy(DraftTrainStrategy):
     """DSpark strategy over DFlash with target hidden-state supervision."""
 
@@ -584,6 +642,7 @@ __all__ = [
     "Eagle3TrainStrategy",
     "PEagleTrainStrategy",
     "DFlashTrainStrategy",
+    "MMFlashTrainStrategy",
     "DSparkTrainStrategy",
     "DominoTrainStrategy",
     "StepOutput",

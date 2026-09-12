@@ -33,11 +33,16 @@ mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" || {
 
 # rm -rf /local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-dflash-baseline-llava-ov15-1M
 
-specforge train --config scripts/mmtraining_configs/qwen3.5-4b-mmflash_hpc.yaml
+# dflash baseline
+# specforge train --config scripts/mmtraining_configs/qwen3.5-4b-dflash.yaml
 
-# 跑之前check一下
-# ps -ef | grep -E "specforge|sglang.launch_server|mooncake_master" | grep -v grep
+# ours: mmflash
+MMFLASH_CONFIG=scripts/mmtraining_configs/qwen3.5-4b-mmflash_hpc.yaml
 
-# pkill -f "specforge train"
-# pkill -f sglang.launch_server
-# pkill -f mooncake_master
+# qsub -l select=1:ngpus=4 -v CONFIG=${MMFLASH_CONFIG} scripts/score_visual_kl_hpc.sh
+
+
+bash scripts/score_visual_kl_hpc.sh ${MMFLASH_CONFIG} 
+
+specforge train --config ${MMFLASH_CONFIG}
+

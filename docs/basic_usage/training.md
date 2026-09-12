@@ -199,6 +199,8 @@ The checked-in examples are the canonical starting points:
 | EAGLE3 offline | [`qwen3-8b-eagle3-offline.yaml`](../../examples/configs/qwen3-8b-eagle3-offline.yaml) |
 | DFlash online | [`qwen3-8b-dflash-online.yaml`](../../examples/configs/qwen3-8b-dflash-online.yaml) |
 | DFlash offline | [`qwen3-8b-dflash-offline.yaml`](../../examples/configs/qwen3-8b-dflash-offline.yaml) |
+| MMFlash online | [`qwen3-8b-mmflash-online.yaml`](../../examples/configs/qwen3-8b-mmflash-online.yaml) |
+| MMFlash offline | [`qwen3-8b-mmflash-offline.yaml`](../../examples/configs/qwen3-8b-mmflash-offline.yaml) |
 | Domino online | [`qwen3-8b-domino-online.yaml`](../../examples/configs/qwen3-8b-domino-online.yaml) |
 | Domino offline | [`qwen3-8b-domino-offline.yaml`](../../examples/configs/qwen3-8b-domino-offline.yaml) |
 | P-EAGLE online | [`qwen3-8b-peagle-disaggregated.yaml`](../../examples/configs/qwen3-8b-peagle-disaggregated.yaml) |
@@ -208,6 +210,7 @@ The checked-in examples are the canonical starting points:
 | DSpark offline | [`qwen3-4b-dspark-offline.yaml`](../../examples/configs/qwen3-4b-dspark-offline.yaml) |
 | EAGLE3 offline disaggregated | [`qwen3-8b-eagle3-offline-disaggregated.yaml`](../../examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml) |
 | Ascend NPU DFlash online | [`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/qwen3.5-4b-dflash-online-npu.yaml) |
+| Ascend NPU MMFlash online | [`qwen3.5-4b-mmflash-online-npu.yaml`](../../examples/configs/qwen3.5-4b-mmflash-online-npu.yaml) |
 | Ascend NPU Domino online | [`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/qwen3.5-4b-domino-online-npu.yaml) |
 
 ## Online and offline data
@@ -235,6 +238,7 @@ The unified runtime supports text training in these combinations:
 | --- | --- | --- | --- |
 | EAGLE3 | Yes, consumer DP | Yes, DP + USP | Yes, consumer DP |
 | DFlash | Yes, consumer DP | Yes, DP | Yes, consumer DP |
+| MMFlash | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | Domino | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | DSpark | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | P-EAGLE | Yes, consumer DP, batch size 1 | No | No |

@@ -37,6 +37,7 @@ from .utils import (
     STEP_BY_STEP_BOXED_PROMPT,
     create_image_sgl_function,
     extract_choice,
+    stratified_indices,
 )
 
 # "default" is what we run: it asks for the reasoning before the answer and
@@ -135,6 +136,9 @@ class MMStarBenchmarker(MMBenchmarker):
             (what published numbers use) or "qwen3_vl".
     """
 
+    #: ``mmstar-origin``: the task's "answer with the option's letter" prompt
+    ORIGINAL_PROMPT_KWARGS = {"prompt_variant": "lmms_eval"}
+
     def __init__(
         self,
         num_samples: Optional[int] = None,
@@ -181,7 +185,11 @@ class MMStarBenchmarker(MMBenchmarker):
         if self.subset:
             dataset = dataset.select(self._select_subset(dataset))
         if self.num_samples is not None:
-            dataset = dataset.select(range(min(self.num_samples, len(dataset))))
+            # stored one category at a time: the first 200 rows are entirely
+            # coarse perception, one of the benchmark's six equal categories
+            dataset = dataset.select(
+                stratified_indices(dataset["category"], self.num_samples)
+            )
 
         questions = []
         labels = []

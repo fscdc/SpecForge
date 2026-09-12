@@ -1,9 +1,22 @@
 
-# for draft model, we need to convert it to a sglang loadable format first
+# for draft model, we need to convert it to a sglang loadable format first.
+# An mmflash checkpoint takes TWO steps, not one: SGLang resolves the draft class
+# by config.architectures[0] and only knows "DFlashDraftModel", so the exported
+# config.json (which says "MMFlashDraftModel") has to be rewritten before it can
+# be served. Step 2 does that in place (and drops auto_map); it also refuses the
+# export if block_size does not match. Weights are untouched -- mmflash is
+# weight-for-weight identical to dflash, which is the only reason this works.
+#
+# 1) export the training checkpoint to an HF directory
 # specforge export --to hf \
-#   --checkpoint /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-sharegpt4v-pt/qwen3.5-4b-mmflash-step160000 \
-#   --draft-config configs/qwen3.5-4b-dflash.json \
-#   --output-dir /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-160000
+#   --checkpoint /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M/qwen3.5-4b-mmflash-step100000 \
+#   --draft-config configs/qwen3.5-4b-mmflash.json \
+#   --output-dir /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-llava-ov15-1M-100000
+#
+# 2) rewrite architectures -> DFlashDraftModel so SGLang's DFLASH loader accepts it
+# python scripts/gates/normalize_dflash_export.py \
+#   --config /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-llava-ov15-1M-100000/config.json \
+#   --block-size 16
 
 export CUDA_VISIBLE_DEVICES=0
 
@@ -53,7 +66,7 @@ for idx in "${!GPU_IDS[@]}"; do
     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
         --model Qwen/Qwen3.5-4B \
         --speculative-algorithm DFLASH \
-        --speculative-draft-model-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-50000 \
+        --speculative-draft-model-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-final \
         --speculative-dflash-block-size ${BLOCK_SIZE} \
         --mem-fraction-static 0.7 \
         --tp 1 \
@@ -98,18 +111,19 @@ if [ $? -ne 0 ]; then
 fi
 
 
+
 python benchmarks/bench_mm.py \
     --model Qwen/Qwen3.5-4B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
     --block-size ${BLOCK_SIZE} \
-    --benchmark-list chartqa:200 mmstar:200 realworldqa:200 mmmu:200 textvqa:200 dynamath:200 seedbench-image:200 mathvision:200 \
+    --benchmark-list chartqa:200 textvqa:200 mmstar:200 seedbench-image-origin:200 dynamath:200 mathvista:200 mathverse:200 \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \
     --top-k 20 \
-    --max-tokens 8192 \
-    --name dflash_baseline_llava_ov_1M_step50000_qwen35-4B_concurrency1_temp0
+    --max-tokens 4096 \
+    --name dflash_baseline_llava_ov_1M_final_qwen35-4B_concurrency1_temp0_4096
 
 # # for text benchmark
 # python benchmarks/bench_text.py \

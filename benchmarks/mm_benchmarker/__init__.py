@@ -22,7 +22,9 @@ The module then has to be imported below, otherwise the registration never runs.
 
 from .chartqa import ChartQABenchmarker
 from .dynamath import DynaMathBenchmarker
+from .mathverse import MathVerseBenchmarker
 from .mathvision import MathVisionBenchmarker
+from .mathvista import MathVistaBenchmarker
 from .mmmu import MMMUBenchmarker
 from .mmstar import MMStarBenchmarker
 from .ocrbench import OCRBenchBenchmarker
@@ -37,7 +39,9 @@ __all__ = [
     "MM_BENCHMARKS",
     "ChartQABenchmarker",
     "DynaMathBenchmarker",
+    "MathVerseBenchmarker",
     "MathVisionBenchmarker",
+    "MathVistaBenchmarker",
     "MMMUBenchmarker",
     "MMStarBenchmarker",
     "OCRBenchBenchmarker",

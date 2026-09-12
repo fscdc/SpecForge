@@ -28,6 +28,11 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
                 "loss_mask": "loss_mask",
                 "hidden_states": "aux_hidden_states",
             },
+            "mmflash": {
+                "input_ids": "input_ids",
+                "loss_mask": "loss_mask",
+                "hidden_states": "aux_hidden_states",
+            },
             "domino": {
                 "input_ids": "input_ids",
                 "loss_mask": "loss_mask",
@@ -76,7 +81,7 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
                 )
 
     def test_materialize_preserves_arbitrary_auxiliary_layer_counts(self):
-        for strategy in ("dflash", "domino", "dspark"):
+        for strategy in ("dflash", "domino", "dspark", "mmflash"):
             layout = (
                 self.registry.resolve(strategy)
                 .providers.offline_for("text")

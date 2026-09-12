@@ -22,14 +22,14 @@ from specforge.algorithms.common.providers import (
 from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "eagle3", "peagle")
+BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mmflash", "peagle")
 
 
 class BuiltinProviderContractTest(unittest.TestCase):
     def setUp(self):
         self.registry = builtin_algorithm_registry()
 
-    def test_five_builtins_are_explicit_and_instance_owned(self):
+    def test_six_builtins_are_explicit_and_instance_owned(self):
         self.assertEqual(BUILTINS, self.registry.names)
         self.assertIsNot(builtin_algorithm_registry(), self.registry)
 
@@ -124,6 +124,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "eagle3": ("llama", 1, 32000, False),
             "peagle": ("llama", 4, 32000, False),
             "dflash": ("qwen3", 1, None, True),
+            "mmflash": ("qwen3", 1, None, True),
         }
         for name, (model_type, layers, vocab_size, has_override) in expected.items():
             with self.subTest(algorithm=name):
@@ -172,6 +173,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             loss_decay_gamma=2.0,
             loss_type="dpace",
             dpace_alpha=0.4,
+            visual_alpha=1.0,
             shift_label=True,
             dspark_ce_loss_alpha=0.1,
             dspark_l1_loss_alpha=0.8,
@@ -194,6 +196,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "dflash": dflash_family,
             "domino": dflash_family,
             "dspark": dflash_family,
+            "mmflash": dflash_family,
         }
         expected_keys = {
             "eagle3": {
@@ -227,6 +230,13 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dspark_ce_loss_alpha",
                 "dspark_l1_loss_alpha",
                 "dspark_confidence_head_alpha",
+            },
+            "mmflash": {
+                "mmflash_block_size",
+                "mmflash_num_anchors",
+                "mmflash_loss_type",
+                "mmflash_dpace_alpha",
+                "mmflash_visual_alpha",
             },
         }
 
@@ -412,7 +422,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==5; "
+            "r=builtin_algorithm_registry(); assert len(r)==6; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )

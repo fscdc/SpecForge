@@ -229,6 +229,10 @@ def write_offline_files_dflash(d, n=4, seq=32, hidden=H, vocab=V, seed=0):
     return d
 
 
+# MMFlash shares DFlash's offline feature schema exactly.
+write_offline_files_mmflash = write_offline_files_dflash
+
+
 def write_offline_files_dspark(
     d,
     n=4,
@@ -332,6 +336,75 @@ def build_dflash(
     ).cuda()
     width = len(draft_model.target_layer_ids) * hidden
     return dflash_model, width, target_dir, list(draft_model.target_layer_ids)
+
+
+def build_mmflash(
+    workdir,
+    *,
+    hidden=H,
+    vocab=V,
+    target_layers=4,
+    draft_layers=1,
+    block_size=4,
+    num_anchors=8,
+    mask_token_id=0,
+    attention_backend="sdpa",
+):
+    """Build a tiny OnlineMMFlashModel on CUDA through the package model pieces.
+
+    Returns (mmflash_model, hidden_states_width, target_dir, target_layer_ids).
+    target_dir holds the saved tiny Qwen3 target (load it as an HF DFlash-family target for
+    the ONLINE path); target_layer_ids are the capture layers (== set_capture_layers).
+    For draft_layers=1 the capture set is one target layer so width == hidden.
+    """
+    from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
+
+    from specforge.algorithms.common.mmflash_model import OnlineMMFlashModel
+    from specforge.modeling.draft.mmflash import MMFlashDraftModel
+    from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
+
+    # Tiny Qwen3 target saved to disk; the draft config is derived from it.
+    tcfg = Qwen3Config(
+        hidden_size=hidden,
+        intermediate_size=2 * hidden,
+        num_hidden_layers=target_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=vocab,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-5,
+        tie_word_embeddings=False,
+    )
+    torch.manual_seed(1234)
+    target_dir = os.path.join(workdir, "mmflash_target")
+    Qwen3ForCausalLM(tcfg).save_pretrained(target_dir)
+
+    draft_config = AutoConfig.from_pretrained(target_dir)
+    draft_config.num_hidden_layers = draft_layers
+    draft_config.block_size = block_size
+    draft_config.num_target_layers = target_layers
+    draft_config.dflash_config = {"mask_token_id": mask_token_id}
+    draft_config._attn_implementation = attention_backend
+
+    draft_model = MMFlashDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
+    draft_model.mask_token_id = mask_token_id
+
+    target_components = TargetEmbeddingsAndHead.from_pretrained(
+        target_dir, lm_head_key="lm_head.weight", device="cuda", dtype=torch.bfloat16
+    )
+
+    mmflash_model = OnlineMMFlashModel(
+        draft_model=draft_model,
+        target_lm_head=target_components.lm_head,
+        target_embed_tokens=target_components.embed_tokens,
+        block_size=draft_model.block_size,
+        mask_token_id=mask_token_id,
+        attention_backend=attention_backend,
+        num_anchors=num_anchors,
+        loss_type="dflash",
+    ).cuda()
+    width = len(draft_model.target_layer_ids) * hidden
+    return mmflash_model, width, target_dir, list(draft_model.target_layer_ids)
 
 
 def build_domino(

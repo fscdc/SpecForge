@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from datasets import load_dataset
 
 from .base import MMBenchmarker
-from .utils import create_image_sgl_function
+from .utils import create_image_sgl_function, stratified_indices
 from .registry import MM_BENCHMARKS
 
 # doc_to_text of the lm-eval task, minus the <image> placeholder (the image is
@@ -307,7 +307,11 @@ class ChartQABenchmarker(MMBenchmarker):
             ]
             dataset = dataset.select(keep)
         if self.num_samples is not None:
-            dataset = dataset.select(range(min(self.num_samples, len(dataset))))
+            # the split is stored human-first, so the first 200 rows are 100%
+            # human-written out of a 50/50 set
+            dataset = dataset.select(
+                stratified_indices(dataset["human_or_machine"], self.num_samples)
+            )
 
         questions = []
         labels = []

@@ -50,7 +50,7 @@
 #PBS -N accept-probe
 #PBS -q auto
 #PBS -l select=1:ngpus=1
-#PBS -l walltime=24:00:00
+#PBS -l walltime=12:00:00
 
 set -uo pipefail
 
@@ -97,7 +97,10 @@ echo "[env] CONDA_PREFIX=${CONDA_PREFIX:-<unset>}"
 
 # CONDA_PREFIX is only meaningful once the environment is active; setting this
 # any earlier under PBS would have produced "/lib:/lib/python3.11/..."
-export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
+# asked of torch rather than assembled from a hard-coded python version, which
+# would silently produce a non-existent path on an env built on another minor
+_TORCH_LIB="$(python3 -c 'import os,torch;print(os.path.join(os.path.dirname(torch.__file__),"lib"))' 2>/dev/null)"
+export LD_LIBRARY_PATH="${CONDA_PREFIX:+${CONDA_PREFIX}/lib:}${_TORCH_LIB}:${LD_LIBRARY_PATH:-}"
 
 # ----------------------------- CONFIG ---------------------------------------
 PROBE=scripts/analyze_dflash_accept.py
@@ -134,36 +137,68 @@ TARGET_MODEL=${TARGET_MODEL:-Qwen/Qwen3.5-4B}
 # short name used in paths; derived from the model id unless given
 TARGET_NAME=${TARGET_NAME:-${TARGET_MODEL##*/}}
 
-# space-separated name=path pairs; the name labels directories and records
+# space-separated name=path pairs; the name labels directories and records.
+# The two drafts are the ones the throughput table compares head to head:
+#   zlab        the published text-only-data baseline
+#   llava-ov-1M our DFlash draft on the LLaVA-OneVision-1.5 boxed-prompt regen
+#               (the "prompted final" checkpoint of results/)
+# Add "sharegpt4v=${ROOT}/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-120000"
+# to bring the earlier ShareGPT4V-pt draft back into the sweep.
 DRAFTS_SPEC=${DRAFTS_SPEC:-"\
 zlab=z-lab/Qwen3.5-4B-DFlash \
-mmflash=${ROOT}/draft_models/qwen3.5-4b-mmflash-sharegpt4v-pt-120000 \
-llava-ov-1M-100k=${ROOT}/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-100000"}
+llava-ov-1M=${ROOT}/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-prompted-final"}
 
 # space-separated benchmark names, each optionally "name:split" to override the
 # split the benchmark itself defaults to. BENCHMARK (singular) still works.
+#
+# Six columns of the throughput table, so a per-anchor result can be read next
+# to the speedup it is meant to explain. They also span the shapes the
+# visual-dependency question needs: read-off-the-image answers (ChartQA,
+# TextVQA), vision-indispensable questions (MMStar), and figure-fed derivations
+# of growing length (DynaMath, MathVista, MathVerse).
+#
+# SEED-Bench is deliberately absent: under its own answer instruction it
+# replies in ~5 tokens, and the probe needs 2*block_size = 32 trainable tokens
+# per generation, so only 28 of 200 would be measurable.
+#
+# "<name>-origin" sends the benchmark's own answer instruction instead of the
+# suite's shared boxed one, and works for any benchmark whose class defines
+# ORIGINAL_PROMPT_KWARGS.
+#
+#   BENCHMARKS="chartqa mmstar realworldqa seedbench-image textvqa mmmu mathvision dynamath"
+#
+# is the older eight-benchmark sweep.
 BENCHMARKS=${BENCHMARKS:-${BENCHMARK:-"\
-chartqa mmstar realworldqa seedbench-image textvqa mmmu mathvision dynamath"}}
+chartqa textvqa mmstar dynamath mathvista mathverse"}}
 
 NUM_SAMPLES=${NUM_SAMPLES:-200}
 
-# Generation budget. A benchmark whose answers run past it is measured only on
-# its first MAX_NEW_TOKENS tokens, which biases the result towards the easy
-# start of a generation -- so the three long-form benchmarks get their own
-# budget rather than the default. Measured over the 200-question throughput run
-# (results/dflash_baseline_llava_ov_1M_step100000_*.jsonl), the number of
-# answers longer than the budget is:
+# Generation budget, one value for every benchmark. Decoding is greedy, so the
+# first MAX_NEW_TOKENS tokens of an answer are the same tokens whichever budget
+# is set: raising it does not change any block measured below the cap, it only
+# adds blocks above it. One budget therefore costs nothing in fidelity and buys
+# two things -- every benchmark's anchors are drawn from the same position
+# range, which is what makes their quartile tables comparable, and generation
+# (the dominant cost of a sweep, 40-250 min per benchmark) stays bounded.
 #
-#   budget    chartqa mmstar rwqa seed textvqa | mmmu mathvision dynamath
-#   1024          7      5    10   12     5    |  75     129        45
-#   3072          4      1     2    2     1    |  49      84        13
+# What it gives up: nothing is measured past position 1024. Answers longer than
+# the budget, out of 200, on the draft this sweep compares against z-lab
+# (results/dflash_baseline_llava_ov_1M_prompted_final_*.jsonl):
 #
-# so 1024 costs the five short benchmarks almost nothing while 3072 is what the
-# long three need. Raising it further mostly chases answers that hit the
-# benchmark's own 8192 cap.
+#   budget   chartqa textvqa | mmstar dynamath mathvista mathverse
+#   1024         9       5   |   34      45        44        77
+#   3072         4       2   |   16      14        21        32
+#
+# so on the four long benchmarks this reads the first 1024 tokens of between
+# 17% and 39% of the answers rather than all of them. The long-generation
+# behaviour those answers would show is a separate question, already measured
+# end to end by the throughput runs in results/; this probe is about WHICH
+# TOKENS end a block, and 128 anchors per generation is the same sample either
+# way. Set MAX_NEW_TOKENS_MAP to bring the per-benchmark budgets back.
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
-# per-benchmark overrides, space-separated name=tokens
-MAX_NEW_TOKENS_MAP=${MAX_NEW_TOKENS_MAP:-"mmmu=3072 mathvision=3072 dynamath=3072"}
+# optional per-benchmark overrides, space-separated name=tokens (e.g.
+# "mathverse=3072 mmmu=3072"); empty means every benchmark uses MAX_NEW_TOKENS.
+MAX_NEW_TOKENS_MAP=${MAX_NEW_TOKENS_MAP:-""}
 
 # Total sequence budget for the re-encode. Over this a sample is DROPPED, not
 # truncated (specforge/data/mm_preprocessing.py:314), and input_ids carry the
@@ -272,6 +307,10 @@ expected = {
     # runs made before the prompts moved into the benchmark classes used a
     # different ChartQA instruction and are not comparable with these
     "prompt_source": "mm_benchmarker",
+    # v1 runs measured the "with image" KL without pixel_values (the image
+    # slots were embedded as plain tokens), so every KL/entropy-derived number
+    # in them is wrong; they are superseded, never deleted
+    "visual_kl_version": 2,
 }
 differences = [
     f"{key}: have {meta.get(key)!r}, want {value!r}"
@@ -344,10 +383,12 @@ BENCH_SPLITS=()
 for entry in ${BENCHMARKS}; do
     bench="${entry%%:*}"
     if [ "${entry}" = "${bench}" ]; then
-        split="${DEFAULT_SPLIT[${bench}]:-}"
+        # "<name>-origin" is the same dataset under the benchmark's own answer
+        # instruction, so it inherits the base benchmark's default split
+        split="${DEFAULT_SPLIT[${bench}]:-${DEFAULT_SPLIT[${bench%-origin}]:-}}"
         if [ -z "${split}" ]; then
             echo "ERROR: '${bench}' is not a benchmark ${PROBE} knows." >&2
-            echo "       known: ${!DEFAULT_SPLIT[*]}" >&2
+            echo "       known: ${!DEFAULT_SPLIT[*]} (each also as <name>-origin)" >&2
             exit 1
         fi
     else
@@ -418,12 +459,17 @@ for bench_index in "${!BENCH_NAMES[@]}"; do
                 archive="${out}.superseded-$(date +%Y%m%d-%H%M%S)"
                 echo "[probe] existing run does not match this request:"
                 echo "[probe]   ${reason:-no run_meta.json}"
-                echo "[probe] preserving it as ${archive}"
-                mv "${out}" "${archive}" || {
-                    echo "[probe] ERROR: could not archive ${out}" >&2
-                    FAILED_PAIRS+=("${label} (archive failed)")
-                    continue
-                }
+                if [ "${DRY_RUN}" = "1" ]; then
+                    # a dry run must not touch the tree; say what would happen
+                    echo "[probe] DRY_RUN=1 -- would preserve it as ${archive}"
+                else
+                    echo "[probe] preserving it as ${archive}"
+                    mv "${out}" "${archive}" || {
+                        echo "[probe] ERROR: could not archive ${out}" >&2
+                        FAILED_PAIRS+=("${label} (archive failed)")
+                        continue
+                    }
+                fi
             fi
         fi
 

@@ -262,6 +262,7 @@ CANONICAL_DRAFT_CONFIGS = {
     "qwen3-4b-dspark.json",
     "qwen3-8b-dspark.json",
     "qwen3-8b-dflash.json",
+    "qwen3-8b-mmflash.json",
     "qwen3-8b-domino.json",
     "qwen3-8b-eagle3.json",
     "qwen3-8b-peagle.json",

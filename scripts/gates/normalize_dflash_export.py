@@ -20,7 +20,7 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
         )
     method_config = config.get("dflash_config") or {}
     projector_type = method_config.get("projector_type", "dflash")
-    if projector_type not in {"dflash", "domino"}:
+    if projector_type not in {"dflash", "domino", "mmflash"}:
         raise ValueError(
             "export is not DFlash-family: "
             f"dflash_config.projector_type={projector_type!r}"

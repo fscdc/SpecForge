@@ -45,6 +45,20 @@ MULTI_CHOICE_EXAMPLE_FORMAT = "{}\n\n{}\n\n"
 
 SHORT_ANS_EXAMPLE_FORMAT = "{}\n\n"
 
+# The instructions of the lmms-eval task's default variant, verbatim
+# (lmms_eval/tasks/mmmu/mmmu_val.yaml), sent by the "lmms_eval" prompt variant
+# in place of the shared boxed one. `_score` already falls back to the
+# repository's own parsers when a generation carries no box, so nothing else
+# changes with them.
+ORIGIN_MULTI_CHOICE_PROMPT = (
+    "Answer with the option's letter from the given choices directly."
+)
+ORIGIN_SHORT_ANS_PROMPT = "Answer the question using a single word or phrase."
+
+#: "default" is this repository's shared step-by-step boxed instruction,
+#: "lmms_eval" the task's two answer-directly ones above.
+PROMPT_VARIANTS = ("default", "lmms_eval")
+
 START_CHR = "A"
 OPTION_LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H", "I"]
 
@@ -91,8 +105,15 @@ MAX_IMAGES = 7
 _RANDOM = random.Random(42)
 
 
-def build_prompt(question: str, question_type: str, options: str) -> str:
+def build_prompt(
+    question: str, question_type: str, options: str, variant: str = "default"
+) -> str:
     """The MMMU prompt, with the "<image i>" placeholders still in place."""
+    multi_choice, short_ans = (
+        (ORIGIN_MULTI_CHOICE_PROMPT, ORIGIN_SHORT_ANS_PROMPT)
+        if variant == "lmms_eval"
+        else (STEP_BY_STEP_BOXED_PROMPT, STEP_BY_STEP_BOXED_PROMPT)
+    )
     if question_type == "multiple-choice":
         choices_str = ""
         for i, choice in enumerate(ast.literal_eval(options)):
@@ -101,9 +122,9 @@ def build_prompt(question: str, question_type: str, options: str) -> str:
         # remove the extraneous prepended \n that we added
         return (
             MULTI_CHOICE_EXAMPLE_FORMAT.format(question, choices_str.lstrip())
-            + STEP_BY_STEP_BOXED_PROMPT
+            + multi_choice
         )
-    return SHORT_ANS_EXAMPLE_FORMAT.format(question) + STEP_BY_STEP_BOXED_PROMPT
+    return SHORT_ANS_EXAMPLE_FORMAT.format(question) + short_ans
 
 
 def split_into_parts(prompt: str, image_paths: Dict[int, str]) -> List[Tuple[str, str]]:
@@ -372,17 +393,27 @@ class MMMUBenchmarker(MMBenchmarker):
             dropped is reported per subset in the results file.
     """
 
+    #: ``mmmu-origin``: the task's two answer-directly instructions
+    ORIGINAL_PROMPT_KWARGS = {"prompt_variant": "lmms_eval"}
+
     def __init__(
         self,
         num_samples: Optional[int] = None,
         subset: Optional[List[str]] = None,
         split: str = "test",
         single_image_only: bool = True,
+        prompt_variant: str = "default",
     ):
         super().__init__(num_samples, subset)
+        if prompt_variant not in PROMPT_VARIANTS:
+            raise ValueError(
+                f"Unknown prompt variant '{prompt_variant}', "
+                f"expected any of {PROMPT_VARIANTS}"
+            )
         self.subsets = self._resolve_subsets(subset)
         self.split = split
         self.single_image_only = single_image_only
+        self.prompt_variant = prompt_variant
         self.cache_dir = None
         # per-question metadata, kept aligned with the loaded questions
         self.question_subsets: List[str] = []
@@ -469,7 +500,10 @@ class MMMUBenchmarker(MMBenchmarker):
             for row in dataset:
                 index = len(questions)
                 prompt = build_prompt(
-                    row["question"], row["question_type"], row["options"]
+                    row["question"],
+                    row["question_type"],
+                    row["options"],
+                    self.prompt_variant,
                 )
                 image_paths = self._materialize_images(row, index, image_dir)
                 questions.append({"parts": split_into_parts(prompt, image_paths)})
@@ -512,6 +546,10 @@ class MMMUBenchmarker(MMBenchmarker):
         the same image twice sends it twice. Only the text columns are read, so
         no image is decoded on the way.
         """
+        # The prompt variant is irrelevant here: both instructions are appended
+        # AFTER the question and carry no "<image i>" placeholder, so the count
+        # this filter reads is the same either way. (It is also a staticmethod,
+        # with no instance to read the variant from.)
         prompts = (
             build_prompt(question, question_type, options)
             for question, question_type, options in zip(

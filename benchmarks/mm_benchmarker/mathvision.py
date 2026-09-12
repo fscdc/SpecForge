@@ -30,7 +30,7 @@ from datasets import load_dataset
 
 from .base import MMBenchmarker
 from .registry import MM_BENCHMARKS
-from .utils import create_image_sgl_function
+from .utils import create_image_sgl_function, stratified_indices
 
 try:
     from latex2sympy2 import latex2sympy
@@ -453,7 +453,9 @@ class MathVisionBenchmarker(MMBenchmarker):
         if self.subset:
             dataset = dataset.select(self._select_subset(dataset))
         if self.num_samples is not None:
-            dataset = dataset.select(range(min(self.num_samples, len(dataset))))
+            dataset = dataset.select(
+                stratified_indices(dataset["subject"], self.num_samples)
+            )
 
         questions = []
         labels = []

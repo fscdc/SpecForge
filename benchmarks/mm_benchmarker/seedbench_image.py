@@ -38,6 +38,7 @@ from .utils import (
     STEP_BY_STEP_BOXED_PROMPT,
     create_image_sgl_function,
     extract_choice,
+    stratified_indices,
 )
 
 #: The task's own instruction, kept so a run can reproduce its numbers.
@@ -85,6 +86,9 @@ class SEEDBenchImageBenchmarker(MMBenchmarker):
             shared step-by-step boxed prompt; pass the task's own
             DIRECT_ANSWER_PROMPT for numbers comparable to lmms-eval.
     """
+
+    #: ``seedbench-image-origin``: the task's own answer-directly instruction
+    ORIGINAL_PROMPT_KWARGS = {"post_prompt": DIRECT_ANSWER_PROMPT}
 
     def __init__(
         self,
@@ -158,7 +162,9 @@ class SEEDBenchImageBenchmarker(MMBenchmarker):
         print(f"SEED-Bench {self.split}: {len(dataset)} image questions selected")
 
         if self.num_samples is not None:
-            dataset = dataset.select(range(min(self.num_samples, len(dataset))))
+            dataset = dataset.select(
+                stratified_indices(dataset["question_type_id"], self.num_samples)
+            )
 
         questions = []
         labels: List[Optional[str]] = []

@@ -1,6 +1,6 @@
 model:
   target_model_path: "Qwen/Qwen3.5-4B"
-  draft_model_config: "configs/qwen3.5-4b-mmflash.json" # TODO@song: 松哥改成这个，这个是抽8层hidden states，draft 是6层，和zlab的配置一致："configs/qwen3.5-4b-dflash-l.json", 如果改成-l，下面outputs的路径也要相应的命名
+  draft_model_config: "configs/qwen3.5-4b-dflash.json" # TODO@song: 松哥改成这个，这个是抽8层hidden states，draft 是6层，和zlab的配置一致："configs/qwen3.5-4b-dflash-l.json", 如果改成-l，下面outputs的路径也要相应的命名
   target_backend: sglang
   # image+text capture: routes prompt building and server requests through the
   # multimodal ServerInputAdapter. Requires a vision-language target model.
@@ -13,23 +13,12 @@ model:
   torch_dtype: "bfloat16"
 data:
   train_data_path: "/local_home2/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M_regen_first_turn.jsonl" # "/local_home2/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M-prompted_regen_first_turn.jsonl"
-  # Per-token visual-dependency scores for the row ids of THIS train_data_path,
-  # written by scripts/score_visual_kl_hpc.sh (which reads both fields from this
-  # file). One sidecar per regen: the two regens above share their ids but not
-  # their responses, and a mismatch is caught per row by the stored fingerprint.
-  # Empty trains image rows on the verification-aware weights alone (g=0).
-  visual_score_path: "/local_home2/fengsicheng/specforge/visual_kl/llava-ov15-1M"
-  visual_score_transform: "quantile"   # quantile | saturate | binary | identity
   max_length: 4096
   chat_template: "qwen3.5"
   build_dataset_num_proc: 32
   cache_dir: "/local_home2/fengsicheng/specforge/.cache"
 training:
-  strategy: "mmflash"
-  # text-only rows keep DFlash's own objective; image rows use the visual-VAT
-  # weighting regardless of this value
-  # loss_type: "dpace"
-  visual_alpha: 1.0
+  strategy: "dflash"
   num_epochs: 6
   # max_steps: 1000 # set for testing, comment out for full training
   batch_size: 2
@@ -47,8 +36,8 @@ training:
 
 tracking:
   report_to: "tensorboard"
-run_id: "qwen3.5-4b-mmflash-llava-ov15-1M" # "qwen3.5-4b-mmflash-llava-ov15-1M-prompted"
-output_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted"
+run_id: "qwen3.5-4b-dflash-baseline-llava-ov15-1M" # "qwen3.5-4b-dflash-baseline-llava-ov15-1M-prompted"
+output_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-dflash-baseline-llava-ov15-1M" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-dflash-baseline-llava-ov15-1M-prompted"
 
 deployment:
   mode: disaggregated
@@ -56,8 +45,8 @@ deployment:
     nnodes: 1
     nproc_per_node: 3 # @sicheng: same as gpu count
   disaggregated:
-    control_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M/control" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/control"
-    consumer_state_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M/consumer-state" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/consumer-state"
+    control_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-dflash-baseline-llava-ov15-1M/control" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-dflash-baseline-llava-ov15-1M-prompted/control"
+    consumer_state_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-dflash-baseline-llava-ov15-1M/consumer-state" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-dflash-baseline-llava-ov15-1M-prompted/consumer-state"
     backend: mooncake
     # server_urls:
     #   - http://127.0.0.1:30000

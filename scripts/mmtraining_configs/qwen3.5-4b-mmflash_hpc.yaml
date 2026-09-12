@@ -1,6 +1,6 @@
 model:
   target_model_path: "Qwen/Qwen3.5-4B"
-  draft_model_config: "configs/qwen3.5-4b-dflash.json"
+  draft_model_config: "configs/qwen3.5-4b-mmflash.json"
   target_backend: sglang
   # image+text capture: routes prompt building and server requests through the
   # multimodal ServerInputAdapter. Requires a vision-language target model.
@@ -12,13 +12,23 @@ model:
   embedding_key: "model.language_model.embed_tokens.weight" # @sicheng: changed "model.embed_tokens.weight"
   torch_dtype: "bfloat16"
 data:
-  train_data_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M_regen_first_turn.jsonl"
+  train_data_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M-prompted_regen_first_turn.jsonl"
   max_length: 4096
   chat_template: "qwen3.5"
   build_dataset_num_proc: 32
   cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
+  # Per-token visual-dependency scores (KL with/without image), written by
+  # scripts/score_visual_kl_hpc.sh. Leave empty to train image rows with the
+  # verification-aware weights alone (g=0 everywhere) -- the "VAT only" ablation.
+  visual_score_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/visual_kl/llava-ov15-1M-prompted"
+  visual_score_transform: "quantile"   # quantile | saturate | binary | identity
 training:
-  strategy: "dflash"
+  strategy: "mmflash"
+  # text-only rows (35% of the corpus) keep DFlash's own objective: D-PACE.
+  # Image rows use the visual-VAT weighting regardless of this value.
+  # loss_type: "dpace"
+  # boost on visually grounded tokens of image rows: w = g*(1+alpha) + (1-g)*w_vat
+  visual_alpha: 1.0
   num_epochs: 6
   # max_steps: 1000 # set for testing, comment out for full training
   batch_size: 2
@@ -36,17 +46,17 @@ training:
 
 tracking:
   report_to: "tensorboard"
-run_id: "qwen3.5-4b-dflash-baseline-llava-ov15-1M"
-output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-dflash-baseline-llava-ov15-1M"
+run_id: "qwen3.5-4b-mmflash-llava-ov15-1M"
+output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M"
 
 deployment:
   mode: disaggregated
   trainer:
     nnodes: 1
-    nproc_per_node: 3 # @sicheng: same as gpu count
+    nproc_per_node: 1 # @sicheng: same as gpu count
   disaggregated:
-    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-dflash-baseline-llava-ov15-1M/control"
-    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-dflash-baseline-llava-ov15-1M/consumer-state"
+    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M/control"
+    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M/consumer-state"
     backend: mooncake
     # server_urls:
     #   - http://127.0.0.1:30000
@@ -61,8 +71,6 @@ deployment:
       # trainer (consumer) GPUs — must stay disjoint from the capture server's
       trainer_cuda_visible_devices:
         - "1"
-        - "2"
-        - "3"
       mooncake:
         protocol: tcp
       capture_servers:

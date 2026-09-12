@@ -208,3 +208,5 @@ stderr.*
 stdout.*
 # accept-probe outputs (generations, per-anchor rows, metrics)
 /accept_analysis/
+
+accept-probe.*

@@ -59,6 +59,11 @@ EXPECTED_TRACKING = {
         "wandb_project": "specforge-qwen3-8b-dflash",
         "wandb_name": "qwen3-8b-dflash-perfectblend",
     },
+    "qwen3-8b-mmflash-online.yaml": {
+        "report_to": "wandb",
+        "wandb_project": "specforge-qwen3-8b-mmflash",
+        "wandb_name": "qwen3-8b-mmflash-perfectblend",
+    },
     "qwen3-8b-domino-disaggregated.yaml": {
         "report_to": "none",
         "wandb_project": "qwen3-8b-domino-disagg",
@@ -146,7 +151,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 62)
+        self.assertEqual(len(paths), 65)
 
         resolved_runs = {
             path.name: resolve_run(Config.from_file(str(path))) for path in paths

@@ -36,6 +36,7 @@ from .utils import (
     extract_boxed,
     extract_choice,
     reference_in_prediction,
+    stratified_indices,
 )
 
 # the questions carry this instruction themselves, which the task strips whenever
@@ -137,14 +138,22 @@ class RealWorldQABenchmarker(MMBenchmarker):
             task. Both numbers are reported either way.
     """
 
+    #: ``realworldqa-origin``: no instruction of ours, which leaves the one the
+    #: dataset writes into the question itself -- what the task sends.
+    ORIGINAL_PROMPT_KWARGS = {"post_prompt": ""}
+
     def __init__(
         self,
         num_samples: Optional[int] = None,
         subset: Optional[List[str]] = None,
         split: str = "test",
         match: str = "lenient",
+        post_prompt: Optional[str] = None,
     ):
         super().__init__(num_samples, subset)
+        self.post_prompt = (
+            "\n" + STEP_BY_STEP_BOXED_PROMPT if post_prompt is None else post_prompt
+        )
         if match not in ("lenient", "exact"):
             raise ValueError(f"Unknown match mode '{match}', expected exact or lenient")
         unknown = {name.strip().lower() for name in (subset or [])} - {
@@ -195,7 +204,15 @@ class RealWorldQABenchmarker(MMBenchmarker):
             ]
             dataset = dataset.select(keep)
         if self.num_samples is not None:
-            dataset = dataset.select(range(min(self.num_samples, len(dataset))))
+            # no category column; the reference tells the two question types
+            # apart, which is the split this benchmark reports on
+            question_types = [
+                MULTIPLE_CHOICE if is_multiple_choice(answer) else OPEN_ENDED
+                for answer in dataset["answer"]
+            ]
+            dataset = dataset.select(
+                stratified_indices(question_types, self.num_samples)
+            )
 
         questions = []
         labels = []
@@ -205,7 +222,12 @@ class RealWorldQABenchmarker(MMBenchmarker):
             row["image"].convert("RGB").save(image_path, "PNG")
 
             questions.append(
-                {"image_path": image_path, "question": build_prompt(row["question"])}
+                {
+                    "image_path": image_path,
+                    "question": build_prompt(
+                        row["question"], post_prompt=self.post_prompt
+                    ),
+                }
             )
             answer = str(row["answer"]).strip()
             labels.append(answer or None)

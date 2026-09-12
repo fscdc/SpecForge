@@ -318,7 +318,7 @@ class ConfigSchemaTest(unittest.TestCase):
             Config.model_validate(payload)
 
     def test_objective_chunk_blocks_is_shared_and_typed(self):
-        for strategy in ("dflash", "domino", "dspark"):
+        for strategy in ("dflash", "domino", "dspark", "mmflash"):
             payload = _online_payload(strategy)
             payload["training"]["objective_chunk_blocks"] = 0
             with self.subTest(strategy=strategy):

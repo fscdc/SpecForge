@@ -113,6 +113,7 @@ assume the command runs from the repository root.
 | --- | --- |
 | EAGLE3 colocated offline | `qwen3-8b-eagle3-offline.yaml` |
 | DFlash colocated offline | `qwen3-8b-dflash-offline.yaml` |
+| MMFlash colocated offline | `qwen3-8b-mmflash-offline.yaml` |
 | Domino colocated offline | `qwen3-8b-domino-offline.yaml` |
 | DSpark colocated offline | `qwen3-4b-dspark-offline.yaml` |
 | External-service online | `qwen3-8b-eagle3-disaggregated.yaml` |
@@ -152,6 +153,7 @@ should make their training strategy and topology explicit.
 | `model.load_target_embedding` | `true` | Copy the frozen target embedding into a fresh draft when supported. |
 | `model.aux_hidden_state_layer_ids` | `null` | Optional EAGLE3/P-EAGLE capture override containing exactly three non-negative layer IDs. Other strategies derive layers from the draft config. |
 | `model.torch_dtype` | `bfloat16` | `bfloat16`, `float16`, or `float32`. |
+| `model.use_liger_kernel` | `false` | MMFlash only: use the Liger fused kernels for the draft's RMSNorm/MLP. |
 | `model.cache_dir` | `null` | Model/tokenizer download cache. This is distinct from `data.cache_dir`. |
 | `model.mask_token_id` | `null` | DFlash-family/P-EAGLE mask token override. Otherwise it resolves from the draft config and then the tokenizer. |
 | `model.tokenizer_pad_token_id` | `null` | Explicit non-negative tokenizer pad ID. Use it for released tokenizers that omit padding metadata. |
@@ -197,6 +199,11 @@ Exactly one of the first three fields must be non-empty:
 | `data.cache_dir` | `./cache` | Prepared dataset and derived vocabulary-mapping cache. |
 | `data.cache_key` | `null` | Optional explicit namespace when multiple preparations share the same source. |
 | `data.max_prompts` | `null` | Optional non-negative prompt cap, useful for smoke tests. |
+| `data.image_root` | `""` | Image modality: directory prepended to relative `image` paths in the records. |
+| `data.image_max_tokens` | `0` | Image modality: cap on visual tokens per image; leave at 0 unless the capture server applies the same limit. |
+| `data.visual_score_path` | `""` | MMFlash only: per-token visual-dependency sidecar (file or directory of `*.jsonl` from `scripts/score_visual_kl.py`), keyed by record `id`. Empty trains image rows with verification-aware weights alone. |
+| `data.visual_score_transform` | `quantile` | MMFlash only: how raw KL becomes `g` in [0, 1] (`quantile`, `saturate`, `binary`, `identity`). |
+| `data.visual_score_binary_threshold` | `0.75` | MMFlash only: quantile-rank cut used by the `binary` transform. |
 
 Offline evaluation uses `eval_hidden_states_path`; configure it together with
 `training.eval_interval`. Online evaluation is unsupported, and setting
@@ -208,7 +215,7 @@ Common fields:
 
 | Field | Default | What to write |
 | --- | --- | --- |
-| `training.strategy` | `eagle3` | `eagle3`, `peagle`, `dflash`, `domino`, or `dspark`. |
+| `training.strategy` | `eagle3` | `eagle3`, `peagle`, `dflash`, `domino`, `dspark`, or `mmflash` (a DFlash clone at the fork). |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |
 | `training.max_steps` | `null` | Positive hard stop in optimizer steps. If it is set while `total_steps` is omitted, it is also the fallback schedule horizon. |
 | `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |
@@ -240,6 +247,7 @@ Strategy-specific fields should be written only when tuning that objective:
 | --- | --- |
 | EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda` or `alpha`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
 | DFlash / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
+| MMFlash | the DFlash knobs above (`training.loss_type` is the objective of text-only rows) plus `training.visual_alpha` (`1.0`; boost on visually grounded tokens of image rows, `w = g*(1+alpha) + (1-g)*w_vat`) and the `data.visual_score_*` fields |
 | DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
 
@@ -440,6 +448,7 @@ For deeper lifecycle and recovery semantics, see the
 | --- | --- | --- | --- |
 | EAGLE3 | consumer DP | DP + USP | consumer DP |
 | DFlash | consumer DP | DP | consumer DP |
+| MMFlash | consumer DP | DP | consumer DP |
 | Domino | consumer DP | DP | consumer DP |
 | DSpark | consumer DP | DP | consumer DP |
 | P-EAGLE | consumer DP, batch size 1 | No | No |

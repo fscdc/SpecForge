@@ -122,6 +122,11 @@ def score_answer(generation: str, answers: List[str]) -> float:
     return statistics.mean(scores)
 
 
+#: The post_prompt of the lmms-eval `textvqa` task's default variant, verbatim
+#: (lmms_eval/tasks/textvqa/_default_template_textvqa_yaml).
+DIRECT_ANSWER_PROMPT = "\nAnswer the question using a single word or phrase."
+
+
 def build_prompt(
     question: str,
     ocr_tokens: Optional[List[str]] = None,
@@ -157,6 +162,9 @@ class TextVQABenchmarker(MMBenchmarker):
             single-word instruction, which is the only form comparable to
             published lmms-eval numbers.
     """
+
+    #: ``textvqa-origin``: the task's "single word or phrase" instruction
+    ORIGINAL_PROMPT_KWARGS = {"post_prompt": DIRECT_ANSWER_PROMPT}
 
     def __init__(
         self,

@@ -22,6 +22,12 @@ class BuiltinProviderParityTest(unittest.TestCase):
                 {"eager", "sdpa", "flex_attention"},
                 None,
             ),
+            "mmflash": (
+                "MMFlashDraftModel",
+                {"input_ids", "loss_mask", "hidden_states"},
+                {"eager", "sdpa", "flex_attention"},
+                None,
+            ),
             "domino": (
                 "DominoDraftModel",
                 {"input_ids", "loss_mask", "hidden_states"},
@@ -90,6 +96,12 @@ class BuiltinProviderParityTest(unittest.TestCase):
                 (("input_ids", "input_ids", ()), ("loss_mask", "loss_mask", ())),
                 None,
             ),
+            "mmflash": (
+                "hidden_states",
+                None,
+                (("input_ids", "input_ids", ()), ("loss_mask", "loss_mask", ())),
+                None,
+            ),
             "domino": (
                 "hidden_states",
                 None,
@@ -148,6 +160,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
             "eagle3": "Eagle3TrainStrategy",
             "peagle": "PEagleTrainStrategy",
             "dflash": "DFlashTrainStrategy",
+            "mmflash": "MMFlashTrainStrategy",
             "domino": "DominoTrainStrategy",
             "dspark": "DSparkTrainStrategy",
         }

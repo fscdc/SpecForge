@@ -146,6 +146,18 @@ class DataConfig(StrictConfigModel):
     #: server builds and the request is rejected for exceeding the context.
     #: Only set this if the server is configured with a matching limit.
     image_max_tokens: int = Field(default=0, ge=0)
+    #: MMFlash only -- per-token visual-dependency sidecar (a JSONL file or a
+    #: directory of shards written by ``scripts/score_visual_kl.py``), keyed by
+    #: the training record's ``id``. Empty: every image row trains with g=0,
+    #: i.e. verification-aware weights without the visual term.
+    visual_score_path: str = ""
+    #: How the sidecar's raw KL (nats) becomes g in [0, 1]; see
+    #: ``specforge.data.visual_score.transform_scores``.
+    visual_score_transform: Literal["quantile", "saturate", "binary", "identity"] = (
+        "quantile"
+    )
+    #: Quantile-rank cut for ``visual_score_transform=binary``.
+    visual_score_binary_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
     build_dataset_num_proc: int = Field(default=8, gt=0)
     #: Ordered background feature-loader workers. ``None`` preserves the
     #: former strategy defaults (EAGLE/P-EAGLE=4, DFlash-family=8).
@@ -527,6 +539,11 @@ class TrainingConfig(StrictConfigModel):
         "dpace-continuation-value-only",
     ] = "dflash"
     dpace_alpha: float = 0.5
+    #: MMFlash only -- extra weight on visually grounded tokens of image rows:
+    #: a token with visual score g gets ``g * (1 + visual_alpha)`` plus
+    #: ``(1 - g)`` times the verification-aware weight. 0 keeps visual tokens at
+    #: full weight without boosting them.
+    visual_alpha: float = Field(default=1.0, ge=0.0)
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_ce_loss_alpha: float = 0.1

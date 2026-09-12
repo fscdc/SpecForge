@@ -8,6 +8,7 @@ from .dflash import (
 from .domino import DominoDraftModel
 from .dspark import DSparkDraftModel
 from .llama3_eagle import LlamaForCausalLMEagle3
+from .mmflash import MMFlashDraftModel
 from .peagle import PEagleDraftModel
 from .registry import DRAFT_REGISTRY, available_drafts, register_draft, resolve_draft
 
@@ -17,6 +18,7 @@ __all__ = [
     "DominoDraftModel",
     "DSparkDraftModel",
     "LlamaForCausalLMEagle3",
+    "MMFlashDraftModel",
     "PEagleDraftModel",
     "build_target_layer_ids",
     "extract_context_feature",

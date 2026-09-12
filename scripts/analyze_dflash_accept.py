@@ -89,6 +89,11 @@ BENCHMARKS = {
     "textvqa": {"dataset": "lmms-lab-encoder/textvqa", "split": "test"},
     "mathvision": {"dataset": "MathLLMs/MathVision", "split": "test"},
     "dynamath": {"dataset": "kcz358/DynaMath", "split": "test"},
+    # Only `testmini` is annotated for either; MathVerse repeats each problem in
+    # five versions that move information out of the text and into the figure,
+    # which is exactly the axis this probe measures.
+    "mathvista": {"dataset": "AI4Math/MathVista", "split": "testmini"},
+    "mathverse": {"dataset": "AI4Math/MathVerse", "split": "testmini"},
     # MMMU interleaves up to seven images into one question. This probe encodes
     # a single leading image, so it is loaded with the benchmark's own
     # `single_image_only` filter and the remaining question is linearised; see
@@ -106,10 +111,36 @@ BENCHMARK_DATASETS = {
 #: benchmark classes from one made with this file's old private prompt table.
 PROMPT_SOURCE = "mm_benchmarker"
 
+#: ``<name>-origin`` sends the benchmark's OWN answer instruction instead of the
+#: suite's shared step-by-step boxed one, exactly as in ``bench_mm.py``: the
+#: constructor arguments come from the class's ``ORIGINAL_PROMPT_KWARGS``, and a
+#: benchmark that never had its prompt replaced refuses the suffix rather than
+#: measure the shared prompt under a misleading name. The two prompts produce
+#: different generations, so they are separate runs with separate directories.
+ORIGIN_SUFFIX = "-origin"
+
+
+def split_benchmark_name(name: str) -> Tuple[str, bool]:
+    """The registered benchmark behind a sweep entry, and whether -origin was asked."""
+    if name.endswith(ORIGIN_SUFFIX) and len(name) > len(ORIGIN_SUFFIX):
+        return name[: -len(ORIGIN_SUFFIX)], True
+    return name, False
+
+
+def benchmark_choices() -> List[str]:
+    """Every accepted ``--benchmark`` value.
+
+    The ``-origin`` variants are listed for all of them because whether one
+    exists is a property of the benchmark CLASS (``ORIGINAL_PROMPT_KWARGS``),
+    and importing the classes here would pull in SGLang just to build a help
+    string; an unported suffix is rejected in `load_benchmark_rows` instead.
+    """
+    return sorted(BENCHMARKS) + sorted(f"{n}{ORIGIN_SUFFIX}" for n in BENCHMARKS)
+
 
 def default_split(benchmark: str) -> str:
     """The split the benchmark's own implementation defaults to."""
-    return BENCHMARKS[benchmark]["split"]
+    return BENCHMARKS[split_benchmark_name(benchmark)[0]]["split"]
 
 
 def _import_mm_benchmarks():
@@ -221,7 +252,7 @@ def parse_args() -> argparse.Namespace:
     model.add_argument("--trust-remote-code", action="store_true", default=True)
 
     data = parser.add_argument_group("data")
-    data.add_argument("--benchmark", default="chartqa", choices=sorted(BENCHMARKS))
+    data.add_argument("--benchmark", default="chartqa", choices=benchmark_choices())
     data.add_argument(
         "--split",
         default=None,
@@ -344,16 +375,30 @@ def load_benchmark_rows(args) -> List[Dict[str, Any]]:
     whole subject is visual grounding, and an imageless row has none.
     """
     registry = _import_mm_benchmarks()
-    spec = BENCHMARKS[args.benchmark]
+    base, origin = split_benchmark_name(args.benchmark)
+    spec = BENCHMARKS[base]
     kwargs: Dict[str, Any] = {"num_samples": args.num_samples, "split": args.split}
     if "single_image_only" in spec:
         kwargs["single_image_only"] = spec["single_image_only"]
 
-    benchmark = registry.get(args.benchmark)(**kwargs)
+    cls = registry.get(base)
+    if origin:
+        original = getattr(cls, "ORIGINAL_PROMPT_KWARGS", None)
+        if original is None:
+            raise SystemExit(
+                f"{args.benchmark}: {base!r} has no ported original prompt "
+                f"({cls.__name__}.ORIGINAL_PROMPT_KWARGS is None). It either "
+                f"already sends its task's own prompt -- drop the {ORIGIN_SUFFIX} "
+                "suffix -- or the original has yet to be ported."
+            )
+        kwargs.update(original)
+
+    benchmark = cls(**kwargs)
     questions, labels = benchmark.load_data()
     print(
         f"[data] {args.benchmark}/{args.split}: {len(questions)} questions from "
         f"{spec['dataset']} via {type(benchmark).__name__}"
+        + (f" (task prompt: {kwargs})" if origin else "")
     )
 
     rows: List[Dict[str, Any]] = []
@@ -383,6 +428,56 @@ def load_benchmark_rows(args) -> List[Dict[str, Any]]:
             f"{args.benchmark}/{args.split} yielded no usable image questions"
         )
     return rows
+
+
+def verify_generations_match_benchmark(args, records: List[Dict[str, Any]]) -> None:
+    """Refuse a generations file that was made from a different question set.
+
+    A record stores its image as an INDEX-based path
+    (``.cache/<bench>_specforge/images/000000.png``) that the benchmark class
+    rewrites every time it loads. So a cached generations file whose questions
+    have since changed -- a re-sampled benchmark, a changed prompt -- does not
+    fail loudly: its stored prompt and answer would be scored against whatever
+    image now sits at that index. Re-deriving the questions here both catches
+    that and re-materialises the images the stored paths point at, which the
+    reuse path would otherwise depend on some earlier run having left behind.
+
+    This is not hypothetical: the ChartQA cache made before the stratified
+    sampler landed shares only 100 of its 200 questions with the current one.
+    """
+    from specforge.data.mm_preprocessing import IMAGE_PLACEHOLDER
+
+    rows = load_benchmark_rows(args)
+    expected = [f"{IMAGE_PLACEHOLDER}\n{row['prompt']}" for row in rows]
+    stored = [
+        record["conversations"][0]["content"] if record.get("conversations") else None
+        for record in records
+    ]
+    if len(stored) == len(expected) and stored == expected:
+        return
+
+    if len(stored) != len(expected):
+        detail = f"it holds {len(stored)} generations, the benchmark yields {len(expected)}"
+    else:
+        first = next(
+            index for index, (a, b) in enumerate(zip(stored, expected)) if a != b
+        )
+        agree = sum(1 for a, b in zip(stored, expected) if a == b)
+        detail = (
+            f"{agree}/{len(expected)} questions still match; the first that does "
+            f"not is #{first}\n"
+            f"    stored:   {str(stored[first])[:120]!r}\n"
+            f"    benchmark:{expected[first][:120]!r}"
+        )
+    raise SystemExit(
+        f"the generations file does not match {args.benchmark}/{args.split} as the "
+        f"benchmark class defines it now: {detail}\n"
+        "  Scoring it would pair those prompts with whatever image the benchmark "
+        "now writes at the same index. Delete the file (and its copy under "
+        "accept_analysis/generations/) so the target answers the current "
+        "questions, or point --benchmark/--split/--num-samples at the set it "
+        "was made from."
+    )
 
 
 def strip_thinking(text: str) -> str:
@@ -680,6 +775,17 @@ def visual_token_mask(input_ids: torch.Tensor, processor) -> torch.Tensor:
     return mask
 
 
+#: Recorded in run_meta so a sweep can tell measurements apart. Version 1 fed
+#: the with-image pass bare ``input_ids`` -- on Qwen3.5 that embeds the
+#: ``<|image_pad|>`` slots as ordinary tokens, so its "visual" KL was not
+#: conditioned on the picture. Version 2 passes the processor batch
+#: (``pixel_values``, ``image_grid_thw``). Everything keyed on ``kl`` /
+#: ``entropy`` from a v1 run (KL quartiles, the truncation-culprit shares, the
+#: entropy control) has to be re-measured; accept lengths and the LVSpec
+#: relevance were computed from a correct image-conditioned pass and stand.
+VISUAL_KL_VERSION = 2
+
+
 def visual_kl_per_token(
     target,
     processor,
@@ -687,6 +793,7 @@ def visual_kl_per_token(
     input_ids: torch.Tensor,
     loss_mask_list: Sequence[int],
     max_length: int,
+    model_inputs: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Optional[Tuple[Dict[int, float], Dict[int, float]]]:
     """Per token: how much the image moves the target, and how unsure it is.
 
@@ -698,6 +805,14 @@ def visual_kl_per_token(
     of the WITH-image distribution -- the one generation actually samples from
     -- is the control.
 
+    ``model_inputs`` is the processor's full batch for the with-image pass
+    (``input_ids`` plus ``pixel_values`` / ``image_grid_thw``). It MUST be
+    given for the score to mean what its name says: Qwen3.5's forward only
+    scatters image features when ``pixel_values`` is present, so a call with
+    bare ``input_ids`` embeds the ``<|image_pad|>`` tokens as ordinary text and
+    the "with image" distribution is not conditioned on the picture at all.
+    The bare-``input_ids`` fallback is kept only for text-only rows.
+
     The same conversation is encoded a second time with the image dropped. The
     assistant span is identical text in both, and sits at the end, so the two
     sequences align by a constant offset -- which is asserted token by token
@@ -705,6 +820,17 @@ def visual_kl_per_token(
     template rendered the image-free turn differently.
     """
     from specforge.data.mm_preprocessing import IMAGE_PLACEHOLDER, to_chat_messages
+
+    if model_inputs is not None:
+        if not torch.equal(model_inputs["input_ids"].to(input_ids.device), input_ids):
+            raise ValueError(
+                "model_inputs['input_ids'] must be the same sequence as input_ids"
+            )
+    elif record.get("image") is not None:
+        raise ValueError(
+            "visual_kl_per_token needs the processor batch (pixel_values) for an "
+            "image row; pass model_inputs=processor(text=..., images=...)"
+        )
 
     stripped = [
         {**turn, "content": turn["content"].replace(IMAGE_PLACEHOLDER, "").lstrip()}
@@ -739,10 +865,13 @@ def visual_kl_per_token(
     blind_len = blind_ids.shape[1]
     seen_keep = seen_len - (min(aligned) - 1)
     blind_keep = blind_len - (min(aligned) - offset - 1)
+    seen_inputs = (
+        {k: v.to(input_ids.device) for k, v in model_inputs.items()}
+        if model_inputs is not None
+        else {"input_ids": input_ids}
+    )
     with torch.no_grad():
-        seen = target(
-            input_ids=input_ids, use_cache=False, logits_to_keep=seen_keep
-        ).logits
+        seen = target(**seen_inputs, use_cache=False, logits_to_keep=seen_keep).logits
         unseen = target(
             **{k: v.to(input_ids.device) for k, v in blind.items()},
             use_cache=False,
@@ -1694,7 +1823,7 @@ def build_run_meta(
         "draft_model_path": args.draft_model_path,
         "target_model_path": args.target_model_path,
         "benchmark": args.benchmark,
-        "dataset": BENCHMARK_DATASETS.get(args.benchmark),
+        "dataset": BENCHMARK_DATASETS.get(split_benchmark_name(args.benchmark)[0]),
         "prompt_source": PROMPT_SOURCE,
         "split": args.split,
         "num_samples_requested": args.num_samples,
@@ -1708,6 +1837,7 @@ def build_run_meta(
         "seed": args.seed,
         "enable_thinking": args.enable_thinking,
         "visual_kl": not args.no_visual_kl,
+        "visual_kl_version": VISUAL_KL_VERSION,
         "visual_relevance": not args.no_visual_relevance,
         "visual_top_n": args.visual_top_n,
         "specforge_path": str(Path(specforge.__file__).resolve().parent),
@@ -1782,6 +1912,8 @@ def main() -> None:
     if args.generations or os.path.exists(generations_path):
         records = read_jsonl(generations_path)
         print(f"Reusing {len(records)} generations from {generations_path}")
+        verify_generations_match_benchmark(args, records)
+        print("[data] reused generations match the benchmark's current questions")
     else:
         print(
             f"Generating {args.num_samples} {args.benchmark} answers "
@@ -1885,6 +2017,7 @@ def main() -> None:
                 input_ids,
                 payload["loss_mask"],
                 args.max_length,
+                model_inputs=inputs,
             )
             if measured is not None:
                 kl, entropy = measured

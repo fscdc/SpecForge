@@ -120,6 +120,14 @@ class MMBenchmarker(Benchmarker):
     `get_max_new_tokens()`, so that the caller keeps the last word.
     """
 
+    #: Constructor arguments that make this benchmark send the ORIGINAL prompt
+    #: of its task instead of the shared step-by-step boxed one, selected on the
+    #: command line by the ``-origin`` suffix (``mmstar-origin:200``). ``None``
+    #: -- the default -- means this benchmark never had its prompt replaced, or
+    #: the original has not been ported; ``bench_mm.py`` then refuses the suffix
+    #: rather than run the shared prompt under a misleading name.
+    ORIGINAL_PROMPT_KWARGS: Optional[Dict[str, Any]] = None
+
     def __init__(
         self, num_samples: Optional[int] = None, subset: Optional[List[str]] = None
     ):

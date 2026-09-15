@@ -17,6 +17,7 @@ from specforge.data.visual_score import (
     dequantize_visual_score,
     expand_visual_score,
     fingerprint_input_ids,
+    gate_by_confidence,
     join_visual_scores,
     quantize,
     text_only_visual_score,
@@ -76,7 +77,7 @@ class TestTable(unittest.TestCase):
     def test_load_file_or_directory(self):
         for path in (self.path, self.tmp.name):
             with self.subTest(path=path):
-                table = VisualScoreTable.load(path, transform="quantile")
+                table = VisualScoreTable.load(path, transform="quantile", confidence_gate=False)
                 self.assertEqual(len(table), 2)
                 n_tokens, fp, g = table.get("a#1")
                 self.assertEqual(n_tokens, 10)
@@ -85,6 +86,32 @@ class TestTable(unittest.TestCase):
                 # the 5.0 is the corpus maximum -> rank 1.0
                 self.assertEqual(float(g[1]), 1.0)
                 self.assertTrue(table.stats.describe())
+
+    def test_confidence_gate_multiplies_by_target_confidence(self):
+        rows = [
+            {"id": "c#1", "n_tokens": 9, "n_loss": 3, "kl": [0.1, 5.0, 5.0], "entropy": [0.0, 1.0, 3.0]},
+        ]
+        with tempfile.TemporaryDirectory() as other:
+            path = _write_sidecar(other, rows)
+            raw = VisualScoreTable.load(path, transform="quantile", confidence_gate=False).get("c#1")[2]
+            gated = VisualScoreTable.load(path, transform="quantile").get("c#1")[2]  # gate on by default
+        # same KL rank for the two 5.0 tokens; the gate separates them by entropy
+        self.assertEqual(float(raw[1]), float(raw[2]))
+        np.testing.assert_allclose(gated, raw * np.exp(-np.array([0.0, 1.0, 3.0], dtype=np.float32)), rtol=1e-6)
+        self.assertGreater(float(gated[1]), float(gated[2]))
+        # a confident token keeps its full score
+        self.assertEqual(float(gated[0]), float(raw[0]))
+
+    def test_gate_needs_entropy_or_must_be_off(self):
+        rows = [{"id": "n#1", "n_tokens": 5, "n_loss": 2, "kl": [0.1, 2.0]}]
+        with tempfile.TemporaryDirectory() as other:
+            path = _write_sidecar(other, rows)
+            with self.assertRaises(ValueError):
+                VisualScoreTable.load(path)
+            table = VisualScoreTable.load(path, confidence_gate=False)
+            self.assertEqual(len(table), 1)
+        with self.assertRaises(ValueError):
+            gate_by_confidence(np.ones(2, dtype=np.float32), [0.5])  # ragged
 
     def test_quantile_cache_is_written_and_reused(self):
         VisualScoreTable.load(self.tmp.name, transform="quantile")

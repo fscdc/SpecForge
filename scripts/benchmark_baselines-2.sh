@@ -126,9 +126,9 @@ IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
         # --speculative-eagle-topk 1 \
         # --speculative-num-draft-tokens 16 \
 
-NAME=mtp-15step_qwen35-9B_concurrency1
+# NAME=mtp-15step_qwen35-9B_concurrency1
 # NAME=mtp-7step_qwen35-9B_concurrency1
-# NAME=mtp-3step_qwen35-9B_concurrency1
+NAME=mtp-3step_qwen35-9B_concurrency1
 
 SERVER_ADDRESSES=()
 PORTS=()
@@ -146,9 +146,9 @@ for idx in "${!GPU_IDS[@]}"; do
     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
         --model Qwen/Qwen3.5-9B \
         --speculative-algorithm NEXTN \
-        --speculative-num-steps 15 \
+        --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 16 \
+        --speculative-num-draft-tokens 4 \
         --disable-overlap-schedule \
         --mem-fraction-static 0.7 \
         --tp 1 \

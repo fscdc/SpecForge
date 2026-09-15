@@ -28,6 +28,7 @@ def _config(strategy="mmflash"):
             visual_score_path="",
             visual_score_transform="quantile",
             visual_score_binary_threshold=0.75,
+            visual_score_confidence_gate=True,
         ),
     )
 

@@ -40,7 +40,7 @@ for idx in "${!GPU_IDS[@]}"; do
     PORTS+=("${port}")
     BASE_URLS+=("http://localhost:${port}")
     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
-        --model Qwen/Qwen3.5-4B \
+        --model Qwen/Qwen3.5-9B \
         --mem-fraction-static 0.7 \
         --tp 1 \
         --trust-remote-code \
@@ -104,7 +104,20 @@ fi
 # realworldqa:200 seedbench-image:200 mmstar-origin:200 mmmu-origin:200
 
 python benchmarks/bench_mm.py \
-    --model Qwen/Qwen3.5-4B \
+    --model Qwen/Qwen3.5-9B \
+    --base-url "${BASE_URLS[@]}" \
+    --concurrency 1 \
+    --block-size 0 \
+    --benchmark-list chartqa:200 textvqa:200 mmstar:200 seedbench-image-origin:200 dynamath:200 mathvista:200 mathverse:200 \
+    --reasoning off \
+    --temperature 0.0 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --max-tokens 4096 \
+    --name origin_qwen35-9B_concurrency1_temp0_4096
+
+python benchmarks/bench_mm.py \
+    --model Qwen/Qwen3.5-9B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
     --block-size 0 \
@@ -114,7 +127,7 @@ python benchmarks/bench_mm.py \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 4096 \
-    --name origin_qwen35-4B_concurrency1_temp1_4096
+    --name origin_qwen35-9B_concurrency1_temp1_4096
 
 
 # # for text benchmark
@@ -132,4 +145,4 @@ python benchmarks/bench_mm.py \
 #     --name origin_qwen35-4B_concurrency1_temp0
 
 
-# pkill -f "sglang.launch_server"
+pkill -f "sglang.launch_server"

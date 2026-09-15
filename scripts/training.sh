@@ -37,7 +37,7 @@ mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" || {
 # specforge train --config scripts/mmtraining_configs/qwen3.5-4b-dflash.yaml
 
 # ours: mmflash
-MMFLASH_CONFIG=scripts/mmtraining_configs/qwen3.5-4b-mmflash_hpc.yaml
+MMFLASH_CONFIG=scripts/mmtraining_configs/qwen3.5-4b-mmflash.yaml
 
 # qsub -l select=1:ngpus=4 -v CONFIG=${MMFLASH_CONFIG} scripts/score_visual_kl_hpc.sh
 

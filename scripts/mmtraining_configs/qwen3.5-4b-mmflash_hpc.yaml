@@ -17,17 +17,23 @@ data:
   chat_template: "qwen3.5"
   build_dataset_num_proc: 32
   cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
-  # Per-token visual-dependency scores (KL with/without image), written by
-  # scripts/score_visual_kl_hpc.sh. Leave empty to train image rows with the
-  # verification-aware weights alone (g=0 everywhere) -- the "VAT only" ablation.
+  # Per-token visual-grounding scores written by scripts/score_visual_kl_hpc.sh:
+  # KL(with image || without) per token, plus the target's entropy with the
+  # image. Leave empty for g=0 everywhere, i.e. the plain loss_type objective
+  # on every row (the no-visual-term ablation).
   visual_score_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/visual_kl/llava-ov15-1M-prompted"
   visual_score_transform: "quantile"   # quantile | saturate | binary | identity
+  # g = transform(KL) * exp(-entropy): high only where the image both changes
+  # AND settles the target's prediction. false = raw KL rank (ablation).
+  visual_score_confidence_gate: true
 training:
   strategy: "mmflash"
-  # text-only rows (35% of the corpus) keep DFlash's own objective: D-PACE.
-  # Image rows use the visual-VAT weighting regardless of this value.
-  # loss_type: "dpace"
-  # boost on visually grounded tokens of image rows: w = g*(1+alpha) + (1-g)*w_vat
+  # One objective for every token of every row:
+  #   w = base * (1 + visual_alpha * g * (1 - p)),  loss = sum(w * ce) / bsz
+  # base = the loss_type weight (D-PACE: gradient of the expected accept
+  # length), g = visual grounding from the sidecar (0 on text rows), p = the
+  # draft's probability on the token. visual_alpha: 0 is exactly loss_type.
+  loss_type: "dpace"
   visual_alpha: 1.0
   num_epochs: 6
   # max_steps: 1000 # set for testing, comment out for full training

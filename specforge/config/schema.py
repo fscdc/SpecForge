@@ -158,6 +158,11 @@ class DataConfig(StrictConfigModel):
     )
     #: Quantile-rank cut for ``visual_score_transform=binary``.
     visual_score_binary_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+    #: Multiply g by ``exp(-entropy)`` -- the target's confidence with the
+    #: image -- so only tokens the image both changes AND settles score high.
+    #: Off: raw (transformed) KL, which also flags tokens the target cannot
+    #: settle even with the image. See ``specforge.data.visual_score``.
+    visual_score_confidence_gate: bool = True
     build_dataset_num_proc: int = Field(default=8, gt=0)
     #: Ordered background feature-loader workers. ``None`` preserves the
     #: former strategy defaults (EAGLE/P-EAGLE=4, DFlash-family=8).
@@ -539,10 +544,10 @@ class TrainingConfig(StrictConfigModel):
         "dpace-continuation-value-only",
     ] = "dflash"
     dpace_alpha: float = 0.5
-    #: MMFlash only -- extra weight on visually grounded tokens of image rows:
-    #: a token with visual score g gets ``g * (1 + visual_alpha)`` plus
-    #: ``(1 - g)`` times the verification-aware weight. 0 keeps visual tokens at
-    #: full weight without boosting them.
+    #: MMFlash only -- every token's weight is the ``loss_type`` base weight
+    #: times ``1 + visual_alpha * g * (1 - p)``: visual grounding g (sidecar)
+    #: times how far the draft still is from the token (p = its probability on
+    #: the target). Bounded in [1, 1 + visual_alpha]; 0 is exactly ``loss_type``.
     visual_alpha: float = Field(default=1.0, ge=0.0)
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5

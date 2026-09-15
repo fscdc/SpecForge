@@ -4,8 +4,8 @@
 #PBS -k oed
 #PBS -N pytorch
 #PBS -q auto
-#PBS -l select=1:ngpus=2
-#PBS -l walltime=48:00:00
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=18:00:00
 
 cd $PBS_O_WORKDIR;
 
@@ -25,6 +25,14 @@ source ~/.bashrc
 conda activate specforge
 
 # bash ./scripts/data_hpc.sh
-bash ./scripts/mmflash_data.sh
+# bash ./scripts/mmflash_data.sh
+
+bash scripts/benchmark_origin.sh
+
+bash scripts/benchmark_baselines.sh
+bash scripts/benchmark_baselines-1.sh
+bash scripts/benchmark_baselines-2.sh
+
+
 
 EOF

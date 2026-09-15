@@ -6,34 +6,36 @@ Forked from ``OnlineDFlashModel`` (and the mask builders it uses) in
 touching DFlash, Domino or DSpark. The block forward, anchor sampling and masks
 are still DFlash's; the objective is not.
 
-Objective. A batch mixes rows with an image and text-only rows, told apart by
-the per-token ``visual_score`` channel (``specforge.data.visual_score``:
-``g in [0, 1]`` on image rows, ``-1`` everywhere on text-only rows).
+Objective. ONE formula for every token of every row:
 
-* Text-only rows are weighted by ``loss_type`` (``"dpace"`` in the multimodal
-  recipes). D-PACE weights are rescaled to a mean of 1 over each block's valid
-  positions so they sit on the same scale as the image rows' weights; D-PACE's
-  within-block shape is untouched, but its BETWEEN-block emphasis is not: a
-  block the draft is confident about no longer carries more total weight than
-  one it is unsure about. Together with the weighted-mean reduction below, this
-  means ``strategy=mmflash, loss_type=dpace`` is NOT the same objective as
-  ``strategy=dflash, loss_type=dpace`` even on a text-only batch -- the losses
-  differ by more than a constant. Only ``loss_type="dflash"`` with no
-  ``visual_score`` reproduces DFlash exactly.
-* Image rows get *verification-aware, visually re-weighted* weights. The
-  verification is simulated for free from the block's own argmax: with
-  ``k*`` the first position whose top-1 misses the target,
+    w_k  = base_k * (1 + visual_alpha * g_k * (1 - p_k))
+    loss = sum_k w_k * ce_k / bsz            (loss_type = D-PACE family)
+         = sum_k w_k * ce_k / sum_k w_k      (loss_type = "dflash")
 
-      w_vat_k = exp(-(k - k*)_+ / loss_decay_gamma)     (VAT re-anchored decay)
-      w_k     = g_k * (1 + visual_alpha) + (1 - g_k) * w_vat_k
+* ``base_k`` is the verification-aware weight ``loss_type`` names, computed
+  exactly as ``dflash_family_model`` computes it for the same ``loss_type`` --
+  D-PACE (the gradient of the expected accept length: how much position k
+  can still contribute given where the draft's verification chain currently
+  breaks) or DFlash's fixed positional decay. It answers "is training this
+  position useful right now".
+* ``g_k in [0, 1]`` is the token's visual grounding from the per-token
+  ``visual_score`` channel (``specforge.data.visual_score``): how much the
+  target's next-token distribution moves when the image is taken away, gated
+  by the target's confidence WITH the image, so a token scores high only when
+  the image both changes and settles the prediction. Static, from the
+  offline sidecar. It answers "is this a multimodal token worth extra effort".
+* ``p_k = exp(-ce_k)`` is the draft's current probability on the target token.
+  ``(1 - p_k)`` makes the boost fade once the draft has learned the token, so
+  the extra effort moves on. Dynamic, per step, detached.
 
-  so a visually grounded token never decays and is boosted by
-  ``visual_alpha``, while a text token of an image row follows VAT.
-
-Both kinds of rows are reduced together as ONE weighted mean,
-``sum(w * ce) / sum(w)``, so a mixed batch has a single well-scaled loss.
-Without a ``visual_score`` tensor every row counts as text-only, which is
-the pre-fork behaviour for ``loss_type="dflash"`` exactly.
+The multiplier is bounded in ``[1, 1 + visual_alpha]`` and never touches the
+base, so the verification structure (positional decay, chain survival) is
+preserved for every token. A text-only row carries ``g = 0`` everywhere (the
+channel's sentinel), so its multiplier is exactly 1 and it trains on the plain
+``loss_type`` objective; the same holds for an image row without a sidecar
+entry and for the whole batch when ``visual_alpha = 0``. In all those cases
+the loss is bit-identical to ``OnlineDFlashModel`` with the same ``loss_type``
+-- there is no separate text path and no per-row rescaling.
 
 The ``loss_type`` values (``"dflash"``, ``"dpace"``, ...) are NOT renamed:
 they name objectives, are shared with ``training.loss_type`` in the config
@@ -196,11 +198,10 @@ class OnlineMMFlashModel(nn.Module):
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
         self.objective_chunk_blocks = int(objective_chunk_blocks)
-        # objective of text-only rows (and of every row when no visual_score
-        # tensor is supplied)
+        # the base (verification-aware) weight of every token, see the module doc
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
-        # boost on visually grounded tokens of image rows, see the module doc
+        # upper bound of the visual multiplier 1 + visual_alpha * g * (1 - p)
         self.visual_alpha = float(visual_alpha)
         self._objective_printed = False
 
@@ -359,58 +360,39 @@ class OnlineMMFlashModel(nn.Module):
         )
         return anchor_positions, block_keep_mask, output_hidden
 
-    def _text_row_weights(
+    def _base_weights(
         self,
         neg_log_q: torch.Tensor,
         weight_mask: torch.Tensor,
         positions: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Per-position weights of a text-only row under ``loss_type``.
+    ) -> torch.Tensor:
+        """The verification-aware base weight of every position, per ``loss_type``.
 
-        Returns ``(weights, dpace_block_mean)``; the second is the per-block
-        mean the D-PACE weights were divided by -- the draft's mean
-        continuation value on that block, which is the informative half of the
-        rescale and is reported as telemetry -- and None for ``"dflash"``.
-
-        ``"dflash"`` is the fixed positional decay. The D-PACE variants are
-        computed exactly as ``dflash_family_model`` does, then rescaled so each
-        block's valid positions average to 1: D-PACE's raw ``suffix`` weights
-        run up to the block size and would otherwise outweigh an image row's
-        weights (which are at most ``1 + visual_alpha``) by an order of
-        magnitude inside the shared weighted mean. The rescaling is per block
-        rather than per row because the objective is evaluated in block slices
-        (``objective_chunk_blocks``) and a per-row constant is not available
-        inside a slice.
+        Exactly what ``dflash_family_model`` computes for the same
+        ``loss_type`` -- the fixed positional decay for ``"dflash"``, the raw
+        D-PACE weights otherwise -- and applied to every row alike, image or
+        text. Nothing is rescaled: D-PACE's between-block emphasis (a block the
+        draft is confident about carries more total weight) is part of the
+        objective and is kept.
         """
         if self.loss_type == "dflash":
             if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
                 decay = torch.exp(
                     -(positions - 1).clamp(min=0).float() / self.loss_decay_gamma
                 )
-                return decay.expand_as(weight_mask), None
-            return torch.ones_like(weight_mask), None
+                return decay.expand_as(weight_mask)
+            return torch.ones_like(weight_mask)
         if self.loss_type not in _DPACE_LOSS_TYPES:  # defensive, validated in __init__
             raise ValueError(f"unknown loss_type {self.loss_type!r}")
         # half-precision CE would make the cumulative products noisy; wider
         # dtypes (the tests run in float64) are kept as they are
         prob_dtype = torch.promote_types(neg_log_q.dtype, torch.float32)
-        dpace = self._dpace_weight(
+        return self._dpace_weight(
             torch.exp(-neg_log_q.detach().to(prob_dtype)),
             weight_mask.to(prob_dtype),
             weight_mask > 0,
             self.loss_type,
         )
-        valid_count = weight_mask.sum(dim=-1, keepdim=True)
-        block_mean = (dpace * weight_mask).sum(dim=-1, keepdim=True) / valid_count.clamp_min(
-            1.0
-        )
-        # A block with no valid position has block_mean 0 and a numerator of 0
-        # too, except under "cumulative-confidence-only" whose prefix is 1
-        # everywhere; dividing by a tiny epsilon there would put ~1e38 into a
-        # tensor that only survives because `* weight_mask` zeroes it two lines
-        # later. Leave those blocks unscaled instead.
-        block_mean = torch.where(valid_count > 0, block_mean, torch.ones_like(block_mean))
-        return dpace / block_mean, block_mean
 
     def _mmflash_objective_chunk_terms(
         self,
@@ -444,44 +426,26 @@ class OnlineMMFlashModel(nn.Module):
             predicted_ids = logits.argmax(dim=-1)
             correct = predicted_ids == target_ids
 
-            # --- simulated verification (VAT): first top-1 miss per block ---
-            # Positions the loss does not cover pass through, and position 0 is
-            # the anchor slot that is never predicted.
-            hit = correct | ~valid | (positions == 0)
-            reached = torch.cumprod(
-                torch.cat([torch.ones_like(hit[..., :1]), hit[..., :-1]], dim=-1).long(),
-                dim=-1,
-            )
-            # index of the first miss; the last slot when the block passes whole,
-            # which makes every (k - k*)_+ zero and nothing decays
-            first_reject = reached.sum(dim=-1, keepdim=True) - 1
-            distance = (positions - first_reject).clamp(min=0).float()
-            if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-                vat_weights = torch.exp(-distance / self.loss_decay_gamma)
-            else:
-                vat_weights = torch.ones_like(distance)
-
-            # --- image rows: visual override on top of VAT ---
-            g = visual_score
-            visual_weights = g * (1.0 + self.visual_alpha) + (1.0 - g) * vat_weights
-
-            # --- text-only rows: loss_type, D-PACE rescaled per block ---
-            text_weights, dpace_block_mean = self._text_row_weights(
-                neg_log_q, weight_mask, positions
-            )
-
-            is_multimodal = multimodal_rows > 0.5
-            loss_weights = torch.where(is_multimodal, visual_weights, text_weights)
-            loss_weights = loss_weights * weight_mask
+            base = self._base_weights(neg_log_q, weight_mask, positions)
+            # the draft's current probability on the target token
+            target_probability = torch.exp(-neg_log_q.detach().to(base.dtype))
+            g = visual_score.to(base.dtype)
+            boost = 1.0 + self.visual_alpha * g * (1.0 - target_probability)
+            loss_weights = base * boost * weight_mask.to(base.dtype)
 
         loss_num = (neg_log_q * loss_weights).sum()
-        loss_den = loss_weights.sum()
+        if self.loss_type == "dflash":
+            loss_den = loss_weights.sum()
+        else:
+            # D-PACE convention: the caller divides by the batch size instead
+            loss_den = loss_num.new_zeros(())
 
         with torch.no_grad():
             correct_f = correct.float()
             mm_mask = weight_mask * multimodal_rows
             text_mask = weight_mask - mm_mask
             ce = neg_log_q.detach().float()
+            weighted_ce = neg_log_q.detach() * loss_weights  # same dtype rule as loss_num
             correct_num = (correct_f * weight_mask).sum()
             accuracy_den = weight_mask.sum()
 
@@ -490,22 +454,6 @@ class OnlineMMFlashModel(nn.Module):
             mm_blocks = block_has_loss * mm_row_flag
             text_blocks = block_has_loss - mm_blocks
             accepted = compute_accept_len(predicted_ids, target_ids, valid)  # (B, n)
-            has_miss = (~hit).any(dim=-1).float()  # (B, n)
-            g_at_first_reject = torch.gather(g, 2, first_reject).squeeze(-1)  # (B, n)
-            # k* is only meaningful where a rejection actually happened: a block
-            # that passes whole is stored as k* = K-1 by convention (so that
-            # nothing decays), and averaging that in would make the metric drift
-            # towards K-1 precisely as the draft gets better.
-            kstar = first_reject.squeeze(-1).float() * has_miss  # (B, n)
-            mm_rejects = has_miss * mm_blocks
-            text_rejects = has_miss * text_blocks
-            # the draft's mean continuation value per block: what the per-block
-            # rescale divides out, and the only informative half of it
-            block_scale = (
-                dpace_block_mean.squeeze(-1).float()
-                if dpace_block_mean is not None
-                else torch.zeros_like(text_blocks)
-            )
 
             telemetry = (
                 (ce * mm_mask).sum(),
@@ -515,17 +463,15 @@ class OnlineMMFlashModel(nn.Module):
                 (correct_f * mm_mask).sum(),
                 (correct_f * text_mask).sum(),
                 (g * mm_mask).sum(),
+                (boost * mm_mask).sum(),
                 (loss_weights * multimodal_rows).sum(),
-                (block_scale * text_blocks).sum(),
+                (loss_weights * (1.0 - multimodal_rows)).sum(),
+                (weighted_ce * multimodal_rows).sum(),
+                weighted_ce.sum(),
                 (accepted * mm_blocks).sum(),
                 mm_blocks.sum(),
                 (accepted * text_blocks).sum(),
                 text_blocks.sum(),
-                (g_at_first_reject * mm_rejects).sum(),
-                (kstar * mm_rejects).sum(),
-                mm_rejects.sum(),
-                (kstar * text_rejects).sum(),
-                text_rejects.sum(),
             )
         return (loss_num, loss_den, correct_num, accuracy_den) + telemetry
 
@@ -538,15 +484,18 @@ class OnlineMMFlashModel(nn.Module):
             rank = torch.distributed.get_rank()
         if rank != 0:
             return
-        gamma = self.loss_decay_gamma
-        decay = f"exp(-(k-k*)/{gamma})" if gamma and gamma > 0 else "none (loss_decay_gamma unset)"
+        if self.loss_type == "dflash":
+            gamma = self.loss_decay_gamma
+            base = f"dflash decay exp(-(k-1)/{gamma})" if gamma and gamma > 0 else "uniform"
+            reduction = "sum(w*ce)/sum(w)"
+        else:
+            base = f"{self.loss_type} (dpace_alpha={self.dpace_alpha})"
+            reduction = "sum(w*ce)/bsz"
         print(
-            "[mmflash-objective] image rows: w = g*(1+alpha) + (1-g)*w_vat, "
-            f"alpha={self.visual_alpha}, w_vat={decay}; text-only rows: "
-            f"loss_type={self.loss_type!r}"
-            + (" (D-PACE, rescaled to mean 1 per block)" if self.loss_type in _DPACE_LOSS_TYPES else "")
-            + "; reduction: sum(w*ce)/sum(w) over the whole batch; "
-            f"visual_score channel present={has_visual_channel}",
+            f"[mmflash-objective] every row: w = base * (1 + alpha*g*(1-p)), "
+            f"base={base}, alpha={self.visual_alpha}, reduction={reduction}; "
+            f"visual_score channel present={has_visual_channel}"
+            + ("" if has_visual_channel else " (g=0 everywhere: plain base objective)"),
             flush=True,
         )
 
@@ -632,10 +581,10 @@ class OnlineMMFlashModel(nn.Module):
         loss_mask_f = loss_mask.float()
         # Image rows whose channel is all zero, which happens when the row has
         # no sidecar entry (or none is configured) and also -- legitimately --
-        # under the "binary" transform when no token of the row clears the
-        # threshold. Either way those rows train on plain VAT weights, which is
-        # what the metric is for; it is NOT a count of join failures, the
-        # producer's own [visual-score] lines are.
+        # when the confidence gate or the "binary" transform zeroes every token
+        # of the row. Either way those rows train on the plain base objective,
+        # which is what the metric is for; it is NOT a count of join failures,
+        # the producer's own [visual-score] lines are.
         zero_score_row = multimodal_row & ((g_full * loss_mask_f).sum(dim=1) <= 0)
 
         hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)
@@ -661,19 +610,20 @@ class OnlineMMFlashModel(nn.Module):
             mm_correct,
             text_correct,
             g_sum,
-            w_mm_sum,
-            block_scale_text,
+            boost_sum_mm,
+            w_sum_mm,
+            w_sum_text,
+            wce_mm,
+            wce_total,
             mm_accepted,
             mm_blocks,
             text_accepted,
             text_blocks,
-            g_at_reject,
-            mm_kstar,
-            mm_rejects,
-            text_kstar,
-            text_rejects,
         ) = terms
-        loss = loss_num / (loss_den + 1e-6)
+        if self.loss_type == "dflash":
+            loss = loss_num / (loss_den + 1e-6)
+        else:
+            loss = loss_num / float(bsz)
         accuracy = correct_num / (accuracy_denom + 1e-6)
 
         self._describe_objective_once(has_visual_channel)
@@ -690,28 +640,21 @@ class OnlineMMFlashModel(nn.Module):
             "text_ce": (detach(text_ce), detach(text_tokens)),
             "mm_acc": (detach(mm_correct), detach(mm_tokens)),
             "text_acc": (detach(text_correct), detach(text_tokens)),
-            # the visual channel and what the objective did with it. There is no
-            # w_mean_text: the per-block rescale pins it to 1 by construction.
+            # the visual channel and what the objective did with it. The
+            # multiplier averages 1 on text rows by construction, so only its
+            # image-row mean is reported; the two w_mean values share a scale
+            # (same base objective), and the shares say how the batch's weight
+            # and loss split between the modalities.
             "g_mean_mm": (detach(g_sum), detach(mm_tokens)),
-            "g_at_first_reject_mm": (detach(g_at_reject), detach(mm_rejects)),
-            "w_mean_mm": (detach(w_mm_sum), detach(mm_tokens)),
-            # simulated verification. k* is averaged over REJECTING blocks only
-            # (a block that passes whole carries the K-1 sentinel), so the pass
-            # rate is reported next to it rather than folded into it.
+            "boost_mean_mm": (detach(boost_sum_mm), detach(mm_tokens)),
+            "w_mean_mm": (detach(w_sum_mm), detach(mm_tokens)),
+            "w_mean_text": (detach(w_sum_text), detach(text_tokens)),
+            "w_share_mm": (detach(w_sum_mm), detach(w_sum_mm + w_sum_text)),
+            "loss_share_mm": (detach(wce_mm), detach(wce_total)),
+            # simulated verification from the block's own argmax
             "sim_accept_len_mm": (detach(mm_accepted), detach(mm_blocks)),
             "sim_accept_len_text": (detach(text_accepted), detach(text_blocks)),
-            "sim_reject_frac_mm": (detach(mm_rejects), detach(mm_blocks)),
-            "sim_reject_frac_text": (detach(text_rejects), detach(text_blocks)),
-            "sim_first_reject_mm": (detach(mm_kstar), detach(mm_rejects)),
-            "sim_first_reject_text": (detach(text_kstar), detach(text_rejects)),
         }
-        if self.loss_type in _DPACE_LOSS_TYPES:
-            # the draft's mean continuation value on text blocks, i.e. what the
-            # per-block rescale divided out; rises as the draft improves
-            ratio_metrics["dpace_block_mean_text"] = (
-                detach(block_scale_text),
-                detach(text_blocks),
-            )
         return (
             loss,
             accuracy,

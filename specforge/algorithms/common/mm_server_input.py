@@ -212,9 +212,9 @@ class ImageServerInputAdapter:
         path = getattr(config.data, "visual_score_path", "") or ""
         if not path:
             print(
-                "[visual-score] data.visual_score_path is empty: every image row "
-                "gets g=0 (verification-aware weights only), text-only rows keep "
-                f"training.loss_type={config.training.loss_type!r}",
+                "[visual-score] data.visual_score_path is empty: g=0 everywhere, so "
+                f"every row trains on the plain training.loss_type={config.training.loss_type!r} "
+                "objective (the visual multiplier is 1)",
                 flush=True,
             )
             return None
@@ -223,6 +223,7 @@ class ImageServerInputAdapter:
             path,
             transform=config.data.visual_score_transform,
             binary_threshold=config.data.visual_score_binary_threshold,
+            confidence_gate=getattr(config.data, "visual_score_confidence_gate", True),
         )
         print(
             f"[visual-score] loaded {path!r} in {time.monotonic() - started:.0f}s: "
@@ -286,7 +287,7 @@ class ImageServerInputAdapter:
                 + (
                     ". The scoring pass looks incomplete -- finish it "
                     "(re-run scripts/score_visual_kl_hpc.sh, it resumes) or set "
-                    "data.visual_score_path: \"\" to train the VAT-only ablation "
+                    "data.visual_score_path: \"\" to train the no-visual-term ablation "
                     "deliberately."
                     if level == "ERROR"
                     else ""

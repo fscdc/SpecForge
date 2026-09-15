@@ -23,6 +23,16 @@ This module turns raw KL (nats, unbounded, heavy-tailed) into ``g in [0, 1]``
 and expands the compact vector back onto the full token sequence in the wire
 format the capture pipeline carries (:func:`expand_visual_score`).
 
+Confidence gate
+---------------
+KL alone conflates "the image matters" with "the target is unsure": a token
+the target cannot settle even with the image in front of it has a flat
+distribution that moves a lot when the image is removed, so it scores high --
+and it is exactly the kind of token a draft cannot learn. The gate multiplies
+the transformed KL by ``exp(-entropy)``, the target's confidence WITH the
+image, so ``g`` is high only where the image both changes and settles the
+prediction (``data.visual_score_confidence_gate``, on by default).
+
 Wire format
 -----------
 The capture transport stores client passthrough tensors as ``int64`` (see
@@ -189,16 +199,19 @@ class VisualScoreStats:
     rows: int = 0
     tokens: int = 0
     transform: str = ""
+    confidence_gate: bool = True
     kl_quantiles: Dict[str, float] = field(default_factory=dict)
     g_mean: float = 0.0
+    g_share_ge_05: float = 0.0
     g_share_ge_075: float = 0.0
 
     def describe(self) -> str:
         q = ", ".join(f"p{k}={v:.3f}" for k, v in self.kl_quantiles.items())
         return (
             f"{self.rows} rows / {self.tokens} scored tokens from {len(self.files)} file(s); "
-            f"transform={self.transform}; raw KL {q}; "
-            f"g mean={self.g_mean:.3f}, share(g>=0.75)={self.g_share_ge_075:.3f}"
+            f"transform={self.transform}, confidence_gate={'on' if self.confidence_gate else 'off'}; "
+            f"raw KL {q}; g mean={self.g_mean:.3f}, "
+            f"share(g>=0.5)={self.g_share_ge_05:.3f}, share(g>=0.75)={self.g_share_ge_075:.3f}"
         )
 
 
@@ -225,13 +238,17 @@ class VisualScoreTable:
         *,
         transform: str = "quantile",
         binary_threshold: float = 0.75,
+        confidence_gate: bool = True,
     ) -> "VisualScoreTable":
         edges = None
         if transform != "identity":
             edges = compute_quantile_edges(path)
         entries: Dict[str, Tuple[int, str, np.ndarray]] = {}
-        stats = VisualScoreStats(files=_sidecar_files(path), transform=transform)
+        stats = VisualScoreStats(
+            files=_sidecar_files(path), transform=transform, confidence_gate=confidence_gate
+        )
         g_sum = 0.0
+        g_mid = 0
         g_hi = 0
         for record in iter_sidecar(path):
             record_id = str(record["id"])
@@ -246,10 +263,13 @@ class VisualScoreTable:
             g = transform_scores(
                 kl, transform, edges=edges, binary_threshold=binary_threshold
             )
+            if confidence_gate:
+                g = gate_by_confidence(g, record.get("entropy"), record_id=record_id)
             entries[record_id] = (int(record["n_tokens"]), str(record.get("fp", "")), g)
             stats.rows += 1
             stats.tokens += int(kl.size)
             g_sum += float(g.sum())
+            g_mid += int((g >= 0.5).sum())
             g_hi += int((g >= 0.75).sum())
         if not entries:
             raise ValueError(f"visual score sidecar {path!r} is empty")
@@ -259,8 +279,29 @@ class VisualScoreTable:
                 str(p): float(edges[int(round(p / 100 * points))]) for p in (25, 50, 75, 90, 99)
             }
         stats.g_mean = g_sum / max(stats.tokens, 1)
+        stats.g_share_ge_05 = g_mid / max(stats.tokens, 1)
         stats.g_share_ge_075 = g_hi / max(stats.tokens, 1)
         return cls(entries, stats)
+
+
+def gate_by_confidence(
+    g: np.ndarray, entropy: Optional[Sequence[float]], *, record_id: str = "?"
+) -> np.ndarray:
+    """``g * exp(-entropy)``: keep the visual score only where the target,
+    looking at the image, is confident (entropy in nats, per loss position).
+    """
+    if entropy is None:
+        raise ValueError(
+            f"visual score row {record_id!r} carries no 'entropy' but the confidence "
+            "gate is on; re-score with scripts/score_visual_kl.py or set "
+            "data.visual_score_confidence_gate: false"
+        )
+    h = np.asarray(entropy, dtype=np.float32)
+    if h.shape != g.shape:
+        raise ValueError(
+            f"visual score row {record_id!r}: {g.size} kl values but {h.size} entropy values"
+        )
+    return (g * np.exp(-np.clip(h, 0.0, None))).astype(np.float32)
 
 
 def quantize(g: np.ndarray) -> np.ndarray:
@@ -361,6 +402,7 @@ __all__ = [
     "compute_quantile_edges",
     "dequantize_visual_score",
     "expand_visual_score",
+    "gate_by_confidence",
     "iter_sidecar",
     "join_visual_scores",
     "quantize",

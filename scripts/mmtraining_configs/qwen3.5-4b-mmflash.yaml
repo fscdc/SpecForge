@@ -12,22 +12,23 @@ model:
   embedding_key: "model.language_model.embed_tokens.weight" # @sicheng: changed "model.embed_tokens.weight"
   torch_dtype: "bfloat16"
 data:
-  train_data_path: "/local_home2/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M_regen_first_turn.jsonl" # "/local_home2/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M-prompted_regen_first_turn.jsonl"
-  # Per-token visual-dependency scores for the row ids of THIS train_data_path,
+  train_data_path: "/local_home2/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M-prompted_regen_first_turn.jsonl" # "/local_home2/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M-prompted_regen_first_turn.jsonl"
+  # Per-token visual-grounding scores for the row ids of THIS train_data_path,
   # written by scripts/score_visual_kl_hpc.sh (which reads both fields from this
   # file). One sidecar per regen: the two regens above share their ids but not
   # their responses, and a mismatch is caught per row by the stored fingerprint.
-  # Empty trains image rows on the verification-aware weights alone (g=0).
-  visual_score_path: "/local_home2/fengsicheng/specforge/visual_kl/llava-ov15-1M"
+  # Empty: g=0 everywhere, the plain loss_type objective on every row.
+  visual_score_path: "/local_home2/fengsicheng/specforge/visual_kl/llava-ov15-1M-prompted"
   visual_score_transform: "quantile"   # quantile | saturate | binary | identity
+  # g = transform(KL) * exp(-entropy): high only where the image both changes
+  # AND settles the target's prediction. false = raw KL rank (ablation).
+  visual_score_confidence_gate: true
   max_length: 4096
   chat_template: "qwen3.5"
   build_dataset_num_proc: 32
   cache_dir: "/local_home2/fengsicheng/specforge/.cache"
 training:
   strategy: "mmflash"
-  # text-only rows keep DFlash's own objective; image rows use the visual-VAT
-  # weighting regardless of this value
   # loss_type: "dpace"
   visual_alpha: 1.0
   num_epochs: 6
@@ -40,15 +41,15 @@ training:
   attention_backend: "flex_attention"
   num_anchors: 512
   loss_decay_gamma: 7
-  save_interval: 10000
+  save_interval: 50000
   log_interval: 50
   dist_timeout: 30
   seed: 42
 
 tracking:
   report_to: "tensorboard"
-run_id: "qwen3.5-4b-mmflash-llava-ov15-1M" # "qwen3.5-4b-mmflash-llava-ov15-1M-prompted"
-output_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted"
+run_id: "qwen3.5-4b-mmflash-llava-ov15-1M-prompted" # "qwen3.5-4b-mmflash-llava-ov15-1M-prompted"
+output_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted"
 
 deployment:
   mode: disaggregated
@@ -56,8 +57,8 @@ deployment:
     nnodes: 1
     nproc_per_node: 3 # @sicheng: same as gpu count
   disaggregated:
-    control_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M/control" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/control"
-    consumer_state_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M/consumer-state" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/consumer-state"
+    control_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/control" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/control"
+    consumer_state_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/consumer-state" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/consumer-state"
     backend: mooncake
     # server_urls:
     #   - http://127.0.0.1:30000

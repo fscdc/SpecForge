@@ -201,9 +201,10 @@ Exactly one of the first three fields must be non-empty:
 | `data.max_prompts` | `null` | Optional non-negative prompt cap, useful for smoke tests. |
 | `data.image_root` | `""` | Image modality: directory prepended to relative `image` paths in the records. |
 | `data.image_max_tokens` | `0` | Image modality: cap on visual tokens per image; leave at 0 unless the capture server applies the same limit. |
-| `data.visual_score_path` | `""` | MMFlash only: per-token visual-dependency sidecar (file or directory of `*.jsonl` from `scripts/score_visual_kl.py`), keyed by record `id`. Empty trains image rows with verification-aware weights alone. |
+| `data.visual_score_path` | `""` | MMFlash only: per-token visual-grounding sidecar (file or directory of `*.jsonl` from `scripts/score_visual_kl.py`), keyed by record `id`. Empty gives `g=0` everywhere, i.e. the plain `loss_type` objective on every row. |
 | `data.visual_score_transform` | `quantile` | MMFlash only: how raw KL becomes `g` in [0, 1] (`quantile`, `saturate`, `binary`, `identity`). |
 | `data.visual_score_binary_threshold` | `0.75` | MMFlash only: quantile-rank cut used by the `binary` transform. |
+| `data.visual_score_confidence_gate` | `true` | MMFlash only: multiply `g` by `exp(-entropy)`, the target's confidence with the image, so only tokens the image both changes and settles score high. `false` uses the raw KL rank. |
 
 Offline evaluation uses `eval_hidden_states_path`; configure it together with
 `training.eval_interval`. Online evaluation is unsupported, and setting
@@ -247,7 +248,7 @@ Strategy-specific fields should be written only when tuning that objective:
 | --- | --- |
 | EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda` or `alpha`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
 | DFlash / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
-| MMFlash | the DFlash knobs above (`training.loss_type` is the objective of text-only rows) plus `training.visual_alpha` (`1.0`; boost on visually grounded tokens of image rows, `w = g*(1+alpha) + (1-g)*w_vat`) and the `data.visual_score_*` fields |
+| MMFlash | the DFlash knobs above (`training.loss_type` is the base weight of every token) plus `training.visual_alpha` (`1.0`; every token's weight is `base * (1 + alpha * g * (1 - p))` with `g` the visual grounding and `p` the draft's probability on the token; `0` is exactly `loss_type`) and the `data.visual_score_*` fields |
 | DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
 

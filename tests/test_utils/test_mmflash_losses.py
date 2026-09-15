@@ -9,12 +9,13 @@ re-implementation of the weighting written independently below.
 What the objective must satisfy (see the module docstring of
 ``specforge/algorithms/common/mmflash_model.py``):
 
-* no ``visual_score`` -> every row is text-only -> ``loss_type`` as before
-  (bit-identical to DFlash for ``loss_type="dflash"``);
-* text-only rows under D-PACE -> D-PACE weights rescaled to mean 1 per block;
-* image rows -> ``g * (1 + alpha) + (1 - g) * w_vat`` with the VAT decay
-  re-anchored at the block's first top-1 miss;
-* one weighted mean over the whole batch;
+* every token: ``w = base * (1 + alpha * g * (1 - p))`` with ``base`` the
+  ``loss_type`` weight exactly as DFlash computes it and ``p`` the draft's
+  probability on the target token;
+* reduction follows the base: weighted mean for ``"dflash"``, ``/ bsz`` for
+  the D-PACE family;
+* ``g = 0`` (text-only rows, image rows without scores, no channel at all) or
+  ``alpha = 0`` gives the plain ``loss_type`` objective, bit for bit;
 * the result does not depend on ``objective_chunk_blocks``.
 """
 
@@ -212,38 +213,37 @@ def _naive_dpace_weight(prob, binary_mask, alpha, loss_type):
     raise ValueError(loss_type)
 
 
-def _naive_text_weights(neg_log_q, mask, loss_type, dpace_alpha, gamma):
+def _naive_base(neg_log_q, mask, loss_type, dpace_alpha, gamma):
     block_size = mask.shape[-1]
     positions = torch.arange(block_size, dtype=torch.double).view(1, 1, -1)
     if loss_type == "dflash":
         if gamma:
             return torch.exp(-(positions - 1).clamp(min=0) / gamma).expand_as(mask)
         return torch.ones_like(mask)
-    raw = _naive_dpace_weight(torch.exp(-neg_log_q), mask, dpace_alpha, loss_type)
-    block_mean = (raw * mask).sum(-1, keepdim=True) / mask.sum(-1, keepdim=True).clamp_min(1.0)
-    return raw / block_mean.clamp_min(torch.finfo(raw.dtype).tiny)
+    return _naive_dpace_weight(torch.exp(-neg_log_q), mask, dpace_alpha, loss_type)
 
 
-def _naive_vat_weights(predicted, targets, mask, gamma):
+def _naive_loss(logits, targets, mask, g4d, *, loss_type, dpace_alpha, gamma, alpha):
+    """The objective as DFlash would compute ``loss_type``, times the multiplier."""
+    neg_log_q = _neg_log_q(logits, targets)
+    base = _naive_base(neg_log_q, mask, loss_type, dpace_alpha, gamma)
+    p = torch.exp(-neg_log_q)
+    w = base * (1.0 + alpha * g4d * (1.0 - p)) * mask
+    if loss_type == "dflash":
+        return (neg_log_q * w).sum() / (w.sum() + 1e-6)
+    return (neg_log_q * w).sum() / float(logits.shape[0])
+
+
+def _naive_accept_len(predicted, targets, mask):
     block_size = mask.shape[-1]
     positions = torch.arange(block_size).view(1, 1, -1)
     hit = (predicted == targets) | (mask <= 0.5) | (positions == 0)
     reached = torch.cumprod(torch.cat([torch.ones_like(hit[..., :1]), hit[..., :-1]], -1).long(), -1)
-    first_reject = reached.sum(-1, keepdim=True) - 1
-    distance = (positions - first_reject).clamp(min=0).double()
-    if gamma:
-        return torch.exp(-distance / gamma), first_reject
-    return torch.ones_like(distance), first_reject
+    # accepted = leading run of valid hits after the anchor slot
+    return ((reached > 0) & hit & (mask > 0.5)).sum(-1).double()
 
 
-def _naive_loss(logits, targets, mask, g4d, mm_rows, *, loss_type, dpace_alpha, gamma, alpha):
-    neg_log_q = _neg_log_q(logits, targets)
-    predicted = logits.argmax(-1)
-    vat, _ = _naive_vat_weights(predicted, targets, mask, gamma)
-    visual = g4d * (1.0 + alpha) + (1.0 - g4d) * vat
-    text = _naive_text_weights(neg_log_q, mask, loss_type, dpace_alpha, gamma)
-    w = torch.where(mm_rows.view(-1, 1, 1) > 0.5, visual, text) * mask
-    return (neg_log_q * w).sum() / (w.sum() + 1e-6)
+ALL_LOSS_TYPES = ("dflash", "dpace", "dpace-cumulative-confidence-only", "dpace-continuation-value-only")
 
 
 # ----------------------------------------------------------------------------
@@ -290,21 +290,32 @@ class TestMMFlashObjective(unittest.TestCase):
         alpha = kwargs.get("visual_alpha", 1.0)
         dpace_alpha = kwargs.get("dpace_alpha", 0.5)
         if visual_score is None:
-            mm_rows = torch.zeros(self.input_ids.shape[0])
             g4d = torch.zeros_like(self.g4d)
         else:
-            mm_rows = (visual_score >= 0).any(dim=1).double()
             g4d = torch.gather(
                 visual_score.clamp(min=0).unsqueeze(1).expand(-1, self.anchors.shape[1], -1),
                 2,
                 self.safe_indices,
             )
         return _naive_loss(
-            self.logits, self.targets, self.mask, g4d, mm_rows,
+            self.logits, self.targets, self.mask, g4d,
             loss_type=loss_type, dpace_alpha=dpace_alpha, gamma=gamma, alpha=alpha,
         )
 
-    # --- legacy paths ------------------------------------------------------
+    def _plain(self, loss_type, gamma=None):
+        """The loss_type objective with no visual term, written out directly."""
+        neg_log_q = _neg_log_q(self.logits, self.targets)
+        base = _naive_base(neg_log_q, self.mask, loss_type, 0.5, gamma) * self.mask
+        if loss_type == "dflash":
+            return (neg_log_q * base).sum() / (base.sum() + 1e-6)
+        return (neg_log_q * base).sum() / float(self.logits.shape[0])
+
+    @staticmethod
+    def _ratio(metrics, name):
+        num, den = metrics["ratio_metrics"][name]
+        return float(num / den)
+
+    # --- the objective collapses to loss_type whenever the visual term is off --
     def test_no_channel_is_the_dflash_weighted_mean(self):
         got, _ = self._run(None)
         neg_log_q = _neg_log_q(self.logits, self.targets)
@@ -313,119 +324,75 @@ class TestMMFlashObjective(unittest.TestCase):
 
     def test_no_channel_keeps_the_dflash_decay(self):
         got, _ = self._run(None, loss_decay_gamma=7.0)
-        positions = torch.arange(self.block_size, dtype=torch.double).view(1, 1, -1)
-        weight = self.mask * torch.exp(-(positions - 1).clamp(min=0) / 7.0)
-        neg_log_q = _neg_log_q(self.logits, self.targets)
-        want = (neg_log_q * weight).sum() / (weight.sum() + 1e-6)
         # the decay itself is evaluated in float32, exactly as DFlash does
-        torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(got, self._plain("dflash", 7.0), rtol=1e-6, atol=1e-6)
 
-    def test_all_text_rows_use_per_block_normalised_dpace(self):
-        text_only = torch.full_like(self.g_full, -1.0)
-        for loss_type in ("dpace", "dpace-cumulative-confidence-only", "dpace-continuation-value-only"):
+    def test_no_channel_is_dflash_dpace_bit_for_bit(self):
+        for loss_type in ALL_LOSS_TYPES[1:]:
             with self.subTest(loss_type=loss_type):
-                got, _ = self._run(text_only, loss_type=loss_type, loss_decay_gamma=7.0)
-                want = self._reference(text_only, loss_type=loss_type, loss_decay_gamma=7.0)
-                torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
+                got, _ = self._run(None, loss_type=loss_type, loss_decay_gamma=7.0)
+                torch.testing.assert_close(got, self._plain(loss_type), rtol=0, atol=1e-9)
 
-    def test_text_rows_dpace_weights_average_to_one_per_block(self):
-        model = _make_model(self.logits, self.anchors, self.keep_mask, loss_type="dpace")
-        neg_log_q = _neg_log_q(self.logits, self.targets)
-        positions = torch.arange(self.block_size).view(1, 1, -1)
-        weights, block_mean = model._text_row_weights(
-            neg_log_q, self.mask.float(), positions
-        )
-        self.assertIsNotNone(block_mean)
-        per_block = (weights * self.mask).sum(-1) / self.mask.sum(-1).clamp_min(1.0)
-        has_tokens = self.mask.sum(-1) > 0
-        torch.testing.assert_close(
-            per_block[has_tokens], torch.ones_like(per_block[has_tokens]), rtol=1e-5, atol=1e-5
-        )
+    def test_text_only_channel_and_alpha_zero_and_zero_scores_all_equal_plain(self):
+        text_only = torch.full_like(self.g_full, -1.0)
+        zeros = torch.zeros_like(self.g_full)
+        for loss_type in ALL_LOSS_TYPES:
+            with self.subTest(loss_type=loss_type):
+                plain = self._plain(loss_type, 7.0)
+                cases = {
+                    "sentinel everywhere": self._run(text_only, loss_type=loss_type, loss_decay_gamma=7.0),
+                    "alpha=0 with real g": self._run(self.g_full, loss_type=loss_type, loss_decay_gamma=7.0, visual_alpha=0.0),
+                    "image rows, g=0": self._run(zeros, loss_type=loss_type, loss_decay_gamma=7.0, visual_alpha=3.0),
+                }
+                for name, (got, metrics) in cases.items():
+                    torch.testing.assert_close(got, plain, rtol=1e-6, atol=1e-6, msg=name)
+                # the zero-score rows are still counted as image rows
+                self.assertEqual(self._ratio(cases["image rows, g=0"][1], "mm_zero_score_row_frac"), 1.0)
+                self.assertEqual(self._ratio(cases["sentinel everywhere"][1], "mm_row_frac"), 0.0)
 
-    # --- image rows --------------------------------------------------------
-    def test_image_rows_without_scores_get_vat_weights(self):
-        zeros = torch.zeros_like(self.g_full)  # g=0 everywhere, but still image rows
-        got, metrics = self._run(zeros, loss_decay_gamma=7.0)
-        want = self._reference(zeros, loss_decay_gamma=7.0)
-        torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
-        num, den = metrics["ratio_metrics"]["mm_zero_score_row_frac"]
-        self.assertEqual(float(num / den), 1.0)
-
-    def test_vat_weights_are_full_up_to_the_first_miss_then_decay(self):
-        predicted = self.logits.argmax(-1)
-        vat, first_reject = _naive_vat_weights(predicted, self.targets, self.mask, gamma=7.0)
-        positions = torch.arange(self.block_size).view(1, 1, -1)
-        before = positions <= first_reject
-        self.assertTrue(bool((vat[before] == 1.0).all()))
-        after = (positions > first_reject) & (self.mask > 0.5)
-        if after.any():
-            self.assertTrue(bool((vat[after] < 1.0).all()))
-        # a block that passes whole has first_reject == K-1 and never decays
-        hit = (predicted == self.targets) | (self.mask <= 0.5) | (positions == 0)
-        whole = hit.all(-1)
-        self.assertTrue(bool((first_reject.squeeze(-1)[whole] == self.block_size - 1).all()))
-
-    def test_fully_visual_rows_reduce_to_plain_mean_ce(self):
-        ones = torch.ones_like(self.g_full)
-        neg_log_q = _neg_log_q(self.logits, self.targets)
-        want = (neg_log_q * self.mask).sum() / (self.mask.sum() + 1e-6)
-        for alpha in (0.0, 1.0, 3.0):
-            with self.subTest(alpha=alpha):
-                got, _ = self._run(ones, loss_decay_gamma=7.0, visual_alpha=alpha)
-                torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
-
-    def test_mixed_batch_matches_reference(self):
+    # --- the multiplier ------------------------------------------------------
+    def test_mixed_batch_matches_reference_for_every_base(self):
         mixed = self.g_full.clone()
         mixed[1] = -1.0  # row 1 text-only
-        for alpha in (0.0, 1.0, 2.0):
-            with self.subTest(alpha=alpha):
-                got, metrics = self._run(mixed, loss_type="dpace", loss_decay_gamma=7.0, visual_alpha=alpha)
-                want = self._reference(mixed, loss_type="dpace", loss_decay_gamma=7.0, visual_alpha=alpha)
-                torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
-                num, den = metrics["ratio_metrics"]["mm_row_frac"]
-                self.assertAlmostEqual(float(num / den), 0.5)
+        for loss_type in ALL_LOSS_TYPES:
+            for alpha in (0.0, 1.0, 2.0):
+                with self.subTest(loss_type=loss_type, alpha=alpha):
+                    got, metrics = self._run(mixed, loss_type=loss_type, loss_decay_gamma=7.0, visual_alpha=alpha)
+                    want = self._reference(mixed, loss_type=loss_type, loss_decay_gamma=7.0, visual_alpha=alpha)
+                    torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
+                    self.assertAlmostEqual(self._ratio(metrics, "mm_row_frac"), 0.5)
 
-    def test_visual_alpha_raises_image_row_weight(self):
+    def test_multiplier_is_bounded_and_fades_with_draft_confidence(self):
+        alpha = 2.0
+        _, metrics = self._run(self.g_full, loss_type="dpace", visual_alpha=alpha)
+        boost = self._ratio(metrics, "boost_mean_mm")
+        self.assertGreaterEqual(boost, 1.0)
+        self.assertLessEqual(boost, 1.0 + alpha)
+        # the same channel on a draft that is sure of every token -> multiplier 1
+        sure = self.logits.clone()
+        for b in range(sure.shape[0]):
+            for n in range(sure.shape[1]):
+                for k in range(sure.shape[2]):
+                    sure[b, n, k, self.targets[b, n, k]] += 60.0
+        model = _make_model(sure, self.anchors, self.keep_mask, loss_type="dpace", visual_alpha=alpha)
+        _, _, m = model(input_ids=self.input_ids, hidden_states=self.hidden_states,
+                        loss_mask=self.loss_mask, visual_score=self.g_full)
+        self.assertAlmostEqual(self._ratio(m, "boost_mean_mm"), 1.0, places=6)
+
+    def test_alpha_raises_image_rows_only(self):
         mixed = self.g_full.clone()
         mixed[1] = -1.0
-        _, low = self._run(mixed, loss_type="dpace", loss_decay_gamma=7.0, visual_alpha=0.0)
-        _, high = self._run(mixed, loss_type="dpace", loss_decay_gamma=7.0, visual_alpha=2.0)
-        w_low = low["ratio_metrics"]["w_mean_mm"]
-        w_high = high["ratio_metrics"]["w_mean_mm"]
-        self.assertGreater(float(w_high[0] / w_high[1]), float(w_low[0] / w_low[1]))
-        # text rows are untouched by alpha
-        t_low = low["ratio_metrics"]["dpace_block_mean_text"]
-        t_high = high["ratio_metrics"]["dpace_block_mean_text"]
-        torch.testing.assert_close(t_low[0] / t_low[1], t_high[0] / t_high[1])
-
-    def test_kstar_metric_ignores_blocks_that_pass_whole(self):
-        """k* is averaged over rejecting blocks only, and the pass rate is separate."""
-        mixed = self.g_full.clone()
-        mixed[1] = -1.0
-        _, metrics = self._run(mixed, loss_decay_gamma=7.0)
-        r = metrics["ratio_metrics"]
-        predicted = self.logits.argmax(-1)
-        _, first_reject = _naive_vat_weights(predicted, self.targets, self.mask, gamma=7.0)
-        positions = torch.arange(self.block_size).view(1, 1, -1)
-        hit = (predicted == self.targets) | (self.mask <= 0.5) | (positions == 0)
-        has_miss = (~hit).any(-1)
-        block_has_loss = (self.mask > 0.5).any(-1)
-        for row, tag in ((0, "mm"), (1, "text")):
-            rejects = (has_miss[row] & block_has_loss[row])
-            want_frac = rejects.float().sum() / block_has_loss[row].float().sum()
-            num, den = r[f"sim_reject_frac_{tag}"]
-            torch.testing.assert_close(num / den, want_frac.to(num.dtype), rtol=1e-6, atol=1e-6)
-            if rejects.any():
-                want_k = first_reject.squeeze(-1)[row][rejects].double().mean()
-                num, den = r[f"sim_first_reject_{tag}"]
-                torch.testing.assert_close(num / den, want_k.to(num.dtype), rtol=1e-6, atol=1e-6)
-                # the sentinel would have pulled the mean towards K-1
-                self.assertLess(float(num / den), float(self.block_size - 1))
-
-    def test_no_dpace_block_mean_metric_under_dflash_loss(self):
-        _, metrics = self._run(None, loss_decay_gamma=7.0)
-        self.assertNotIn("dpace_block_mean_text", metrics["ratio_metrics"])
-        self.assertNotIn("w_mean_text", metrics["ratio_metrics"])
+        _, low = self._run(mixed, loss_type="dpace", visual_alpha=0.0)
+        _, high = self._run(mixed, loss_type="dpace", visual_alpha=2.0)
+        self.assertGreater(self._ratio(high, "w_mean_mm"), self._ratio(low, "w_mean_mm"))
+        self.assertGreater(self._ratio(high, "w_share_mm"), self._ratio(low, "w_share_mm"))
+        self.assertGreater(self._ratio(high, "loss_share_mm"), self._ratio(low, "loss_share_mm"))
+        # text rows are untouched by alpha, and at alpha=0 both modalities share a scale
+        self.assertAlmostEqual(self._ratio(high, "w_mean_text"), self._ratio(low, "w_mean_text"), places=9)
+        neg_log_q = _neg_log_q(self.logits, self.targets)
+        base = _naive_dpace_weight(torch.exp(-neg_log_q), self.mask, 0.5, "dpace") * self.mask
+        want_text = float(base[1].sum() / self.mask[1].sum())
+        self.assertAlmostEqual(self._ratio(low, "w_mean_text"), want_text, places=6)
 
     # --- telemetry and invariances ------------------------------------------
     def test_g_mean_metric_is_the_masked_mean_of_the_channel(self):
@@ -434,16 +401,29 @@ class TestMMFlashObjective(unittest.TestCase):
         want = (self.g4d * self.mask).sum() / self.mask.sum()
         torch.testing.assert_close(num / den, want.to(num.dtype), rtol=1e-5, atol=1e-6)
 
+    def test_sim_accept_len_matches_a_naive_count(self):
+        mixed = self.g_full.clone()
+        mixed[1] = -1.0
+        _, metrics = self._run(mixed, loss_type="dpace")
+        accepted = _naive_accept_len(self.logits.argmax(-1), self.targets, self.mask)
+        has_loss = (self.mask > 0.5).any(-1)
+        for row, tag in ((0, "mm"), (1, "text")):
+            want = accepted[row][has_loss[row]].mean()
+            num, den = metrics["ratio_metrics"][f"sim_accept_len_{tag}"]
+            torch.testing.assert_close(num / den, want.to(num.dtype), rtol=1e-6, atol=1e-6)
+
     def test_chunking_does_not_change_loss_or_metrics(self):
         mixed = self.g_full.clone()
         mixed[1] = -1.0
-        whole, m_whole = self._run(mixed, loss_type="dpace", loss_decay_gamma=7.0, objective_chunk_blocks=0)
-        chunked, m_chunk = self._run(mixed, loss_type="dpace", loss_decay_gamma=7.0, objective_chunk_blocks=1)
-        torch.testing.assert_close(whole, chunked, rtol=1e-9, atol=1e-9)
-        for name, (num, den) in m_whole["ratio_metrics"].items():
-            num2, den2 = m_chunk["ratio_metrics"][name]
-            torch.testing.assert_close(num, num2, rtol=1e-9, atol=1e-9, msg=name)
-            torch.testing.assert_close(den, den2, rtol=1e-9, atol=1e-9, msg=name)
+        for loss_type in ("dflash", "dpace"):
+            with self.subTest(loss_type=loss_type):
+                whole, m_whole = self._run(mixed, loss_type=loss_type, loss_decay_gamma=7.0, objective_chunk_blocks=0)
+                chunked, m_chunk = self._run(mixed, loss_type=loss_type, loss_decay_gamma=7.0, objective_chunk_blocks=1)
+                torch.testing.assert_close(whole, chunked, rtol=1e-9, atol=1e-9)
+                for name, (num, den) in m_whole["ratio_metrics"].items():
+                    num2, den2 = m_chunk["ratio_metrics"][name]
+                    torch.testing.assert_close(num, num2, rtol=1e-9, atol=1e-9, msg=name)
+                    torch.testing.assert_close(den, den2, rtol=1e-9, atol=1e-9, msg=name)
 
     def test_gradient_flows_through_image_and_text_rows(self):
         mixed = self.g_full.clone()

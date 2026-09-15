@@ -189,7 +189,7 @@ class MMFlashParityTest(unittest.TestCase):
         dflash = _code_of("specforge/algorithms/common/dflash_family_model.py",
                           start="def compute_accept_len", stop="    def _dflash_objective_chunk_terms")
         mmflash = _code_of("specforge/algorithms/common/mmflash_model.py",
-                           start="def compute_accept_len", stop="    def _text_row_weights")
+                           start="def compute_accept_len", stop="    def _base_weights")
         # the constructor gained visual_alpha; strip those lines before comparing
         mmflash = "\n".join(
             line for line in mmflash.splitlines()

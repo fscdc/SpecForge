@@ -542,8 +542,13 @@ class TrainingConfig(StrictConfigModel):
         "dpace",
         "dpace-cumulative-confidence-only",
         "dpace-continuation-value-only",
+        "mmflash",
     ] = "dflash"
     dpace_alpha: float = 0.5
+    #: MMFlash only -- with ``loss_type: mmflash`` every token's base weight is
+    #: the prefix confidence ``prod_{i<=k} ((1 - s) * p_i + s)``: the smoothed
+    #: probability that verification reaches position k. ``s`` is this floor.
+    mmflash_smoothing: float = Field(default=0.5, ge=0.0, le=1.0)
     #: MMFlash only -- every token's weight is the ``loss_type`` base weight
     #: times ``1 + visual_alpha * g * (1 - p)``: visual grounding g (sidecar)
     #: times how far the draft still is from the token (p = its probability on

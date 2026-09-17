@@ -477,6 +477,7 @@ def build_mmflash_model(
             loss_type=cfg.training.loss_type,
             dpace_alpha=cfg.training.dpace_alpha,
             visual_alpha=cfg.training.visual_alpha,
+            mmflash_smoothing=cfg.training.mmflash_smoothing,
         ),
     )
 

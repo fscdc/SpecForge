@@ -174,6 +174,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             loss_type="dpace",
             dpace_alpha=0.4,
             visual_alpha=1.0,
+            mmflash_smoothing=0.5,
             shift_label=True,
             dspark_ce_loss_alpha=0.1,
             dspark_l1_loss_alpha=0.8,
@@ -237,6 +238,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "mmflash_loss_type",
                 "mmflash_dpace_alpha",
                 "mmflash_visual_alpha",
+                "mmflash_smoothing",
             },
         }
 

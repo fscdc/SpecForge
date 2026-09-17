@@ -12,12 +12,17 @@ Objective. ONE formula for every token of every row:
     loss = sum_k w_k * ce_k / bsz            (loss_type = D-PACE family)
          = sum_k w_k * ce_k / sum_k w_k      (loss_type = "dflash")
 
-* ``base_k`` is the verification-aware weight ``loss_type`` names, computed
-  exactly as ``dflash_family_model`` computes it for the same ``loss_type`` --
-  D-PACE (the gradient of the expected accept length: how much position k
-  can still contribute given where the draft's verification chain currently
-  breaks) or DFlash's fixed positional decay. It answers "is training this
-  position useful right now".
+* ``base_k`` is the verification-aware weight ``loss_type`` names. It answers
+  "is training this position useful right now":
+
+  - ``"mmflash"``: the *prefix confidence* ``prod_{i<=k} q~_i`` with
+    ``q~ = (1 - lambda) q + lambda`` (``mmflash_smoothing``) -- the smoothed
+    probability that sequential verification reaches position k at all. A
+    position after a likely miss gets almost no gradient; a block the draft is
+    sure of keeps its later positions in play. Reduced as ``sum(w*ce)/bsz``.
+  - ``"dflash"``: DFlash's fixed positional decay, reduced as a weighted mean.
+  - the ``"dpace*"`` values: D-PACE weights, exactly as ``dflash_family_model``
+    computes them (``"mmflash"`` coincides with its cumulative-only variant).
 * ``g_k in [0, 1]`` is the token's visual grounding from the per-token
   ``visual_score`` channel (``specforge.data.visual_score``): how much the
   target's next-token distribution moves when the image is taken away, gated
@@ -67,11 +72,12 @@ if hasattr(torch, "npu") and torch.npu.is_available():
 
 _VALID_LOSS_TYPES = {
     "dflash",
+    "mmflash",
     "dpace",
     "dpace-cumulative-confidence-only",
     "dpace-continuation-value-only",
 }
-_DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
+_DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash", "mmflash"}
 
 
 def compute_accept_len(
@@ -176,6 +182,7 @@ class OnlineMMFlashModel(nn.Module):
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
         visual_alpha: float = 1.0,
+        mmflash_smoothing: float = 0.5,
     ):
         super().__init__()
         if loss_type not in _VALID_LOSS_TYPES:
@@ -186,6 +193,8 @@ class OnlineMMFlashModel(nn.Module):
             raise ValueError(f"dpace_alpha must be in [0, 1], got {dpace_alpha}")
         if not visual_alpha >= 0.0:
             raise ValueError(f"visual_alpha must be >= 0, got {visual_alpha}")
+        if not 0.0 <= mmflash_smoothing <= 1.0:
+            raise ValueError(f"mmflash_smoothing must be in [0, 1], got {mmflash_smoothing}")
         if objective_chunk_blocks < 0:
             raise ValueError("objective_chunk_blocks must be >= 0")
 
@@ -201,6 +210,8 @@ class OnlineMMFlashModel(nn.Module):
         # the base (verification-aware) weight of every token, see the module doc
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
+        # floor of the smoothed confidence inside the "mmflash" prefix weight
+        self.mmflash_smoothing = float(mmflash_smoothing)
         # upper bound of the visual multiplier 1 + visual_alpha * g * (1 - p)
         self.visual_alpha = float(visual_alpha)
         self._objective_printed = False
@@ -368,12 +379,9 @@ class OnlineMMFlashModel(nn.Module):
     ) -> torch.Tensor:
         """The verification-aware base weight of every position, per ``loss_type``.
 
-        Exactly what ``dflash_family_model`` computes for the same
-        ``loss_type`` -- the fixed positional decay for ``"dflash"``, the raw
-        D-PACE weights otherwise -- and applied to every row alike, image or
-        text. Nothing is rescaled: D-PACE's between-block emphasis (a block the
-        draft is confident about carries more total weight) is part of the
-        objective and is kept.
+        Applied to every row alike, image or text, and never rescaled: a block
+        the draft is confident about carries more total weight than one it is
+        unsure about, which is part of the objective.
         """
         if self.loss_type == "dflash":
             if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
@@ -382,11 +390,19 @@ class OnlineMMFlashModel(nn.Module):
                 )
                 return decay.expand_as(weight_mask)
             return torch.ones_like(weight_mask)
-        if self.loss_type not in _DPACE_LOSS_TYPES:  # defensive, validated in __init__
-            raise ValueError(f"unknown loss_type {self.loss_type!r}")
         # half-precision CE would make the cumulative products noisy; wider
         # dtypes (the tests run in float64) are kept as they are
         prob_dtype = torch.promote_types(neg_log_q.dtype, torch.float32)
+        if self.loss_type == "mmflash":
+            # prefix confidence: the smoothed probability that verification
+            # reaches position k. Positions the loss does not cover (and the
+            # anchor slot) are multiplicative no-ops so they never break a chain.
+            confidence = torch.exp(-neg_log_q.detach().to(prob_dtype))
+            smooth = (1.0 - self.mmflash_smoothing) * confidence + self.mmflash_smoothing
+            smooth = torch.where(weight_mask > 0, smooth, torch.ones_like(smooth))
+            return torch.cumprod(smooth, dim=-1)
+        if self.loss_type not in _DPACE_LOSS_TYPES:  # defensive, validated in __init__
+            raise ValueError(f"unknown loss_type {self.loss_type!r}")
         return self._dpace_weight(
             torch.exp(-neg_log_q.detach().to(prob_dtype)),
             weight_mask.to(prob_dtype),
@@ -488,6 +504,12 @@ class OnlineMMFlashModel(nn.Module):
             gamma = self.loss_decay_gamma
             base = f"dflash decay exp(-(k-1)/{gamma})" if gamma and gamma > 0 else "uniform"
             reduction = "sum(w*ce)/sum(w)"
+        elif self.loss_type == "mmflash":
+            base = (
+                "prefix confidence prod_(i<=k) ((1-lambda)*p_i + lambda), "
+                f"lambda={self.mmflash_smoothing}"
+            )
+            reduction = "sum(w*ce)/bsz"
         else:
             base = f"{self.loss_type} (dpace_alpha={self.dpace_alpha})"
             reduction = "sum(w*ce)/bsz"

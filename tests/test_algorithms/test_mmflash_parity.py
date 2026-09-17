@@ -162,11 +162,12 @@ class MMFlashParityTest(unittest.TestCase):
 
         draft = SimpleNamespace(config=SimpleNamespace(num_hidden_layers=3), target_layer_ids=[1, 5, 9])
         model = SimpleNamespace(block_size=16, mask_token_id=7, attention_backend="sdpa", num_anchors=32,
-                                loss_decay_gamma=None, loss_type="dflash", dpace_alpha=0.5, visual_alpha=1.0)
+                                loss_decay_gamma=None, loss_type="dflash", dpace_alpha=0.5, visual_alpha=1.0,
+                                mmflash_smoothing=0.5)
         d = self.dflash.providers.step.resume_contract(None, draft, model)
         m = self.mmflash.providers.step.resume_contract(None, draft, model)
         renamed = {k.replace("dflash_", "mmflash_", 1): v for k, v in d.items()}
-        self.assertEqual({**renamed, "mmflash_visual_alpha": 1.0}, m)
+        self.assertEqual({**renamed, "mmflash_visual_alpha": 1.0, "mmflash_smoothing": 0.5}, m)
         self.assertTrue(all(k.startswith("mmflash_") for k in m))
 
     # -- step strategy ------------------------------------------------------
@@ -190,10 +191,13 @@ class MMFlashParityTest(unittest.TestCase):
                           start="def compute_accept_len", stop="    def _dflash_objective_chunk_terms")
         mmflash = _code_of("specforge/algorithms/common/mmflash_model.py",
                            start="def compute_accept_len", stop="    def _base_weights")
-        # the constructor gained visual_alpha; strip those lines before comparing
+        # the constructor gained visual_alpha and mmflash_smoothing; strip
+        # those lines before comparing
         mmflash = "\n".join(
             line for line in mmflash.splitlines()
-            if "visual_alpha" not in line and "_objective_printed" not in line
+            if "visual_alpha" not in line
+            and "mmflash_smoothing" not in line
+            and "_objective_printed" not in line
         )
         self.assertEqual(_normalise(dflash), _normalise(mmflash))
 

@@ -29,7 +29,8 @@ data:
   cache_dir: "/local_home2/fengsicheng/specforge/.cache"
 training:
   strategy: "mmflash"
-  # loss_type: "dpace"
+  loss_type: "mmflash"
+  mmflash_smoothing: 0.5
   visual_alpha: 1.0
   num_epochs: 6
   # max_steps: 1000 # set for testing, comment out for full training
@@ -48,8 +49,8 @@ training:
 
 tracking:
   report_to: "tensorboard"
-run_id: "qwen3.5-4b-mmflash-llava-ov15-1M-prompted" # "qwen3.5-4b-mmflash-llava-ov15-1M-prompted"
-output_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted"
+run_id: "qwen3.5-4b-mmflash-llava-ov15-1M-prompted-mmloss" # "qwen3.5-4b-mmflash-llava-ov15-1M-prompted"
+output_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted-mmloss" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted"
 
 deployment:
   mode: disaggregated
@@ -57,8 +58,8 @@ deployment:
     nnodes: 1
     nproc_per_node: 3 # @sicheng: same as gpu count
   disaggregated:
-    control_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/control" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/control"
-    consumer_state_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/consumer-state" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/consumer-state"
+    control_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted-mmloss/control" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/control"
+    consumer_state_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted-mmloss/consumer-state" # "/local_home2/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M-prompted/consumer-state"
     backend: mooncake
     # server_urls:
     #   - http://127.0.0.1:30000

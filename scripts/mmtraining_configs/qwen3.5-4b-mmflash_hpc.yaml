@@ -30,10 +30,13 @@ training:
   strategy: "mmflash"
   # One objective for every token of every row:
   #   w = base * (1 + visual_alpha * g * (1 - p)),  loss = sum(w * ce) / bsz
-  # base = the loss_type weight (D-PACE: gradient of the expected accept
-  # length), g = visual grounding from the sidecar (0 on text rows), p = the
-  # draft's probability on the token. visual_alpha: 0 is exactly loss_type.
-  loss_type: "dpace"
+  # base = "mmflash": prefix confidence prod_{i<=k} ((1-s) p_i + s), the smoothed
+  # probability that verification reaches position k (s = mmflash_smoothing).
+  # Leave unset for dflash's fixed decay; "dpace" for D-PACE.
+  # g = visual grounding from the sidecar (0 on text rows), p = the draft's
+  # probability on the token. visual_alpha: 0 is exactly loss_type.
+  loss_type: "mmflash"
+  # mmflash_smoothing: 0.5
   visual_alpha: 1.0
   num_epochs: 6
   # max_steps: 1000 # set for testing, comment out for full training

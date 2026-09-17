@@ -213,20 +213,29 @@ def _naive_dpace_weight(prob, binary_mask, alpha, loss_type):
     raise ValueError(loss_type)
 
 
-def _naive_base(neg_log_q, mask, loss_type, dpace_alpha, gamma):
+def _naive_prefix_confidence(prob, mask, smoothing):
+    """mmflash base: smoothed probability that verification reaches position k."""
+    smooth = (1.0 - smoothing) * prob + smoothing
+    smooth = torch.where(mask > 0, smooth, torch.ones_like(smooth))
+    return torch.cumprod(smooth, dim=-1)
+
+
+def _naive_base(neg_log_q, mask, loss_type, dpace_alpha, gamma, smoothing=0.5):
     block_size = mask.shape[-1]
     positions = torch.arange(block_size, dtype=torch.double).view(1, 1, -1)
     if loss_type == "dflash":
         if gamma:
             return torch.exp(-(positions - 1).clamp(min=0) / gamma).expand_as(mask)
         return torch.ones_like(mask)
+    if loss_type == "mmflash":
+        return _naive_prefix_confidence(torch.exp(-neg_log_q), mask, smoothing)
     return _naive_dpace_weight(torch.exp(-neg_log_q), mask, dpace_alpha, loss_type)
 
 
-def _naive_loss(logits, targets, mask, g4d, *, loss_type, dpace_alpha, gamma, alpha):
-    """The objective as DFlash would compute ``loss_type``, times the multiplier."""
+def _naive_loss(logits, targets, mask, g4d, *, loss_type, dpace_alpha, gamma, alpha, smoothing=0.5):
+    """The ``loss_type`` base weight times the visual multiplier, reduced per base."""
     neg_log_q = _neg_log_q(logits, targets)
-    base = _naive_base(neg_log_q, mask, loss_type, dpace_alpha, gamma)
+    base = _naive_base(neg_log_q, mask, loss_type, dpace_alpha, gamma, smoothing)
     p = torch.exp(-neg_log_q)
     w = base * (1.0 + alpha * g4d * (1.0 - p)) * mask
     if loss_type == "dflash":
@@ -243,7 +252,7 @@ def _naive_accept_len(predicted, targets, mask):
     return ((reached > 0) & hit & (mask > 0.5)).sum(-1).double()
 
 
-ALL_LOSS_TYPES = ("dflash", "dpace", "dpace-cumulative-confidence-only", "dpace-continuation-value-only")
+ALL_LOSS_TYPES = ("dflash", "mmflash", "dpace", "dpace-cumulative-confidence-only", "dpace-continuation-value-only")
 
 
 # ----------------------------------------------------------------------------
@@ -289,6 +298,7 @@ class TestMMFlashObjective(unittest.TestCase):
         gamma = kwargs.get("loss_decay_gamma")
         alpha = kwargs.get("visual_alpha", 1.0)
         dpace_alpha = kwargs.get("dpace_alpha", 0.5)
+        smoothing = kwargs.get("mmflash_smoothing", 0.5)
         if visual_score is None:
             g4d = torch.zeros_like(self.g4d)
         else:
@@ -300,6 +310,7 @@ class TestMMFlashObjective(unittest.TestCase):
         return _naive_loss(
             self.logits, self.targets, self.mask, g4d,
             loss_type=loss_type, dpace_alpha=dpace_alpha, gamma=gamma, alpha=alpha,
+            smoothing=smoothing,
         )
 
     def _plain(self, loss_type, gamma=None):
@@ -327,8 +338,25 @@ class TestMMFlashObjective(unittest.TestCase):
         # the decay itself is evaluated in float32, exactly as DFlash does
         torch.testing.assert_close(got, self._plain("dflash", 7.0), rtol=1e-6, atol=1e-6)
 
+    def test_mmflash_base_is_the_prefix_confidence(self):
+        """loss_type="mmflash": base_k = prod_{i<=k} ((1-s) p_i + s), reduced / bsz."""
+        neg_log_q = _neg_log_q(self.logits, self.targets)
+        for smoothing in (0.3, 0.5, 0.7):
+            with self.subTest(smoothing=smoothing):
+                got, _ = self._run(None, loss_type="mmflash", mmflash_smoothing=smoothing)
+                prefix = _naive_prefix_confidence(torch.exp(-neg_log_q), self.mask, smoothing)
+                want = (neg_log_q * prefix * self.mask).sum() / float(self.logits.shape[0])
+                torch.testing.assert_close(got, want, rtol=0, atol=1e-9)
+                # the chain can only lose probability along the block (a masked
+                # position is a no-op, not a break), and never falls below s^k
+                self.assertTrue(bool((prefix[..., 1:] <= prefix[..., :-1] + 1e-12).all()))
+                floor = smoothing ** (self.block_size - 1)
+                self.assertTrue(bool((prefix >= floor - 1e-12).all()))
+        with self.assertRaises(ValueError):
+            _make_model(self.logits, self.anchors, self.keep_mask, loss_type="mmflash", mmflash_smoothing=1.5)
+
     def test_no_channel_is_dflash_dpace_bit_for_bit(self):
-        for loss_type in ALL_LOSS_TYPES[1:]:
+        for loss_type in ALL_LOSS_TYPES[2:]:
             with self.subTest(loss_type=loss_type):
                 got, _ = self._run(None, loss_type=loss_type, loss_decay_gamma=7.0)
                 torch.testing.assert_close(got, self._plain(loss_type), rtol=0, atol=1e-9)

@@ -74,6 +74,7 @@ def resume_contract(_config, draft_model, training_model):
         "mmflash_loss_type": str(training_model.loss_type),
         "mmflash_dpace_alpha": float(training_model.dpace_alpha),
         "mmflash_visual_alpha": float(training_model.visual_alpha),
+        "mmflash_smoothing": float(training_model.mmflash_smoothing),
     }
 
 

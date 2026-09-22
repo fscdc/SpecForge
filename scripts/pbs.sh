@@ -4,8 +4,8 @@
 #PBS -k oed
 #PBS -N pytorch
 #PBS -q auto
-#PBS -l select=1:ngpus=2
-#PBS -l walltime=18:00:00
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=20:00:00
 
 cd $PBS_O_WORKDIR;
 
@@ -17,8 +17,8 @@ cd $PBS_O_WORKDIR;
 # singularity exec -e $image bash << EOF > stdout.$PBS_JOBID 2> stderr.$PBS_JOBID
 
 
-# source ~/.bashrc
-# conda activate specforge
+source ~/.bashrc
+conda activate specforge
 
 
 # nvidia-smi > stdout.$PBS_JOBID 2> stderr.$PBS_JOBID
@@ -29,13 +29,14 @@ cd $PBS_O_WORKDIR;
 # bash ./scripts/data_hpc.sh
 # bash ./scripts/mmflash_data.sh
 
-bash scripts/benchmark_origin.sh
+# bash scripts/benchmark_origin.sh
+
 bash scripts/benchmark_baselines.sh
+bash scripts/benchmark_baselines-1.sh
+bash scripts/benchmark_baselines-2.sh
 
-# bash scripts/benchmark_baselines.sh
-# bash scripts/benchmark_baselines-1.sh
-# bash scripts/benchmark_baselines-2.sh
-
-
+bash scripts/benchmark_mmflash.sh
+bash scripts/benchmark_mmflash-1.sh
+bash scripts/benchmark_mmflash-2.sh
 
 EOF

@@ -117,9 +117,9 @@ IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
         # --speculative-eagle-topk 1 \
         # --speculative-num-draft-tokens 16 \
 
-NAME=mtp-15step_qwen35-9B_concurrency1
-# NAME=mtp-7step_qwen35-9B_concurrency1
-# NAME=mtp-3step_qwen35-9B_concurrency1
+NAME=mtp-15step_qwen35-4B_concurrency1
+# NAME=mtp-7step_qwen35-4B_concurrency1
+# NAME=mtp-3step_qwen35-4B_concurrency1
 
 SERVER_ADDRESSES=()
 PORTS=()
@@ -135,7 +135,7 @@ for idx in "${!GPU_IDS[@]}"; do
     PORTS+=("${port}")
     BASE_URLS+=("http://localhost:${port}")
     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
-        --model Qwen/Qwen3.5-9B \
+        --model Qwen/Qwen3.5-4B \
         --speculative-algorithm NEXTN \
         --speculative-num-steps 15 \
         --speculative-eagle-topk 1 \
@@ -187,32 +187,32 @@ fi
 
 # --save-generations \
 
-NAME="${NAME}_temp0_4096"
+RUN_NAME="${NAME}_temp0_4096"
 python benchmarks/bench_mm.py \
-    --model Qwen/Qwen3.5-9B \
+    --model Qwen/Qwen3.5-4B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
-    --benchmark-list chartqa:200 textvqa:200 mmstar:200 seedbench-image-origin:200 dynamath:200 mathvista:200 mathverse:200 \
+    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200 \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 4096 \
-    --name "${NAME}"
+    --name "${RUN_NAME}"
 
 
-NAME="${NAME}_temp1_4096"
+RUN_NAME="${NAME}_temp1_4096"
 python benchmarks/bench_mm.py \
-    --model Qwen/Qwen3.5-9B \
+    --model Qwen/Qwen3.5-4B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
-    --benchmark-list chartqa:200 textvqa:200 mmstar:200 seedbench-image-origin:200 dynamath:200 mathvista:200 mathverse:200 \
+    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200 \
     --reasoning off \
     --temperature 1.0 \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 4096 \
-    --name "${NAME}"
+    --name "${RUN_NAME}"
 
 # # for text benchmark
 # NAME="${NAME}_temp0"

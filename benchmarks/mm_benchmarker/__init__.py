@@ -21,10 +21,12 @@ The module then has to be imported below, otherwise the registration never runs.
 """
 
 from .chartqa import ChartQABenchmarker
+from .charxiv import CharXivBenchmarker
 from .dynamath import DynaMathBenchmarker
 from .mathverse import MathVerseBenchmarker
 from .mathvision import MathVisionBenchmarker
 from .mathvista import MathVistaBenchmarker
+from .mmbench import MMBenchBenchmarker
 from .mmmu import MMMUBenchmarker
 from .mmstar import MMStarBenchmarker
 from .ocrbench import OCRBenchBenchmarker
@@ -38,10 +40,12 @@ from .vdc import VDCBenchmarker
 __all__ = [
     "MM_BENCHMARKS",
     "ChartQABenchmarker",
+    "CharXivBenchmarker",
     "DynaMathBenchmarker",
     "MathVerseBenchmarker",
     "MathVisionBenchmarker",
     "MathVistaBenchmarker",
+    "MMBenchBenchmarker",
     "MMMUBenchmarker",
     "MMStarBenchmarker",
     "OCRBenchBenchmarker",

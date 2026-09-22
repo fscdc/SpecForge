@@ -1,8 +1,11 @@
+# DFlash baseline: z-lab's released Qwen3.5-4B drafter, same benchmark list and
+# settings as benchmark_mmflash.sh. Results resume into the existing
+# dflash_zlab_qwen35-4B_concurrency1_* files (already-recorded benchmarks are skipped).
+
 export CUDA_VISIBLE_DEVICES=0
 export SGLANG_FORCE_STREAM_INTERVAL=1
 
 GPU_IDS=(0)
-
 
 # for deep100
 # export LD_LIBRARY_PATH="/home/svu/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
@@ -13,8 +16,16 @@ GPU_IDS=(0)
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
 export FLASHINFER_USE_CUDA_NORM=1
 export SGLANG_NUMA_BIND_V2=0
-export HF_HUB_DISABLE_XET=1
 
+
+# z-lab/Qwen3.5-4B-DFlash
+# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v
+# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-hf 这个是一个只有1000step的test版本
+# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-50000 用llava那个数据集训的baseline版本，数据没有改prompt
+# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-prompted-final
+
+
+BLOCK_SIZE=16
 
 # Patch the installed SGLang so every response carries its prefill/decode split
 # (first_token_latency / decode_latency). Must run before launch_server imports
@@ -22,11 +33,11 @@ export HF_HUB_DISABLE_XET=1
 bash scripts/benchmark_helper.sh || exit 1
 
 
-# The scheduler decides which GPUs this job gets and may name them by UUID
-# (GPU-xxxxxxxx-...), so GPU_IDS indexes into that list rather than assuming the
-# device numbers are 0,1,2,...
 IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
+
+       
+#  --speculative-draft-window-size 512 \
 SERVER_ADDRESSES=()
 PORTS=()
 BASE_URLS=()
@@ -36,12 +47,15 @@ for idx in "${!GPU_IDS[@]}"; do
         echo "GPU ${GPU_IDS[$idx]} is not among the ${#VISIBLE_GPUS[@]} GPU(s) of this job" >&2
         exit 1
     fi
-    port=$((30000 + idx * 10))
+    port=$((32100 + idx * 10))
     SERVER_ADDRESSES+=("localhost:${port}")
     PORTS+=("${port}")
     BASE_URLS+=("http://localhost:${port}")
     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
         --model Qwen/Qwen3.5-4B \
+        --speculative-algorithm DFLASH \
+        --speculative-draft-model-path z-lab/Qwen3.5-4B-DFlash \
+        --speculative-dflash-block-size ${BLOCK_SIZE} \
         --mem-fraction-static 0.7 \
         --tp 1 \
         --trust-remote-code \
@@ -85,48 +99,35 @@ if [ $? -ne 0 ]; then
 fi
 
 
-# # temperature = 1.0
-# python benchmarks/bench_mm.py \
-#     --model Qwen/Qwen3.5-4B \
-#     --base-url "${BASE_URLS[@]}" \
-#     --concurrency 1 \
-#     --block-size 0 \
-#     --benchmark-list chartqa:200 mmstar:200 \
-#     --reasoning off \
-#     --temperature 1.0 \
-#     --top-p 0.95 \
-#     --top-k 20 \
-#     --max-tokens 8192 \
-#     --name origin_qwen35-4B_concurrency1
-
-#     --save-generations \
+#  dynamath:200 mathvista:200 mathverse:200
 
 python benchmarks/bench_mm.py \
     --model Qwen/Qwen3.5-4B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
-    --block-size 0 \
-    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200 \
+    --block-size ${BLOCK_SIZE} \
+    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 4096 \
-    --name origin_qwen35-4B_concurrency1_temp0_4096
+    --name dflash_zlab_qwen35-4B_concurrency1_temp0_4096
 
-# # video
-# python benchmarks/bench_mm.py \
-#     --model Qwen/Qwen3.5-4B \
-#     --base-url "${BASE_URLS[@]}" \
-#     --concurrency 1 \
-#     --block-size 0 \
-#     --benchmark-list vdc:20 \
-#     --reasoning off \
-#     --temperature 0.0 \
-#     --top-p 0.95 \
-#     --top-k 20 \
-#     --max-tokens 4096 \
-#     --name video_origin_qwen35-4B_concurrency1_temp0_4096
+python benchmarks/bench_mm.py \
+    --model Qwen/Qwen3.5-4B \
+    --base-url "${BASE_URLS[@]}" \
+    --concurrency 1 \
+    --block-size ${BLOCK_SIZE} \
+    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
+    --reasoning off \
+    --temperature 1.0 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --max-tokens 4096 \
+    --name dflash_zlab_qwen35-4B_concurrency1_temp1_4096
+
+
 
 
 # # for text benchmark
@@ -134,14 +135,16 @@ python benchmarks/bench_mm.py \
 #     --model Qwen/Qwen3.5-4B \
 #     --base-url "${BASE_URLS[@]}" \
 #     --concurrency 1 \
-#     --block-size 0 \
+#     --block-size ${BLOCK_SIZE} \
 #     --benchmark-list gsm8k:200 \
 #     --reasoning off \
 #     --temperature 0.0 \
 #     --top-p 0.95 \
 #     --top-k 20 \
 #     --max-tokens 8192 \
-#     --name origin_qwen35-4B_concurrency1_temp0
+#     --name dflash_zlab_qwen35-4B_concurrency1
 
 
 pkill -f "sglang.launch_server"
+
+

@@ -1,0 +1,72 @@
+model:
+  target_model_path: "Qwen/Qwen3.5-4B"
+  draft_model_config: "configs/qwen3.5-4b-eagle3.json"
+  target_backend: sglang
+  # image+text capture: routes prompt building and server requests through the
+  # multimodal ServerInputAdapter. Requires a vision-language target model.
+  input_modality: image
+  trust_remote_code: true
+  # A VL checkpoint nests the text stack under model.language_model.* (the
+  # vision tower lives in model.visual.*), so the text-only key does not exist.
+  # lm_head_key is unused here because the model ties word embeddings.
+  embedding_key: "model.language_model.embed_tokens.weight"
+  # REQUIRED for EAGLE3 disaggregated (planning.py:172): producer and consumer
+  # cannot each derive their own mapping, so they must share this file.
+  vocab_mapping_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/vocab_mapping/qwen3.5-4b-eagle3.pt"
+  torch_dtype: "bfloat16"
+data:
+  train_data_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M-prompted_regen_first_turn.jsonl"
+  max_length: 4096
+  chat_template: "qwen3.5"
+  build_dataset_num_proc: 32
+  cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
+  # image_root stays empty: the regen records already carry absolute paths under
+  # .../specforge/data/llava-ov15-1M/.
+  # image_max_tokens stays 0 on purpose -- the capture server expands image_data
+  # with the checkpoint's own resolution, so a client-side cap desyncs the prompt.
+training:
+  strategy: "eagle3"
+  num_epochs: 6
+  # max_steps: 1000 # set for testing, comment out for full training
+  batch_size: 1
+  learning_rate: 0.0001
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "flex_attention"
+  save_interval: 10000
+  log_interval: 50
+  dist_timeout: 30
+  seed: 0
+
+tracking:
+  report_to: "tensorboard"
+run_id: "qwen3.5-4b-eagle3-llava-ov15-1M"
+output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-eagle3-llava-ov15-1M"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1 # @sicheng: trainer GPUs only; the capture GPU is separate
+  disaggregated:
+    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-eagle3-llava-ov15-1M/control"
+    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-eagle3-llava-ov15-1M/consumer-state"
+    backend: mooncake
+
+    # managed_local: the CLI supervises Mooncake and the SGLang capture server
+    # itself, so nothing has to be started by hand. It derives the server URLs
+    # and Mooncake endpoints, which is why none of them may be set here.
+    managed_local:
+      # trainer (consumer) GPUs — must stay disjoint from the capture server's
+      trainer_cuda_visible_devices:
+        - "1"
+      mooncake:
+        protocol: tcp
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices:
+            - "0"
+          tp_size: 1
+          # GPU 0 is shared with other jobs, so size the static pool to the free
+          # memory rather than to the whole card.
+          mem_fraction_static: 0.80

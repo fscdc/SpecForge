@@ -1,0 +1,94 @@
+model:
+  target_model_path: "Qwen/Qwen3.5-9B"
+  draft_model_config: "configs/qwen3.5-9b-mmflash.json"
+  target_backend: sglang
+  # image+text capture: routes prompt building and server requests through the
+  # multimodal ServerInputAdapter. Requires a vision-language target model.
+  input_modality: image
+  trust_remote_code: true
+  # A VL checkpoint nests the text stack under model.language_model.* (the
+  # vision tower lives in model.visual.*), so the text-only key does not exist.
+  # Unlike the 4B, Qwen3.5-9B does NOT tie word embeddings (tie_word_embeddings:
+  # false), so lm_head_key is read for real; the checkpoint carries a top-level
+  # lm_head.weight, which is the schema default and is spelled out here.
+  embedding_key: "model.language_model.embed_tokens.weight"
+  lm_head_key: "lm_head.weight"
+  torch_dtype: "bfloat16"
+data:
+  # Copy the finished 9B regen over from the HPC regen_data directory first.
+  train_data_path: "/local_home2/fengsicheng/specforge/regen_data/qwen35-9B_llava-ov15-1M-prompted_regen_first_turn.jsonl"
+  # Per-token visual-grounding scores for the row ids of THIS train_data_path,
+  # written by scripts/score_visual_kl_hpc.sh (which reads both fields from this
+  # file). The scores are TARGET-specific (they come from the 9B's own logits),
+  # so the 4B sidecar cannot be reused: run
+  #   bash scripts/score_visual_kl_hpc.sh scripts/mmtraining_configs/qwen3.5-9b-mmflash.yaml
+  # first; it reads train_data_path and writes into this directory. Empty: g=0
+  # everywhere, the plain loss_type objective on every row.
+  visual_score_path: "/local_home2/fengsicheng/specforge/visual_kl/qwen35-9B-llava-ov15-1M-prompted"
+  visual_score_transform: "quantile"   # quantile | saturate | binary | identity
+  # g = transform(KL) * exp(-entropy): high only where the image both changes
+  # AND settles the target's prediction. false = raw KL rank (ablation).
+  visual_score_confidence_gate: true
+  max_length: 4096
+  chat_template: "qwen3.5"
+  build_dataset_num_proc: 32
+  cache_dir: "/local_home2/fengsicheng/specforge/.cache"
+training:
+  strategy: "mmflash"
+  loss_type: "mmflash"
+  mmflash_smoothing: 0.5
+  visual_alpha: 1.0
+  num_epochs: 6
+  # max_steps: 1000 # set for testing, comment out for full training
+  batch_size: 2
+  accumulation_steps: 4
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  attention_backend: "flex_attention"
+  num_anchors: 512
+  loss_decay_gamma: 7
+  save_interval: 50000
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: "tensorboard"
+run_id: "qwen3.5-9b-mmflash-llava-ov15-1M-prompted-mmloss"
+output_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-9b-mmflash-llava-ov15-1M-prompted-mmloss"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 3 # @sicheng: same as gpu count
+  disaggregated:
+    control_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-9b-mmflash-llava-ov15-1M-prompted-mmloss/control"
+    consumer_state_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-9b-mmflash-llava-ov15-1M-prompted-mmloss/consumer-state"
+    backend: mooncake
+    # server_urls:
+    #   - http://127.0.0.1:30000
+    # mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    # mooncake_master_server_addr: 127.0.0.1:35551
+    # mooncake_protocol: tcp
+
+    # managed_local: the CLI supervises Mooncake and the SGLang capture server
+    # itself, so nothing has to be started by hand. It derives the server URLs
+    # and Mooncake endpoints, which is why none of them may be set here.
+    managed_local:
+      # trainer (consumer) GPUs — must stay disjoint from the capture server's
+      trainer_cuda_visible_devices:
+        - "1"
+        - "2"
+        - "3"
+      mooncake:
+        protocol: tcp
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices:
+            - "0"
+          tp_size: 1
+          # GPU 2 is shared with other jobs, so size the static pool to the free
+          # memory rather than to the whole card.
+          mem_fraction_static: 0.80

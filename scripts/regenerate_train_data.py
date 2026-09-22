@@ -5,6 +5,7 @@ import mimetypes
 import os
 import random
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Sequence
@@ -592,6 +593,32 @@ def count_lines(path: str) -> int:
         return sum(1 for _ in handle)
 
 
+def collect_row_ids(path: str) -> set | None:
+    """Ids of every row in a regen JSONL file, or None if a row has no id.
+
+    A skipped row whose data was not an object is stored wrapped under
+    ``data`` (see ``set_skipped``); it carries no id, like any other row that
+    was written without one, and a single such row disables id-based resume
+    for the whole file.
+    """
+    ids: set = set()
+    if not os.path.exists(path):
+        return ids
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if isinstance(row, dict) and "id" not in row and "data" in row:
+                row = row["data"]
+            row_id = row.get("id") if isinstance(row, dict) else None
+            if row_id is None:
+                return None
+            ids.add(row_id)
+    return ids
+
+
 def input_has_image_field(path: str) -> bool:
     """Peek the first non-empty row to decide whether this input is
     multimodal. A single preparation run produces a homogeneous file (either
@@ -691,7 +718,11 @@ def parse_arguments():
     data_group.add_argument(
         "--resume",
         action="store_true",
-        help="Resume from existing output file, skip already processed samples",
+        help=(
+            "Resume from the existing output file: rows already regenerated, "
+            "skipped, or rejected are skipped (matched by id) and rows in the "
+            "error file are retried"
+        ),
     )
 
     # prompt alignment
@@ -1062,7 +1093,7 @@ def filter_regenerated(output_file_path: str) -> tuple[int, "Counter"]:
     with (
         open(output_file_path, encoding="utf-8") as source,
         open(kept_path, "w", encoding="utf-8") as keep,
-        open(rejected_path, "w", encoding="utf-8") as reject,
+        open(rejected_path, "a", encoding="utf-8") as reject,
     ):
         for line in source:
             line = line.strip()
@@ -1104,7 +1135,9 @@ def filter_regenerated(output_file_path: str) -> tuple[int, "Counter"]:
                 reject.write(json.dumps(data, ensure_ascii=False) + "\n")
                 reasons[reason] += 1
     os.replace(kept_path, output_file_path)
-    if not reasons:
+    # Appended rather than overwritten: a resumed run must still see the
+    # earlier rejects so it does not regenerate them again.
+    if os.path.getsize(rejected_path) == 0:
         os.unlink(rejected_path)
     else:
         print(f"  rejects written to {rejected_path}")
@@ -1224,23 +1257,65 @@ def main():
     total_lines = count_lines(args.input_file_path)
 
     skip_lines = 0
+    done_ids: set = set()
+    resume_by_id = False
     error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
     skipped_file_path = args.output_file_path.replace(".jsonl", "_skipped.jsonl")
+    rejected_file_path = args.output_file_path.replace(".jsonl", "_rejected.jsonl")
 
     if args.resume and os.path.exists(args.output_file_path):
         existing_success = count_lines(args.output_file_path)
-        existing_error = 0
-        if os.path.exists(error_file_path):
-            existing_error = count_lines(error_file_path)
-        existing_skipped = 0
-        if os.path.exists(skipped_file_path):
-            existing_skipped = count_lines(skipped_file_path)
-        skip_lines = existing_success + existing_error + existing_skipped
-        print(f"Resume mode enabled:")
+        existing_error = (
+            count_lines(error_file_path) if os.path.exists(error_file_path) else 0
+        )
+        existing_skipped = (
+            count_lines(skipped_file_path) if os.path.exists(skipped_file_path) else 0
+        )
+        existing_rejected = (
+            count_lines(rejected_file_path)
+            if os.path.exists(rejected_file_path)
+            else 0
+        )
+        # Resume by row id rather than by line count. Counting lines broke in
+        # two ways: the filter pass drops rows from the output, so the count
+        # fell short by the number of rejects and the tail of the input was
+        # regenerated twice; and a failed row counted as processed, so a
+        # server that died mid-run cost its share of the corpus for good.
+        # Rows in the output, skipped, and rejected files are done; rows in
+        # the error file are queued again, and the old error file is kept
+        # under a timestamped name.
+        id_sets = [
+            collect_row_ids(path)
+            for path in (args.output_file_path, skipped_file_path, rejected_file_path)
+        ]
+        print("Resume mode enabled:")
         print(f"  Found {existing_success} successful samples in output file")
         print(f"  Found {existing_error} error samples in error file")
         print(f"  Found {existing_skipped} skipped samples in skipped file")
-        print(f"  Skipping first {skip_lines} input samples")
+        print(f"  Found {existing_rejected} rejected samples in rejected file")
+        if all(ids is not None for ids in id_sets):
+            resume_by_id = True
+            done_ids = set().union(*id_sets)
+            skip_lines = len(done_ids)
+            if existing_error:
+                rotated = error_file_path.replace(
+                    ".jsonl", f".{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+                )
+                os.replace(error_file_path, rotated)
+                print(
+                    f"  Retrying the {existing_error} failed samples "
+                    f"(previous error file kept at {rotated})"
+                )
+            print(f"  Skipping {skip_lines} samples already done, matched by id")
+        else:
+            # Rows without an id: fall back to the positional skip.
+            skip_lines = (
+                existing_success + existing_error + existing_skipped + existing_rejected
+            )
+            print(
+                "  Rows carry no id; skipping the first "
+                f"{skip_lines} input samples (failed samples are not retried)"
+            )
         print("-" * 50)
 
         if skip_lines >= total_lines:
@@ -1273,6 +1348,9 @@ def main():
 
     # Determine file open mode based on resume flag
     file_mode = "a" if (args.resume and skip_lines > 0) else "w"
+    # With id-based resume the old error file was rotated away and every row
+    # in it is queued again, so this run's error file starts empty.
+    error_file_mode = "w" if resume_by_id else file_mode
     print(
         f"Regenerating dataset and saving the output to {args.output_file_path} and error log to {error_file_path}"
     )
@@ -1297,7 +1375,7 @@ def main():
     with (
         open(args.input_file_path, "r") as input_file,
         open(args.output_file_path, file_mode) as output_file_handle,
-        open(error_file_path, file_mode) as error_file_handle,
+        open(error_file_path, error_file_mode) as error_file_handle,
         open(skipped_file_path, file_mode, encoding="utf-8") as skipped_file_handle,
     ):
         executor = ThreadPoolExecutor(
@@ -1309,7 +1387,7 @@ def main():
         pbar = tqdm(total=total_lines, desc="Processing", initial=skip_lines)
         start_server_index = 0
 
-        if skip_lines > 0:
+        if skip_lines > 0 and not resume_by_id:
             print(f"Skipping {skip_lines} already processed samples...")
             for _ in range(skip_lines):
                 next(input_file, None)
@@ -1320,6 +1398,8 @@ def main():
                 break
 
             data = json.loads(line.strip())
+            if resume_by_id and isinstance(data, dict) and data.get("id") in done_ids:
+                continue
             unusable = sanitize_regen_row(data)
             if unusable is None and args.align_prompts:
                 # The terse rule runs FIRST. A text-math row can carry a terse

@@ -48,9 +48,19 @@ export HF_HUB_DOWNLOAD_TIMEOUT=120
 ####################################   up build data up   ##############################
 #################################### down regen data down ##########################
 
+# What this does, end to end:
+#   1. one SGLang server per GPU, each under a supervisor loop that relaunches
+#      it if it dies (a dead server used to silently fail every other row);
+#   2. regenerate_train_data.py --resume, repeated until its error file is
+#      empty: --resume skips rows already in the output/skipped/rejected files
+#      by id and re-queues everything in the error file, so a round only costs
+#      the rows that actually failed;
+#   3. a tally at the end that must add up to the input.
+# Re-running this script on an interrupted or half-failed output is the
+# intended way to finish it; nothing has to be moved or merged by hand.
 
-# for deep100
-export LD_LIBRARY_PATH="/home/svu/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
+# for deep100 (run after `conda activate specforge`, the path is taken from the env)
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 export FLASHINFER_USE_CUDA_NORM=1
 export NVCC_PREPEND_FLAGS="-ccbin g++-11"
 
@@ -59,133 +69,207 @@ export NVCC_PREPEND_FLAGS="-ccbin g++-11"
 # export FLASHINFER_USE_CUDA_NORM=1
 
 export PYTHONUNBUFFERED=1
-GPU_IDS=(0 1)
+
+# ----------------------------- settings -------------------------------------
+# All overridable from the environment, e.g.
+#   REGEN_GPUS="0 1 2 3" bash scripts/mmflash_data.sh
+MODEL="${REGEN_MODEL:-Qwen/Qwen3.5-9B}"
+# deep100: /local_home2/fengsicheng/specforge ; hpc: /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge
+DATA_ROOT="${REGEN_DATA_ROOT:-/local_home2/fengsicheng/specforge}"
+INPUT_FILE="${REGEN_INPUT:-${DATA_ROOT}/data/llava-ov15-1M_train.jsonl}"
+OUTPUT_FILE="${REGEN_OUTPUT:-${DATA_ROOT}/regen_data/qwen35-9B_llava-ov15-1M-prompted_regen_first_turn.jsonl}"
+# one server per entry; must match the job's GPU allocation (pbs.sh ngpus=)
+GPU_IDS=(${REGEN_GPUS:-0 1})
+CONCURRENCY="${REGEN_CONCURRENCY:-64}"   # in-flight requests per server
+MAX_TOKENS="${REGEN_MAX_TOKENS:-4096}"
+# --resume rounds: round 1 does the bulk, later rounds only re-queue the
+# rows that failed (a server restart window, a timeout). 4 is plenty.
+MAX_ROUNDS="${REGEN_MAX_ROUNDS:-4}"
+SERVER_TIMEOUT="${REGEN_SERVER_TIMEOUT:-900}"  # seconds to wait for a server to come up
+PORT_BASE=40000
 
 JOB_ID="${PBS_JOBID:-${SLURM_JOB_ID:-local}}"
 LOG_DIR="logs/regen_${JOB_ID}"
-
 mkdir -p "${LOG_DIR}"
 
+# Compile caches. ~/.bashrc points TRITON_CACHE_DIR at ONE shared directory on
+# /scratch. Two servers that start together JIT-compile the same kernels at the
+# same moment and race on it: one of them reads a .ptx/.json the other is in
+# the middle of replacing, gets FileNotFoundError, and its scheduler exits.
+# That is exactly what killed one server in each of the two 9B runs. One
+# directory per job and per GPU, like scripts/training.sh does per host.
+# deep100: /local_home2/fengsicheng/tmp ; hpc: /scratch/${USER}/tmp
+CACHE_ROOT="${SPECFORGE_CACHE_ROOT:-/local_home2/fengsicheng/tmp}"
+
+ERROR_FILE="${OUTPUT_FILE%.jsonl}_error.jsonl"
+SKIPPED_FILE="${OUTPUT_FILE%.jsonl}_skipped.jsonl"
+REJECTED_FILE="${OUTPUT_FILE%.jsonl}_rejected.jsonl"
+STOP_FILE="${LOG_DIR}/stop-servers"
+rm -f "${STOP_FILE}"
+
 SERVER_ADDRESSES=()
-SERVER_PIDS=()
+SUPERVISOR_PIDS=()
+
+count_lines() { if [ -f "$1" ]; then wc -l < "$1"; else echo 0; fi; }
 
 cleanup() {
     echo "[cleanup] stopping sglang servers..."
-
-    for pid in "${SERVER_PIDS[@]}"; do
-        if kill -0 "${pid}" 2>/dev/null; then
-            kill "${pid}" 2>/dev/null || true
-        fi
+    touch "${STOP_FILE}"
+    for pid_file in "${LOG_DIR}"/server_gpu*.pid; do
+        [ -f "${pid_file}" ] || continue
+        pid=$(cat "${pid_file}")
+        kill "${pid}" 2>/dev/null || true
     done
-
-    for pid in "${SERVER_PIDS[@]}"; do
+    for pid in "${SUPERVISOR_PIDS[@]}"; do
         wait "${pid}" 2>/dev/null || true
     done
-
     echo "[cleanup] all sglang servers stopped"
 }
 
 trap cleanup EXIT INT TERM
 
-echo "[info] log directory: ${LOG_DIR}"
-echo "[info] starting SGLang servers..."
+# Launch one server and relaunch it whenever it exits before we asked it to.
+# Rows that fail while a server is down are retried by the next --resume round.
+supervise_server() {
+    local gpu_id=$1 port=$2
+    local attempt=0 pid status
+    local cache_dir="${CACHE_ROOT}/triton-${JOB_ID}-gpu${gpu_id}"
+    local log="${LOG_DIR}/server_gpu${gpu_id}_port${port}.log"
+    local pid_file="${LOG_DIR}/server_gpu${gpu_id}.pid"
+    mkdir -p "${cache_dir}" "${cache_dir}-inductor" || {
+        echo "cannot create compile cache under ${CACHE_ROOT}; set SPECFORGE_CACHE_ROOT" >&2
+        return 1
+    }
+    while [ ! -f "${STOP_FILE}" ]; do
+        attempt=$((attempt + 1))
+        echo "[server] GPU ${gpu_id} port ${port}: launch #${attempt} ($(date '+%F %T'))"
+        TRITON_CACHE_DIR="${cache_dir}" \
+        TORCHINDUCTOR_CACHE_DIR="${cache_dir}-inductor" \
+        CUDA_VISIBLE_DEVICES="${gpu_id}" \
+        python3 -m sglang.launch_server \
+            --model "${MODEL}" \
+            --mem-fraction-static 0.7 \
+            --tp 1 \
+            --trust-remote-code \
+            --cuda-graph-max-bs 128 \
+            --attention-backend fa3 \
+            --mm-attention-backend sdpa \
+            --host 0.0.0.0 \
+            --port "${port}" \
+            --dtype bfloat16 \
+            --reasoning-parser qwen3 \
+            >> "${log}" 2>&1 &
+        pid=$!
+        echo "${pid}" > "${pid_file}"
+        wait "${pid}"
+        status=$?
+        rm -f "${pid_file}"
+        if [ -f "${STOP_FILE}" ]; then
+            break
+        fi
+        echo "[server] GPU ${gpu_id} port ${port}: exited with status ${status} ($(date '+%F %T')); relaunching in 15s (see ${log})" >&2
+        sleep 15
+    done
+}
 
-for idx in "${!GPU_IDS[@]}"; do
-    gpu_id="${GPU_IDS[$idx]}"
-    port=$((40000 + idx * 10))
-    addr="localhost:${port}"
-
-    SERVER_ADDRESSES+=("${addr}")
-
-    echo "[start] GPU ${gpu_id}, address ${addr}"
-
-    CUDA_VISIBLE_DEVICES="${gpu_id}" python3 -m sglang.launch_server \
-        --model Qwen/Qwen3.5-4B \
-        --mem-fraction-static 0.7 \
-        --tp 1 \
-        --trust-remote-code \
-        --cuda-graph-max-bs 128 \
-        --attention-backend fa3 \
-        --mm-attention-backend sdpa \
-        --host 0.0.0.0 \
-        --port "${port}" \
-        --dtype bfloat16 \
-        --reasoning-parser qwen3 \
-        > "${LOG_DIR}/server_gpu${gpu_id}_port${port}.log" 2>&1 &
-
-    SERVER_PIDS+=("$!")
-done
-
-WAIT_TIMEOUT=600
-
-echo "[wait] waiting for all servers to become ready..."
-
-for idx in "${!SERVER_ADDRESSES[@]}"; do
-    addr="${SERVER_ADDRESSES[$idx]}"
-    pid="${SERVER_PIDS[$idx]}"
-    start_ts=$(date +%s)
-
-    until ADDR="${addr}" python3 - <<'PY'
-import os
-import sys
-import urllib.request
-
-url = f"http://{os.environ['ADDR']}/health"
-
+server_healthy() {
+    if command -v curl > /dev/null 2>&1; then
+        curl -sf -m 5 "http://$1/health" > /dev/null 2>&1
+    else
+        ADDR="$1" python3 - <<'PY' > /dev/null 2>&1
+import os, sys, urllib.request
 try:
-    with urllib.request.urlopen(url, timeout=5) as response:
-        sys.exit(0 if response.status == 200 else 1)
+    with urllib.request.urlopen(f"http://{os.environ['ADDR']}/health", timeout=5) as r:
+        sys.exit(0 if r.status == 200 else 1)
 except Exception:
     sys.exit(1)
 PY
-    do
-        if ! kill -0 "${pid}" 2>/dev/null; then
-            echo "[error] server ${addr} (pid ${pid}) exited during startup" >&2
-            echo "[error] check logs in: ${LOG_DIR}" >&2
-            exit 1
-        fi
+    fi
+}
 
-        current_ts=$(date +%s)
-
-        if (( current_ts - start_ts >= WAIT_TIMEOUT )); then
-            echo "[error] timed out waiting for server ${addr}" >&2
-            echo "[error] check logs in: ${LOG_DIR}" >&2
-            exit 1
-        fi
-
-        sleep 10
+# Block until every server answers /health (they may be restarting).
+wait_for_servers() {
+    local addr start_ts now
+    for addr in "${SERVER_ADDRESSES[@]}"; do
+        start_ts=$(date +%s)
+        until server_healthy "${addr}"; do
+            now=$(date +%s)
+            if (( now - start_ts >= SERVER_TIMEOUT )); then
+                echo "[error] timed out waiting for server ${addr}; check ${LOG_DIR}" >&2
+                return 1
+            fi
+            sleep 10
+        done
+        echo "[ready] server ${addr} is up"
     done
+}
 
-    echo "[ready] server ${addr} is up"
+run_regen_round() {
+    python3 scripts/regenerate_train_data.py \
+        --model "${MODEL}" \
+        --concurrency "${CONCURRENCY}" \
+        --max-tokens "${MAX_TOKENS}" \
+        --server-address "${SERVER_ADDRESSES[@]}" \
+        --temperature 0.0 \
+        --top-p 0.95 \
+        --top-k 20 \
+        --input-file-path "${INPUT_FILE}" \
+        --output-file-path "${OUTPUT_FILE}" \
+        --resume \
+        --reasoning disable \
+        --align-prompts
+}
+
+echo "[info] job ${JOB_ID}; log directory: ${LOG_DIR}"
+echo "[info] model ${MODEL}; GPUs ${GPU_IDS[*]}; ${CONCURRENCY} in-flight requests per server"
+echo "[info] input  ${INPUT_FILE}"
+echo "[info] output ${OUTPUT_FILE}"
+echo "[info] already on disk: $(count_lines "${OUTPUT_FILE}") regenerated, $(count_lines "${ERROR_FILE}") failed (will be retried), $(count_lines "${SKIPPED_FILE}") skipped, $(count_lines "${REJECTED_FILE}") rejected"
+
+echo "[info] starting SGLang servers..."
+for idx in "${!GPU_IDS[@]}"; do
+    gpu_id="${GPU_IDS[$idx]}"
+    port=$((PORT_BASE + idx * 10))
+    SERVER_ADDRESSES+=("localhost:${port}")
+    supervise_server "${gpu_id}" "${port}" &
+    SUPERVISOR_PIDS+=("$!")
 done
 
-echo "[run] all servers ready, starting regeneration..."
-echo "[run] regen log: ${LOG_DIR}/regen.log"
+echo "[wait] waiting for all servers to become ready..."
+wait_for_servers || exit 1
 
+TOTAL_INPUT=$(count_lines "${INPUT_FILE}")
+prev_failed=-1
+for round in $(seq 1 "${MAX_ROUNDS}"); do
+    echo "[round ${round}/${MAX_ROUNDS}] $(date '+%F %T') regenerating; log: ${LOG_DIR}/regen.log"
+    # a server may be mid-restart; the client drops any server that is down
+    # when it starts, so make sure they are all back first
+    wait_for_servers || exit 1
+    echo "==================== round ${round} $(date '+%F %T') ====================" >> "${LOG_DIR}/regen.log"
+    if ! run_regen_round >> "${LOG_DIR}/regen.log" 2>&1; then
+        status=$?
+        echo "[error] regeneration exited with ${status} in round ${round}; check ${LOG_DIR}/regen.log" >&2
+        exit "${status}"
+    fi
+    failed=$(count_lines "${ERROR_FILE}")
+    echo "[round ${round}] done: $(count_lines "${OUTPUT_FILE}") regenerated, ${failed} failed"
+    if [ "${failed}" -eq 0 ]; then
+        break
+    fi
+    if [ "${prev_failed}" -ge 0 ] && [ "${failed}" -ge "${prev_failed}" ]; then
+        echo "[error] round ${round} made no progress (${failed} failures, previously ${prev_failed}); the servers are probably unhealthy, check ${LOG_DIR}" >&2
+        exit 1
+    fi
+    prev_failed=${failed}
+    echo "[round ${round}] ${failed} rows failed (Connection error / timeout); retrying them"
+done
 
-# TODO@song: 这地方换成自己的路径即可
-# hpc
-# /scratch/Projects/CFP-04/CFP04-CF-054
-if python3 scripts/regenerate_train_data.py \
-    --model Qwen/Qwen3.5-4B \
-    --concurrency 64 \
-    --max-tokens 4096 \
-    --server-address "${SERVER_ADDRESSES[@]}" \
-    --temperature 0.0 \
-    --top-p 0.95 \
-    --top-k 20 \
-    --input-file-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/data/llava-ov15-1M_train.jsonl \
-    --output-file-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M-prompted_regen_first_turn.jsonl \
-    --resume \
-    --reasoning disable \
-    --align-prompts \
-    > "${LOG_DIR}/regen.log" 2>&1
-then
-    echo "[done] regeneration finished successfully"
-else
-    status=$?
-    echo "[error] regeneration failed with exit code ${status}" >&2
-    echo "[error] check log: ${LOG_DIR}/regen.log" >&2
-    exit "${status}"
+success=$(count_lines "${OUTPUT_FILE}")
+failed=$(count_lines "${ERROR_FILE}")
+skipped=$(count_lines "${SKIPPED_FILE}")
+rejected=$(count_lines "${REJECTED_FILE}")
+echo "[done] $(date '+%F %T') input ${TOTAL_INPUT} = regenerated ${success} + failed ${failed} + skipped ${skipped} + rejected ${rejected} (sum $((success + failed + skipped + rejected)))"
+if [ "${failed}" -ne 0 ]; then
+    echo "[done] ${failed} rows still failed after ${MAX_ROUNDS} rounds; re-run this script to retry them" >&2
+    exit 1
 fi
-

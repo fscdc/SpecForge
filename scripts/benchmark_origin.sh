@@ -1,4 +1,5 @@
 export CUDA_VISIBLE_DEVICES=0
+export SGLANG_FORCE_STREAM_INTERVAL=1
 
 GPU_IDS=(0)
 
@@ -45,7 +46,7 @@ for idx in "${!GPU_IDS[@]}"; do
         --tp 1 \
         --trust-remote-code \
         --cuda-graph-max-bs 128 \
-        --attention-backend fa3 \
+        --attention-backend triton \
         --mm-attention-backend sdpa \
         --host 0.0.0.0 \
         --port ${port} \
@@ -98,26 +99,23 @@ fi
 #     --max-tokens 8192 \
 #     --name origin_qwen35-4B_concurrency1
 
-# temperature = 0.0
 #     --save-generations \
-# chartqa:200 mmstar:200 mmmu:200 textvqa:200 dynamath:200 seedbench-image-origin:200 mathvision:200 
-# realworldqa:200 seedbench-image:200 mmstar-origin:200 mmmu-origin:200
+
+python benchmarks/bench_mm.py \
+    --model Qwen/Qwen3.5-4B \
+    --base-url "${BASE_URLS[@]}" \
+    --concurrency 1 \
+    --block-size 0 \
+    --benchmark-list chartqa:200 textvqa:200 mmstar:200 seedbench-image-origin:200 dynamath:200 mathvista:200 mathverse:200 \
+    --reasoning off \
+    --temperature 0.0 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --max-tokens 4096 \
+    --name origin_qwen35-4B_concurrency1_temp0_4096_test_triton
 
 # python benchmarks/bench_mm.py \
-#     --model Qwen/Qwen3.5-9B \
-#     --base-url "${BASE_URLS[@]}" \
-#     --concurrency 1 \
-#     --block-size 0 \
-#     --benchmark-list chartqa:200 textvqa:200 mmstar:200 seedbench-image-origin:200 dynamath:200 mathvista:200 mathverse:200 \
-#     --reasoning off \
-#     --temperature 0.0 \
-#     --top-p 0.95 \
-#     --top-k 20 \
-#     --max-tokens 4096 \
-#     --name origin_qwen35-9B_concurrency1_temp0_4096
-
-# python benchmarks/bench_mm.py \
-#     --model Qwen/Qwen3.5-9B \
+#     --model Qwen/Qwen3.5-4B \
 #     --base-url "${BASE_URLS[@]}" \
 #     --concurrency 1 \
 #     --block-size 0 \
@@ -127,21 +125,21 @@ fi
 #     --top-p 0.95 \
 #     --top-k 20 \
 #     --max-tokens 4096 \
-#     --name origin_qwen35-9B_concurrency1_temp1_4096
+#     --name origin_qwen35-4B_concurrency1_temp1_4096
 
-# video
-python benchmarks/bench_mm.py \
-    --model Qwen/Qwen3.5-4B \
-    --base-url "${BASE_URLS[@]}" \
-    --concurrency 1 \
-    --block-size 0 \
-    --benchmark-list vdc:20 \
-    --reasoning off \
-    --temperature 0.0 \
-    --top-p 0.95 \
-    --top-k 20 \
-    --max-tokens 4096 \
-    --name origin_qwen35-4B_concurrency1_temp0_4096
+# # video
+# python benchmarks/bench_mm.py \
+#     --model Qwen/Qwen3.5-4B \
+#     --base-url "${BASE_URLS[@]}" \
+#     --concurrency 1 \
+#     --block-size 0 \
+#     --benchmark-list vdc:20 \
+#     --reasoning off \
+#     --temperature 0.0 \
+#     --top-p 0.95 \
+#     --top-k 20 \
+#     --max-tokens 4096 \
+#     --name video_origin_qwen35-4B_concurrency1_temp0_4096
 
 
 # # for text benchmark

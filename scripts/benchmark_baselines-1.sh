@@ -1,8 +1,5 @@
-# Speculative-decoding baselines for Qwen3.5-4B on the multimodal suite.
-# Uncomment ONE launch block below; the health poll and the benchmark call at
-# the bottom are shared and only read ${NAME}.
-
 export CUDA_VISIBLE_DEVICES=0
+export SGLANG_FORCE_STREAM_INTERVAL=1
 
 GPU_IDS=(0)
 
@@ -19,12 +16,7 @@ export SGLANG_NUMA_BIND_V2=0
 
 EAGLE3_DRAFT_MODEL_PATH="${EAGLE3_DRAFT_MODEL_PATH:-/TODO/exports/qwen3.5-4b-eagle3-sglang}"
 
-# The scheduler decides which GPUs this job gets and may name them by UUID
-# (GPU-xxxxxxxx-...), so GPU_IDS indexes into that list rather than assuming the
-# device numbers are 0,1,2,...
-# Patch the installed SGLang so every response carries its prefill/decode split
-# (first_token_latency / decode_latency). Must run before launch_server imports
-# tokenizer_manager.py. `bash scripts/benchmark_helper.sh --unpatch` undoes it.
+
 bash scripts/benchmark_helper.sh || exit 1
 
 

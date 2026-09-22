@@ -17,17 +17,20 @@ cd $PBS_O_WORKDIR;
 # singularity exec -e $image bash << EOF > stdout.$PBS_JOBID 2> stderr.$PBS_JOBID
 
 
-source ~/.bashrc
+# source ~/.bashrc
+# conda activate specforge
+
 
 # nvidia-smi > stdout.$PBS_JOBID 2> stderr.$PBS_JOBID
 # conda env list > stdout.$PBS_JOBID 2> stderr.$PBS_JOBID
 
-conda activate specforge
+
 
 # bash ./scripts/data_hpc.sh
-bash ./scripts/mmflash_data.sh
+# bash ./scripts/mmflash_data.sh
 
-# bash scripts/benchmark_origin.sh
+bash scripts/benchmark_origin.sh
+bash scripts/benchmark_baselines.sh
 
 # bash scripts/benchmark_baselines.sh
 # bash scripts/benchmark_baselines-1.sh

@@ -1,0 +1,154 @@
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3164,6 +3164,7 @@
+         """Run a batch."""
+         self.forward_ct += 1
+         batch.forward_iter = self.forward_ct
++        self.metrics_reporter.phase_mark_launch()
+ 
+         if self.scripted_scheduler_hook is not None:
+             self.scripted_scheduler_hook.on_run_batch(batch)
+@@ -3383,6 +3384,7 @@
+         batch: ScheduleBatch,
+         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+     ):
++        self.metrics_reporter.phase_account_step(batch)
+         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+ 
+         if batch.forward_mode.is_decode():
+@@ -3464,6 +3466,7 @@
+         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+         if not self.is_fully_idle():
+             return
++        self.metrics_reporter.phase_reset_clock()
+ 
+         # memory leak check (skipped for hisparse — pool counters intentionally
+         # diverge during host-backup, see _get_swa_token_info clamp).
+@@ -3684,6 +3687,7 @@
+     def get_internal_state(self, recv_req: GetInternalStateReq):
+         ret = dict(vars(get_global_server_args()))  # vars returns a ref to obj.__dict__
+         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
++        ret["phase_accounting"] = self.metrics_reporter.phase_accounting()
+         ret["memory_usage"] = {
+             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
+             "kvcache": round(
+--- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
++++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+@@ -125,6 +125,23 @@
+         self.last_gen_throughput: float = 0.0
+         self.last_input_throughput: float = 0.0
+         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
++
++        # Phase accounting (SpecForge benchmark patch). Wall time of the
++        # scheduler loop attributed to the forward mode of the batch whose
++        # result is being processed, so a benchmark client can separate the
++        # prefill from the decode at any concurrency. Read back through
++        # get_internal_state(); nothing here feeds the log lines or the
++        # Prometheus metrics, and the per-step cost is two perf_counter calls.
++        self.phase_time = {"extend": 0.0, "decode": 0.0, "other": 0.0}
++        self.phase_steps = {"extend": 0, "decode": 0, "other": 0}
++        self.phase_decode_tokens = 0
++        self.phase_decode_bs_sum = 0
++        self.phase_prefill_tokens = 0
++        self.phase_prefill_seqs = 0
++        self.phase_decode_time_by_bs = defaultdict(float)
++        self.phase_decode_steps_by_bs = defaultdict(int)
++        self.phase_decode_tokens_by_bs = defaultdict(int)
++        self.phase_last_tic = None
+         self.stats = SchedulerStats()
+         self._graph_backend_label = {
+             "cpu": "cpu graph",
+@@ -344,6 +361,71 @@
+             "num_draft_tokens": num_draft_tokens or 0,
+         }
+ 
++    def phase_mark_launch(self):
++        """Start the phase clock on the first batch after an idle stretch."""
++        if self.phase_last_tic is None:
++            self.phase_last_tic = time.perf_counter()
++
++    def phase_reset_clock(self):
++        """The scheduler is idle: the next interval must not include the wait."""
++        self.phase_last_tic = None
++
++    def phase_account_step(self, batch: ScheduleBatch):
++        """Attribute the time since the previous step to this batch's phase.
++
++        Called from Scheduler.process_batch_result. Under the overlap loop the
++        GPU runs batch k while the CPU processes batch k-1, so the interval
++        between two consecutive calls is what one step costs end to end
++        (target, draft, sampling and scheduler overhead alike), and the batch
++        being processed is the one that just held the GPU. Spec-decoding
++        batches are DECODE at this level; TARGET_VERIFY is the model-side name.
++        """
++        now = time.perf_counter()
++        if self.phase_last_tic is None:
++            self.phase_last_tic = now
++            return
++        elapsed = now - self.phase_last_tic
++        self.phase_last_tic = now
++        mode = batch.forward_mode
++        if mode.is_decode() or mode.is_target_verify():
++            bs = batch.batch_size()
++            self.phase_time["decode"] += elapsed
++            self.phase_steps["decode"] += 1
++            self.phase_decode_bs_sum += bs
++            self.phase_decode_time_by_bs[bs] += elapsed
++            self.phase_decode_steps_by_bs[bs] += 1
++        elif mode.is_extend():
++            self.phase_time["extend"] += elapsed
++            self.phase_steps["extend"] += 1
++        else:
++            self.phase_time["other"] += elapsed
++            self.phase_steps["other"] += 1
++
++    def phase_account_decode_tokens(self, bs: int, decode_tokens: int):
++        """Tokens a decode step produced: one per request plus accepted drafts."""
++        self.phase_decode_tokens += decode_tokens
++        self.phase_decode_tokens_by_bs[bs] += decode_tokens
++
++    def phase_accounting(self) -> dict:
++        """Lifetime counters; a client takes differences around its run."""
++        return {
++            "time": dict(self.phase_time),
++            "steps": dict(self.phase_steps),
++            "decode_tokens": self.phase_decode_tokens,
++            "decode_bs_sum": self.phase_decode_bs_sum,
++            "prefill_tokens": self.phase_prefill_tokens,
++            "prefill_seqs": self.phase_prefill_seqs,
++            "decode_time_by_bs": {
++                str(k): v for k, v in self.phase_decode_time_by_bs.items()
++            },
++            "decode_steps_by_bs": {
++                str(k): v for k, v in self.phase_decode_steps_by_bs.items()
++            },
++            "decode_tokens_by_bs": {
++                str(k): v for k, v in self.phase_decode_tokens_by_bs.items()
++            },
++        }
++
+     def update_spec_metrics(self, bs: int, num_correct_drafts: int):
+         self.spec_num_accept_tokens += num_correct_drafts + bs
+         self.spec_num_forward_ct += bs
+@@ -499,6 +581,10 @@
+         can_run_cuda_graph: bool,
+         dp_cooperation_info: Optional[DPCooperationInfo] = None,
+     ):
++        # Phase accounting: every prefill batch, ahead of the metrics gate below
++        self.phase_prefill_tokens += int(prefill_stats.log_input_tokens)
++        self.phase_prefill_seqs += int(prefill_stats.num_new_seqs)
++
+         if (
+             not self.is_stats_logging_rank
+             and not self.current_scheduler_metrics_enabled
+@@ -645,6 +731,10 @@
+         num_correct_drafts: int = 0,
+     ):
+         batch = running_batch or self.scheduler.running_batch
++        # Phase accounting: every decode step, ahead of the metrics gates below
++        self.phase_account_decode_tokens(
++            batch.batch_size(), batch.batch_size() + num_correct_drafts
++        )
+ 
+         # Every-iteration work: realtime token counting + status logger
+         if self.current_scheduler_metrics_enabled:

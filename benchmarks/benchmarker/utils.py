@@ -204,6 +204,42 @@ def _finite(stats: List[Dict[str, Any]], key: str) -> Optional[List[float]]:
     return values
 
 
+def decode_busy_time(stats: List[Dict[str, Any]]) -> Optional[float]:
+    """Seconds during which at least one request was in its decode phase.
+
+    Each request's window is [send + first_token_latency, send + e2e_latency]
+    on the client's timeline (`send_offset`, seconds since the run started);
+    the server-side latencies are shifted by the client's send time, so the
+    request's queueing before the server stamps it (well under a millisecond
+    here) is the only approximation. Overlapping windows are merged so a batch
+    step shared by N requests is counted once. None when any record lacks one
+    of the three fields, for the same all-or-nothing reason as `_finite`.
+    """
+    sends = _finite(stats, "send_offset")
+    ttfts = _finite(stats, "first_token_latency")
+    e2es = _finite(stats, "e2e_latency")
+    if sends is None or ttfts is None or e2es is None:
+        return None
+    windows = sorted(
+        (send + ttft, send + e2e)
+        for send, ttft, e2e in zip(sends, ttfts, e2es)
+        if e2e > ttft
+    )
+    busy = 0.0
+    current_start: Optional[float] = None
+    current_end = 0.0
+    for start, end in windows:
+        if current_start is None or start > current_end:
+            if current_start is not None:
+                busy += current_end - current_start
+            current_start, current_end = start, end
+        elif end > current_end:
+            current_end = end
+    if current_start is not None:
+        busy += current_end - current_start
+    return busy
+
+
 def throughput_summary(
     stats: List[Dict[str, Any]], latency: float
 ) -> Optional[Dict[str, Any]]:
@@ -220,6 +256,17 @@ def throughput_summary(
     Everything is token-weighted (sum over sum), not a mean of per-request
     ratios, so one short request cannot dominate. The decode phase counts
     `completion_tokens - 1` tokens: the first one is what TTFT ends on.
+
+    `decode_output_throughput` divides by the SUM of the per-request decode
+    latencies. With one request in flight that sum is the wall time spent
+    decoding, but with N in flight the same batch step is counted once per
+    request, so it turns into a per-request speed. `decode_busy_throughput`
+    is the system figure: the same tokens over the union of the requests'
+    decode windows on one timeline (client send offset + server TTFT to
+    client send offset + server e2e latency), so overlapping windows are
+    counted once. `decode_overlap` is their ratio, the mean number of
+    requests decoding at once; at concurrency 1 it is 1 and the two
+    throughputs agree.
     """
     if not stats:
         return None
@@ -259,10 +306,142 @@ def throughput_summary(
         summary["decode_tokens"] = decoded
         summary["decode_latency_sum"] = sum(decode)
         summary["decode_output_throughput"] = decoded / sum(decode)
+        busy = decode_busy_time(stats)
+        if busy is not None and busy > 0:
+            summary["decode_busy_time"] = busy
+            summary["decode_busy_throughput"] = decoded / busy
+            summary["decode_overlap"] = sum(decode) / busy
 
     if "ttft_sum" in summary and "e2e_latency_sum" in summary:
         summary["prefill_share"] = summary["ttft_sum"] / summary["e2e_latency_sum"]
     return summary
+
+
+def phase_accounting_summary(
+    before: Optional[List[Dict[str, Any]]], after: Optional[List[Dict[str, Any]]]
+) -> Optional[Dict[str, Any]]:
+    """What the servers spent on each phase during the run.
+
+    `before` and `after` are the lifetime counters every server exposes under
+    /server_info with patches/sglang/v0.5.14/phase-accounting.patch, one dict
+    per server, and the run is their difference. Times are the scheduler's
+    wall clock attributed per batch, so `decode_time` is exactly the time the
+    server was stepping decode batches, whatever the concurrency: this is the
+    number the client-side decode throughput turns into once requests overlap
+    and one request's decode window contains another's prefill.
+
+    `decode_by_batch_size` is the same accounting split by how many requests
+    the step served, which is the curve that says how a method scales with
+    batch: step_ms(N) / tokens_per_step(N).
+    """
+    if not before or not after or len(before) != len(after):
+        return None
+
+    def delta(key: str, sub: Optional[str] = None) -> float:
+        total = 0.0
+        for old, new in zip(before, after):
+            if sub is None:
+                total += (new.get(key) or 0) - (old.get(key) or 0)
+            else:
+                total += (new.get(key) or {}).get(sub, 0) - (old.get(key) or {}).get(
+                    sub, 0
+                )
+        return total
+
+    def delta_by_bs(key: str) -> Dict[int, float]:
+        out: Dict[int, float] = {}
+        for old, new in zip(before, after):
+            for bs, value in (new.get(key) or {}).items():
+                diff = value - (old.get(key) or {}).get(bs, 0)
+                if diff:
+                    out[int(bs)] = out.get(int(bs), 0) + diff
+        return out
+
+    decode_time = delta("time", "decode")
+    prefill_time = delta("time", "extend")
+    other_time = delta("time", "other")
+    decode_steps = delta("steps", "decode")
+    prefill_steps = delta("steps", "extend")
+    decode_tokens = delta("decode_tokens")
+    decode_bs_sum = delta("decode_bs_sum")
+    prefill_tokens = delta("prefill_tokens")
+    busy = decode_time + prefill_time + other_time
+
+    summary: Dict[str, Any] = {
+        "servers": len(before),
+        "decode_time": decode_time,
+        "prefill_time": prefill_time,
+        "other_time": other_time,
+        "busy_time": busy,
+        "decode_steps": int(decode_steps),
+        "prefill_steps": int(prefill_steps),
+        "decode_tokens": int(decode_tokens),
+        "prefill_tokens": int(prefill_tokens),
+        "prefill_seqs": int(delta("prefill_seqs")),
+    }
+    if decode_time > 0:
+        summary["decode_step_throughput"] = decode_tokens / decode_time
+    if decode_steps > 0:
+        summary["mean_decode_batch"] = decode_bs_sum / decode_steps
+        summary["decode_step_ms"] = 1000.0 * decode_time / decode_steps
+        summary["tokens_per_decode_step"] = decode_tokens / decode_steps
+    if prefill_time > 0:
+        summary["prefill_step_throughput"] = prefill_tokens / prefill_time
+    if busy > 0:
+        summary["prefill_share"] = prefill_time / busy
+
+    time_by = delta_by_bs("decode_time_by_bs")
+    steps_by = delta_by_bs("decode_steps_by_bs")
+    tokens_by = delta_by_bs("decode_tokens_by_bs")
+    summary["decode_by_batch_size"] = {
+        str(bs): {
+            "steps": int(steps_by[bs]),
+            "step_ms": 1000.0 * time_by.get(bs, 0.0) / steps_by[bs],
+            "tokens": int(tokens_by.get(bs, 0)),
+            "throughput": (
+                tokens_by.get(bs, 0) / time_by[bs] if time_by.get(bs, 0) else None
+            ),
+        }
+        for bs in sorted(steps_by)
+        if steps_by[bs] > 0
+    }
+    return summary
+
+
+def format_phase_accounting(summary: Optional[Dict[str, Any]]) -> List[str]:
+    """The server-side phase lines `print_summary` shows."""
+    if not summary:
+        return []
+    lines = [
+        f"{'Server phases:':<18}prefill {summary['prefill_time']:,.1f}s"
+        f" ({summary.get('prefill_share', 0.0):.1%})"
+        f"   decode {summary['decode_time']:,.1f}s"
+        f"   other {summary['other_time']:,.1f}s"
+        f"   (scheduler wall clock per batch)"
+    ]
+    if "decode_step_throughput" in summary:
+        lines.append(
+            f"{'  decode (server):':<18}{summary['decode_step_throughput']:>10,.2f} tok/s"
+            f"   (decode tokens / decode-step time, prefill excluded)"
+        )
+    if "decode_step_ms" in summary:
+        lines.append(
+            f"{'  decode steps:':<18}{summary['decode_steps']:>10,d}"
+            f"   {summary['decode_step_ms']:.2f} ms/step, mean batch"
+            f" {summary['mean_decode_batch']:.2f},"
+            f" {summary['tokens_per_decode_step']:.2f} tok/step"
+        )
+    by_bs = summary.get("decode_by_batch_size") or {}
+    if by_bs:
+        # the buckets that carried the run, largest step counts first
+        top = sorted(by_bs.items(), key=lambda item: -item[1]["steps"])[:8]
+        parts = [
+            f"bs{bs} {cell['step_ms']:.1f}ms"
+            + (f" {cell['throughput']:,.0f}tok/s" if cell["throughput"] else "")
+            for bs, cell in sorted(top, key=lambda item: int(item[0]))
+        ]
+        lines.append(f"{'  by batch size:':<18}" + " | ".join(parts))
+    return lines
 
 
 def format_throughput_summary(summary: Optional[Dict[str, Any]]) -> List[str]:
@@ -286,7 +465,13 @@ def format_throughput_summary(summary: Optional[Dict[str, Any]]) -> List[str]:
     if "decode_output_throughput" in summary:
         lines.append(
             f"{'  decode:':<18}{summary['decode_output_throughput']:>10,.2f} tok/s"
-            f"   (output-1 / sum of decode latency)"
+            f"   (output-1 / sum of decode latency; per request when >1 in flight)"
+        )
+    if "decode_busy_throughput" in summary:
+        lines.append(
+            f"{'  decode (busy):':<18}{summary['decode_busy_throughput']:>10,.2f} tok/s"
+            f"   (output-1 / union of decode windows, "
+            f"{summary['decode_overlap']:.2f} requests decoding at once)"
         )
     if "ttft_mean" in summary:
         lines.append(

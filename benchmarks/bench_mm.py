@@ -63,6 +63,7 @@ import requests
 from benchmarker.utils import (
     BenchmarkMetrics,
     format_length_summary,
+    format_phase_accounting,
     format_throughput_summary,
     length_summary,
     load_results,
@@ -70,6 +71,7 @@ from benchmarker.utils import (
     per_sample_entropy_stats,
     results_path,
     save_results,
+    phase_accounting_summary,
     throughput_summary,
 )
 from mm_benchmarker import MM_BENCHMARKS
@@ -372,6 +374,31 @@ def response_meta_info(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload.get("meta_info") or {}
 
 
+def server_phase_accounting(
+    base_urls: Sequence[str],
+) -> Optional[List[Dict[str, Any]]]:
+    """Every server's lifetime phase counters, or None when any lacks them.
+
+    The counters come from patches/sglang/v0.5.14/phase-accounting.patch; a
+    stock server answers /server_info without the field and the run simply
+    records no server-side accounting. One dict per server, in `base_urls`
+    order, so two snapshots can be differenced pairwise.
+    """
+    snapshots = []
+    for base_url in base_urls:
+        try:
+            response = requests.get(base_url.rstrip("/") + "/server_info", timeout=60)
+            response.raise_for_status()
+            states = response.json().get("internal_states") or []
+        except (requests.RequestException, ValueError):
+            return None
+        accounting = states[0].get("phase_accounting") if states else None
+        if not isinstance(accounting, dict):
+            return None
+        snapshots.append(accounting)
+    return snapshots
+
+
 def flush_cache(base_urls: Sequence[str]) -> None:
     for base_url in base_urls:
         try:
@@ -507,7 +534,9 @@ def run_sample(
         reasoning=reasoning,
         top_logprobs=top_logprobs,
     )
+    send_time = time.perf_counter()
     payload = send_chat(base_url, body, timeout_s)
+    recv_time = time.perf_counter()
 
     choice = (payload.get("choices") or [{}])[0]
     message = choice.get("message") or {}
@@ -548,6 +577,10 @@ def run_sample(
         "e2e_latency": meta.get("e2e_latency"),
         "first_token_latency": meta.get("first_token_latency"),
         "decode_latency": meta.get("decode_latency"),
+        # client clock, absolute; run_requests turns these into offsets from the
+        # run's start so the requests' decode windows can be laid on one timeline
+        "send_time": send_time,
+        "recv_time": recv_time,
         "finish_reason": choice.get("finish_reason"),
         "generation": message.get("content") or "",
         "reasoning": message.get("reasoning_content") or "",
@@ -573,6 +606,7 @@ def run_requests(
     results: List[Optional[Dict[str, Any]]] = [None] * len(contents)
     failures: List[Tuple[int, BaseException]] = []
     workers = max(concurrency, 1) * len(base_urls)
+    run_start = time.perf_counter()
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
@@ -595,6 +629,13 @@ def run_requests(
             f"of this run would be meaningless. First failure (question "
             f"{index}): {type(error).__name__}: {error}"
         )
+    for result in results:
+        if result is None:
+            continue
+        # seconds since the run started, so the timeline is meaningful in the
+        # saved file (an absolute perf_counter value is not)
+        result["send_offset"] = result.pop("send_time") - run_start
+        result["recv_offset"] = result.pop("recv_time") - run_start
     return [result for result in results if result is not None]
 
 
@@ -941,6 +982,7 @@ def print_summary(
     accept_summary: Optional[Dict[str, Any]],
     length_stats: Optional[Dict[str, Any]] = None,
     throughput_stats: Optional[Dict[str, Any]] = None,
+    server_stats: Optional[Dict[str, Any]] = None,
 ) -> None:
     print(f"\n{'=' * 50}")
     print(f"Benchmark:        {benchmark_name}")
@@ -954,6 +996,8 @@ def print_summary(
             print(line)
     else:
         print(f"Throughput:       {metrics.output_throughput:,.2f} tok/s")
+    for line in format_phase_accounting(server_stats):
+        print(line)
     for line in format_length_summary(length_stats):
         print(line)
     if accept_summary is not None:
@@ -1198,11 +1242,19 @@ def main() -> None:
             f"Running benchmark: {len(eval_contents)} prompts, "
             f"max_new_tokens={max_new_tokens} ..."
         )
+        # server-side phase counters, read outside the timed region on both
+        # sides; None on a server without the phase-accounting patch
+        accounting_before = server_phase_accounting(base_urls)
         start = time.perf_counter()
         stats = run_requests(
             eval_contents, base_urls, concurrency, "Benchmarking", **request_kwargs
         )
         latency = time.perf_counter() - start
+        accounting_after = (
+            server_phase_accounting(base_urls)
+            if accounting_before is not None
+            else None
+        )
 
         # score with the benchmark's own extractor, on the visible answer: with
         # a reasoning parser installed the thinking text is in reasoning_content
@@ -1283,6 +1335,7 @@ def main() -> None:
         )
         length_stats = length_summary(stats)
         throughput_stats = throughput_summary(stats, latency)
+        server_stats = phase_accounting_summary(accounting_before, accounting_after)
         print_summary(
             benchmark_name,
             metrics,
@@ -1293,6 +1346,7 @@ def main() -> None:
             accept_summary,
             length_stats,
             throughput_stats,
+            server_stats,
         )
 
         if args.save_generations:
@@ -1320,6 +1374,7 @@ def main() -> None:
                 accept_length_summary=accept_summary,
                 length_summary=length_stats,
                 throughput_summary=throughput_stats,
+                server_accounting=server_stats,
                 per_sample_stats=benchmarker.per_sample_stats,
                 # target-model next-token entropy, None unless --token-entropy
                 token_entropy_summary=entropy_summary,

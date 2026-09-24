@@ -15,7 +15,7 @@ export SGLANG_FORCE_STREAM_INTERVAL=1
 GPU_IDS=(0)
 
 # for deep100
-# export LD_LIBRARY_PATH="/home/svu/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
+# export LD_LIBRARY_PATH="/home/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
 # export FLASHINFER_USE_CUDA_NORM=1
 # export NVCC_PREPEND_FLAGS="-ccbin g++-11"
 
@@ -106,33 +106,54 @@ if [ $? -ne 0 ]; then
 fi
 
 
-#  dynamath:200 mathvista:200 mathverse:200
 
-python benchmarks/bench_mm.py \
-    --model Qwen/Qwen3.5-4B \
-    --base-url "${BASE_URLS[@]}" \
-    --concurrency 1 \
-    --block-size ${BLOCK_SIZE} \
-    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
-    --reasoning off \
-    --temperature 0.0 \
-    --top-p 0.95 \
-    --top-k 20 \
-    --max-tokens 4096 \
-    --name mmflash_qwen35-4B_concurrency1_temp0_4096
+# Sweep over request concurrency (requests in flight on the one server). Each
+# level gets its own results file, so a finished level is skipped on re-run.
+# Override with e.g. CONCURRENCIES="2 8" bash scripts/benchmark_mmflash.sh
+CONCURRENCIES="${CONCURRENCIES:-2 4 8 16}"
 
-python benchmarks/bench_mm.py \
-    --model Qwen/Qwen3.5-4B \
-    --base-url "${BASE_URLS[@]}" \
-    --concurrency 1 \
-    --block-size ${BLOCK_SIZE} \
-    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
-    --reasoning off \
-    --temperature 1.0 \
-    --top-p 0.95 \
-    --top-k 20 \
-    --max-tokens 4096 \
-    --name mmflash_qwen35-4B_concurrency1_temp1_4096
+for CONC in ${CONCURRENCIES}; do
+    echo "===== concurrency ${CONC} ====="
+    python benchmarks/bench_mm.py \
+        --model Qwen/Qwen3.5-4B \
+        --base-url "${BASE_URLS[@]}" \
+        --concurrency ${CONC} \
+        --block-size ${BLOCK_SIZE} \
+        --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
+        --reasoning off \
+        --temperature 0.0 \
+        --top-p 0.95 \
+        --top-k 20 \
+        --max-tokens 4096 \
+        --name "mmflash_qwen35-4B_concurrency${CONC}_temp0_4096"
+done
+
+# python benchmarks/bench_mm.py \
+#     --model Qwen/Qwen3.5-4B \
+#     --base-url "${BASE_URLS[@]}" \
+#     --concurrency 1 \
+#     --block-size ${BLOCK_SIZE} \
+#     --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
+#     --reasoning off \
+#     --temperature 0.0 \
+#     --top-p 0.95 \
+#     --top-k 20 \
+#     --max-tokens 4096 \
+#     --name mmflash_qwen35-4B_concurrency1_temp0_4096
+
+
+# python benchmarks/bench_mm.py \
+#     --model Qwen/Qwen3.5-4B \
+#     --base-url "${BASE_URLS[@]}" \
+#     --concurrency 1 \
+#     --block-size ${BLOCK_SIZE} \
+#     --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
+#     --reasoning off \
+#     --temperature 1.0 \
+#     --top-p 0.95 \
+#     --top-k 20 \
+#     --max-tokens 4096 \
+#     --name mmflash_qwen35-4B_concurrency1_temp1_4096
 
 
 

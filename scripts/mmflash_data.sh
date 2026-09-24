@@ -77,7 +77,8 @@ MODEL="${REGEN_MODEL:-Qwen/Qwen3.5-9B}"
 # deep100: /local_home2/fengsicheng/specforge ; hpc: /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge
 DATA_ROOT="${REGEN_DATA_ROOT:-/local_home2/fengsicheng/specforge}"
 INPUT_FILE="${REGEN_INPUT:-${DATA_ROOT}/data/llava-ov15-1M_train.jsonl}"
-OUTPUT_FILE="${REGEN_OUTPUT:-${DATA_ROOT}/regen_data/qwen35-9B_llava-ov15-1M-prompted_regen_first_turn.jsonl}"
+# OUTPUT_FILE="${REGEN_OUTPUT:-${DATA_ROOT}/regen_data/qwen35-9B_llava-ov15-1M-prompted_regen_first_turn.jsonl}"
+OUTPUT_FILE="${REGEN_OUTPUT:-${DATA_ROOT}/regen_data/qwen35-9B_llava-ov15-1M_regen_first_turn.jsonl}"
 # one server per entry; must match the job's GPU allocation (pbs.sh ngpus=)
 GPU_IDS=(${REGEN_GPUS:-0 1})
 CONCURRENCY="${REGEN_CONCURRENCY:-64}"   # in-flight requests per server
@@ -216,9 +217,9 @@ run_regen_round() {
         --input-file-path "${INPUT_FILE}" \
         --output-file-path "${OUTPUT_FILE}" \
         --resume \
-        --reasoning disable \
-        --align-prompts
+        --reasoning disable
 }
+        # --align-prompts
 
 echo "[info] job ${JOB_ID}; log directory: ${LOG_DIR}"
 echo "[info] model ${MODEL}; GPUs ${GPU_IDS[*]}; ${CONCURRENCY} in-flight requests per server"

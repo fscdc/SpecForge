@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# Prepare the installed SGLang for a benchmark run.
+# Prepares the installed SGLang for the multimodal benchmarks.
 #
-# Applies patches/sglang/v0.5.14/request-timing-split.patch, which makes every
-# response carry `first_token_latency` and `decode_latency` next to the
-# `e2e_latency` stock SGLang already returns. Without them a benchmark can only
-# report `output tokens / wall clock`, and on a prompt of tens of thousands of
-# visual tokens that number is ~90% prefill -- a draft model cannot move it, so
-# a speculative-decoding run looks identical to its baseline.
+# Applies the patches under patches/sglang/v0.5.14/ that the benchmark harness
+# reads back:
+#   request-timing-split  every response carries first_token_latency and
+#                         decode_latency in meta_info (tokenizer_manager.py)
+#   phase-accounting      the scheduler attributes its wall time to prefill or
+#                         decode per batch and exposes the counters under
+#                         /server_info, which is what separates the two phases
+#                         once more than one request is in flight
+#                         (scheduler.py, metrics_reporter.py)
 #
-# The patch edits tokenizer_manager.py, which launch_server imports at startup,
-# so this has to run BEFORE any server is launched (and a server already
-# running has to be restarted).
+# Both edit modules that launch_server imports at startup, so run this before
+# starting the server, in the same environment:
 #
-# Usage, from the benchmark scripts:
 #     bash scripts/benchmark_helper.sh || exit 1
 #     bash scripts/benchmark_helper.sh --unpatch     # restore a stock tree
 #
@@ -21,14 +22,23 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PATCH_DIR="${REPO_ROOT}/patches/sglang/v0.5.14"
 
-PATCH_FILE="${REPO_ROOT}/patches/sglang/v0.5.14/request-timing-split.patch"
-PATCH_TARGET="sglang/srt/managers/tokenizer_manager.py"
-# A string only the patched file contains. `patch --reverse --dry-run` cannot be
-# used to detect this: on an UNPATCHED file GNU patch prints "Unreversed patch
-# detected! Ignoring -R" and dry-runs it forward instead, exiting 0 either way,
-# so it reports "already applied" for both states.
-PATCH_SENTINEL='meta_info["first_token_latency"]'
+# One entry per patch, in application order. TARGET is a file the patch edits
+# and SENTINEL a string only the patched version of that file contains.
+# `patch --reverse --dry-run` cannot be used to detect the state: on an
+# UNPATCHED file GNU patch prints "Unreversed patch detected! Ignoring -R" and
+# dry-runs it forward instead, exiting 0 either way, so it reports "already
+# applied" for both states.
+PATCH_NAMES=(request-timing-split phase-accounting)
+PATCH_TARGETS=(
+    "sglang/srt/managers/tokenizer_manager.py"
+    "sglang/srt/managers/scheduler_components/metrics_reporter.py"
+)
+PATCH_SENTINELS=(
+    'meta_info["first_token_latency"]'
+    'def phase_account_step'
+)
 
 # The directory sglang is installed under, or empty when python3 is not the
 # environment's python -- the usual cause, and worth its own message, since an
@@ -39,10 +49,10 @@ sglang_parent() {
 
 # prints: missing | applied | clean
 patch_state() {
-    local sgl_parent="$1"
-    if [ ! -f "${sgl_parent}/${PATCH_TARGET}" ]; then
+    local sgl_parent="$1" target="$2" sentinel="$3"
+    if [ ! -f "${sgl_parent}/${target}" ]; then
         echo missing
-    elif grep -qF "${PATCH_SENTINEL}" "${sgl_parent}/${PATCH_TARGET}"; then
+    elif grep -qF "${sentinel}" "${sgl_parent}/${target}"; then
         echo applied
     else
         echo clean
@@ -60,64 +70,82 @@ require_sglang() {
     echo "${sgl_parent}"
 }
 
-do_apply() {
-    local sgl_parent state
-    sgl_parent="$(require_sglang)" || return 1
-    if [ ! -f "${PATCH_FILE}" ]; then
-        echo "[helper] ERROR: ${PATCH_FILE} not found" >&2
+apply_one() {
+    local sgl_parent="$1" name="$2" target="$3" sentinel="$4"
+    local patch_file="${PATCH_DIR}/${name}.patch" state
+    if [ ! -f "${patch_file}" ]; then
+        echo "[helper] ERROR: ${patch_file} not found" >&2
         return 1
     fi
 
-    state="$(patch_state "${sgl_parent}")"
+    state="$(patch_state "${sgl_parent}" "${target}" "${sentinel}")"
     case "${state}" in
         applied)
-            echo "[helper] request-timing-split already applied at ${sgl_parent}"
+            echo "[helper] ${name} already applied at ${sgl_parent}"
             return 0
             ;;
         missing)
-            echo "[helper] ERROR: ${sgl_parent}/${PATCH_TARGET} does not exist" >&2
+            echo "[helper] ERROR: ${sgl_parent}/${target} does not exist" >&2
             return 1
             ;;
     esac
 
-    if ! patch -p2 --dry-run --batch -N -d "${sgl_parent}" < "${PATCH_FILE}" > /dev/null 2>&1; then
-        echo "[helper] ERROR: the patch does not apply to this sglang" >&2
+    if ! patch -p2 --dry-run --batch -N -d "${sgl_parent}" < "${patch_file}" > /dev/null 2>&1; then
+        echo "[helper] ERROR: ${name} does not apply to this sglang" >&2
         echo "[helper] the tree is neither patched nor the version it targets" >&2
         return 1
     fi
-    patch -p2 --batch -N -d "${sgl_parent}" < "${PATCH_FILE}" || return 1
-    if [ "$(patch_state "${sgl_parent}")" != "applied" ]; then
-        echo "[helper] ERROR: patch reported success but the sentinel is absent" >&2
+    patch -p2 --batch -N -d "${sgl_parent}" < "${patch_file}" || return 1
+    if [ "$(patch_state "${sgl_parent}" "${target}" "${sentinel}")" != "applied" ]; then
+        echo "[helper] ERROR: ${name} reported success but the sentinel is absent" >&2
         return 1
     fi
-    echo "[helper] request-timing-split applied at ${sgl_parent}"
-    echo "[helper] responses now carry first_token_latency and decode_latency"
+    echo "[helper] ${name} applied at ${sgl_parent}"
 }
 
-do_unpatch() {
-    local sgl_parent
-    sgl_parent="$(require_sglang)" || return 1
-    case "$(patch_state "${sgl_parent}")" in
+unpatch_one() {
+    local sgl_parent="$1" name="$2" target="$3" sentinel="$4"
+    local patch_file="${PATCH_DIR}/${name}.patch"
+    case "$(patch_state "${sgl_parent}" "${target}" "${sentinel}")" in
         clean)
-            echo "[helper] nothing to reverse; sglang is already stock"
+            echo "[helper] ${name} is not applied at ${sgl_parent}"
             return 0
             ;;
         missing)
-            echo "[helper] ERROR: ${sgl_parent}/${PATCH_TARGET} missing" >&2
+            echo "[helper] ERROR: ${sgl_parent}/${target} does not exist" >&2
             return 1
             ;;
     esac
-    patch -p2 --reverse --batch -d "${sgl_parent}" < "${PATCH_FILE}" || return 1
-    if [ "$(patch_state "${sgl_parent}")" = "applied" ]; then
-        echo "[helper] ERROR: reverse reported success but the sentinel remains" >&2
+    patch -p2 --reverse --batch -d "${sgl_parent}" < "${patch_file}" || return 1
+    if [ "$(patch_state "${sgl_parent}" "${target}" "${sentinel}")" = "applied" ]; then
+        echo "[helper] ERROR: reverse patch reported success but the sentinel remains" >&2
         return 1
     fi
-    echo "[helper] reversed; sglang is stock again"
+    echo "[helper] ${name} removed from ${sgl_parent}"
+}
+
+do_apply() {
+    local sgl_parent i
+    sgl_parent="$(require_sglang)" || return 1
+    for i in "${!PATCH_NAMES[@]}"; do
+        apply_one "${sgl_parent}" "${PATCH_NAMES[$i]}" "${PATCH_TARGETS[$i]}" "${PATCH_SENTINELS[$i]}" || return 1
+    done
+    echo "[helper] responses carry first_token_latency and decode_latency;"
+    echo "[helper] /server_info carries phase_accounting"
+}
+
+do_unpatch() {
+    local sgl_parent i
+    sgl_parent="$(require_sglang)" || return 1
+    # reverse order, in case a later patch ever touches an earlier one's file
+    for (( i=${#PATCH_NAMES[@]}-1; i>=0; i-- )); do
+        unpatch_one "${sgl_parent}" "${PATCH_NAMES[$i]}" "${PATCH_TARGETS[$i]}" "${PATCH_SENTINELS[$i]}" || return 1
+    done
 }
 
 case "${1:-}" in
+    "") do_apply ;;
     --unpatch) do_unpatch ;;
-    "")        do_apply ;;
     *)
         echo "usage: bash scripts/benchmark_helper.sh [--unpatch]" >&2
         exit 2

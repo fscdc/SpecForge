@@ -5,7 +5,7 @@ GPU_IDS=(0)
 
 
 # for deep100
-# export LD_LIBRARY_PATH="/home/svu/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
+# export LD_LIBRARY_PATH="/home/fengsicheng/miniconda3/envs/specforge/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}"
 # export FLASHINFER_USE_CUDA_NORM=1
 # export NVCC_PREPEND_FLAGS="-ccbin g++-11"
 

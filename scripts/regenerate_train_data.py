@@ -8,7 +8,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from tqdm import tqdm
 
@@ -531,9 +531,14 @@ def append_short_answer_prompt(
     return False
 
 
-# Chat/Instruct Qwen3.5 checkpoints only. "-Base" checkpoints are not
+# Chat/Instruct checkpoints only. "-Base" and "-pt" checkpoints are not
 # chat-aligned and cannot reliably serve /v1/chat/completions requests.
+# Every entry must (1) accept images through /v1/chat/completions on SGLang
+# and (2) honour ``chat_template_kwargs.enable_thinking`` for --reasoning
+# disable/save; Gemma 4's template does, its thought channel is caught by
+# has_think_marker() if it leaks anyway.
 SUPPORTED_MM_MODELS = (
+    "google/gemma-4-E4B-it",
     "Qwen/Qwen3.5-0.8B",
     "Qwen/Qwen3.5-2B",
     "Qwen/Qwen3.5-4B",
@@ -963,6 +968,18 @@ def build_query_kwargs(args, messages, max_tokens=None, image_data_url=None):
     return query_kwargs
 
 
+def _reasoning_content_of(response_message) -> Optional[str]:
+    """The reasoning the server split off, whichever way the client exposes it."""
+    reasoning_content = getattr(response_message, "reasoning_content", None)
+    if reasoning_content is None:
+        model_extra = getattr(response_message, "model_extra", None)
+        if isinstance(model_extra, dict):
+            reasoning_content = model_extra.get("reasoning_content")
+    if isinstance(reasoning_content, str) and reasoning_content.strip():
+        return reasoning_content
+    return None
+
+
 def call_sglang(
     args,
     server_address: str,
@@ -1016,6 +1033,18 @@ def call_sglang(
                 return set_skipped(
                     data,
                     "Non-reasoning assistant response is empty or contains a thinking marker",
+                )
+            if args.reasoning == "disable" and _reasoning_content_of(
+                resp.choices[0].message
+            ):
+                # The server's reasoning parser stripped a thought block out of
+                # the content (Gemma 4 can still open its thought channel with
+                # enable_thinking=False). The visible answer is fine, but the
+                # row was produced with thinking and is not what "disable"
+                # asked for; the draft must not learn from it.
+                return set_skipped(
+                    data,
+                    "Non-reasoning request came back with reasoning_content",
                 )
             resp_msg = {
                 "role": "assistant",
@@ -1212,7 +1241,7 @@ def main():
         raise ValueError(
             f"Input file {args.input_file_path!r} contains multimodal rows "
             f"(an `image` field), but --model {args.model!r} is not a "
-            "supported Qwen3.5 chat/instruct checkpoint. Supported models: "
+            "supported multimodal chat/instruct checkpoint. Supported models: "
             f"{', '.join(SUPPORTED_MM_MODELS)}"
         )
 

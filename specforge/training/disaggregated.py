@@ -560,6 +560,11 @@ def _build_online(
                 cfg,
                 input_tools,
                 draft_config=draft_config,
+                # the algorithm's threshold, as the text path applies it in
+                # assembly.py; the adapter itself is shared across algorithms
+                min_loss_tokens=algorithm.providers.model.minimum_loss_tokens(
+                    cfg, draft_config
+                ),
             )
         if cfg.training.total_steps is None and cfg.training.max_steps is None:
             schedule = _online_schedule_payload(cfg, num_prompts=len(prompts))

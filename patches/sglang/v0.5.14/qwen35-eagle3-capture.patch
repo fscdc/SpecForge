@@ -1,0 +1,31 @@
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -1620,6 +1620,28 @@
+         cfg = getattr(model, "config", None)
+         return int(getattr(cfg, "num_hidden_layers", 0))
+ 
++    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
++        """EAGLE3 aux-hidden capture routed through the Qwen3.5 text stack.
++
++        The inherited Qwen3VL version writes ``self.model.layers_to_capture``,
++        which this text stack never reads: its decoder loop keys off the
++        per-layer ``_is_layer_to_capture`` flag that only
++        ``set_dflash_layers_to_capture`` sets. The wrapper's flag went on, the
++        stack returned a plain tensor, and forward() died unpacking it
++        (``too many values to unpack``) during CUDA-graph capture. Same layer
++        mapping as the inherited setter: the input of layer i+1 is the output
++        of layer i, and the default triple is SGLang's EAGLE3 default.
++        """
++        if not self.pp_group.is_last_rank:
++            return
++        if layer_ids is None:
++            num_layers = int(self.end_layer)
++            capture = [2, num_layers // 2, num_layers - 3]
++        else:
++            capture = [val + 1 for val in layer_ids]
++        self.capture_aux_hidden_states = True
++        self.model.set_dflash_layers_to_capture(capture)
++
+     def get_embed_and_head(self):
+         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
+         head = self.lm_head.weight if self.pp_group.is_last_rank else None

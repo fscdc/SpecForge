@@ -85,23 +85,23 @@ if [ $? -ne 0 ]; then
 fi
 
 
-CONCURRENCIES="${CONCURRENCIES:-2 4 8 16 32}"
+# CONCURRENCIES="${CONCURRENCIES:-2 4 8 16 32}"
 
-for CONC in ${CONCURRENCIES}; do
-    echo "===== concurrency ${CONC} ====="
-    python benchmarks/bench_mm.py \
-        --model Qwen/Qwen3.5-4B \
-        --base-url "${BASE_URLS[@]}" \
-        --concurrency ${CONC} \
-        --block-size ${BLOCK_SIZE} \
-        --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
-        --reasoning off \
-        --temperature 0.0 \
-        --top-p 0.95 \
-        --top-k 20 \
-        --max-tokens 4096 \
-        --name "origin_qwen35-4B_concurrency${CONC}_temp0_4096"
-done
+# for CONC in ${CONCURRENCIES}; do
+#     echo "===== concurrency ${CONC} ====="
+#     python benchmarks/bench_mm.py \
+#         --model Qwen/Qwen3.5-4B \
+#         --base-url "${BASE_URLS[@]}" \
+#         --concurrency ${CONC} \
+#         --block-size 0 \
+#         --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
+#         --reasoning off \
+#         --temperature 0.0 \
+#         --top-p 0.95 \
+#         --top-k 20 \
+#         --max-tokens 4096 \
+#         --name "origin_qwen35-4B_concurrency${CONC}_temp0_4096"
+# done
 
 # python benchmarks/bench_mm.py \
 #     --model Qwen/Qwen3.5-4B \
@@ -116,19 +116,19 @@ done
 #     --max-tokens 4096 \
 #     --name origin_qwen35-4B_concurrency1_temp0_4096
 
-# # video
-# python benchmarks/bench_mm.py \
-#     --model Qwen/Qwen3.5-4B \
-#     --base-url "${BASE_URLS[@]}" \
-#     --concurrency 1 \
-#     --block-size 0 \
-#     --benchmark-list vdc:20 \
-#     --reasoning off \
-#     --temperature 0.0 \
-#     --top-p 0.95 \
-#     --top-k 20 \
-#     --max-tokens 4096 \
-#     --name video_origin_qwen35-4B_concurrency1_temp0_4096
+# video
+python benchmarks/bench_mm.py \
+    --model Qwen/Qwen3.5-4B \
+    --base-url "${BASE_URLS[@]}" \
+    --concurrency 1 \
+    --block-size 0 \
+    --benchmark-list vdc:20 \
+    --reasoning off \
+    --temperature 0.0 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --max-tokens 4096 \
+    --name video_origin_qwen35-4B_concurrency1_temp0_4096
 
 
 # # for text benchmark

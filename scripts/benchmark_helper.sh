@@ -10,8 +10,12 @@
 #                         /server_info, which is what separates the two phases
 #                         once more than one request is in flight
 #                         (scheduler.py, metrics_reporter.py)
+#   qwen35-eagle3-capture EAGLE3 serving on the Qwen3.5 VL wrapper: its
+#                         inherited aux-capture setter never reached the text
+#                         stack, so --speculative-algorithm EAGLE3 died in
+#                         CUDA-graph capture (qwen3_5.py)
 #
-# Both edit modules that launch_server imports at startup, so run this before
+# All of them edit modules that launch_server imports at startup, so run this before
 # starting the server, in the same environment:
 #
 #     bash scripts/benchmark_helper.sh || exit 1
@@ -30,14 +34,16 @@ PATCH_DIR="${REPO_ROOT}/patches/sglang/v0.5.14"
 # UNPATCHED file GNU patch prints "Unreversed patch detected! Ignoring -R" and
 # dry-runs it forward instead, exiting 0 either way, so it reports "already
 # applied" for both states.
-PATCH_NAMES=(request-timing-split phase-accounting)
+PATCH_NAMES=(request-timing-split phase-accounting qwen35-eagle3-capture)
 PATCH_TARGETS=(
     "sglang/srt/managers/tokenizer_manager.py"
     "sglang/srt/managers/scheduler_components/metrics_reporter.py"
+    "sglang/srt/models/qwen3_5.py"
 )
 PATCH_SENTINELS=(
     'meta_info["first_token_latency"]'
     'def phase_account_step'
+    'def set_eagle3_layers_to_capture'
 )
 
 # The directory sglang is installed under, or empty when python3 is not the
@@ -131,7 +137,7 @@ do_apply() {
         apply_one "${sgl_parent}" "${PATCH_NAMES[$i]}" "${PATCH_TARGETS[$i]}" "${PATCH_SENTINELS[$i]}" || return 1
     done
     echo "[helper] responses carry first_token_latency and decode_latency;"
-    echo "[helper] /server_info carries phase_accounting"
+    echo "[helper] /server_info carries phase_accounting; Qwen3.5 serves EAGLE3"
 }
 
 do_unpatch() {

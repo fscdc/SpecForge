@@ -1,0 +1,254 @@
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -50,6 +50,102 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++class DFlashDraftSparseContext:
++    """Training-free sparse context for the DFlash draft (SpecForge experiment).
++
++    Off unless ``SGLANG_DFLASH_DRAFT_SPARSE`` is set, for example
++    ``SGLANG_DFLASH_DRAFT_SPARSE="sink=4,text=1,stride=32,window=2048"``.
++    Needs the compact draft cache (``--speculative-draft-window-size``) and
++    ``page_size == 1``. Instead of the most recent ``window`` target tokens
++    only, every draft step attends to the union of
++
++      sink    the first ``sink`` prompt positions (attention sinks);
++      text    every non-visual position, prompt text and generated tokens,
++              when ``text=1``;
++      stride  one of every ``stride`` positions inside each image/video span,
++              a low-resolution overview of every frame (``0`` = none);
++      window  the most recent ``window`` positions (defaults to the CLI window).
++
++    Visual spans come from the request's multimodal item offsets, so nothing
++    here is tokenizer specific. The K/V read are the very cache entries the
++    full-context draft would read; only which slots are visible changes, so
++    RoPE positions stay absolute, exactly as the draft was trained.
++    """
++
++    ENV_VAR = "SGLANG_DFLASH_DRAFT_SPARSE"
++
++    def __init__(self, *, sink: int, text: bool, stride: int, window: int):
++        self.sink = int(sink)
++        self.text = bool(text)
++        self.stride = int(stride)
++        self.window = int(window)
++
++    def __repr__(self) -> str:
++        return (
++            f"sink={self.sink},text={int(self.text)},stride={self.stride},"
++            f"window={self.window}"
++        )
++
++    @classmethod
++    def maybe_from_env(
++        cls, *, window: Optional[int], page_size: int
++    ) -> Optional["DFlashDraftSparseContext"]:
++        raw = os.environ.get(cls.ENV_VAR, "").strip()
++        if not raw:
++            return None
++        opts = {"sink": 0, "text": 1, "stride": 0, "window": None}
++        for part in raw.split(","):
++            part = part.strip()
++            if not part:
++                continue
++            key, sep, value = part.partition("=")
++            key = key.strip()
++            if not sep or key not in opts:
++                raise ValueError(
++                    f"{cls.ENV_VAR}: unknown option {part!r}; expected "
++                    "sink=<n>,text=<0|1>,stride=<n>,window=<n>"
++                )
++            opts[key] = int(value.strip())
++        if window is None:
++            raise ValueError(
++                f"{cls.ENV_VAR} needs --speculative-draft-window-size so the "
++                "draft keeps its own compact req->token table"
++            )
++        if opts["window"] is None:
++            opts["window"] = int(window)
++        if int(page_size) != 1:
++            raise ValueError(
++                f"{cls.ENV_VAR} requires page_size == 1 (arbitrary cache slots "
++                f"are gathered per position), got {page_size}"
++            )
++        for key in ("sink", "stride", "window"):
++            if opts[key] < 0:
++                raise ValueError(f"{cls.ENV_VAR}: {key} must be >= 0")
++        return cls(
++            sink=opts["sink"],
++            text=bool(opts["text"]),
++            stride=opts["stride"],
++            window=opts["window"],
++        )
++
++    def prompt_keep_mask(
++        self, prompt_len: int, spans: list, device
++    ) -> torch.Tensor:
++        """Which prompt positions stay visible, before the recent window."""
++        keep = torch.full((prompt_len,), self.text, dtype=torch.bool, device=device)
++        for start, end in spans:
++            start = max(int(start), 0)
++            end = min(int(end), prompt_len - 1)
++            if end < start:
++                continue
++            keep[start : end + 1] = False
++            if self.stride > 0:
++                keep[start + self.stride // 2 : end + 1 : self.stride] = True
++        if self.sink > 0:
++            keep[: min(self.sink, prompt_len)] = True
++        return keep
++
++
+ class DFlashVerifyEntropyRecorder:
+     """Record the target's per-position entropy at DFlash verify time.
+ 
+@@ -184,6 +280,13 @@
+             server_args.speculative_draft_window_size
+         )
+         self.use_compact_draft_cache = self.draft_window_size is not None
++        self.draft_sparse = DFlashDraftSparseContext.maybe_from_env(
++            window=self.draft_window_size, page_size=self.page_size
++        )
++        # req_pool_idx -> (rid, keep-mask over the prompt positions); recorded
++        # at prefill, read at every draft step while the request is alive.
++        self._draft_sparse_prompt_masks: dict = {}
++        self._draft_sparse_logged = False
+         self.device = target_worker.device
+ 
+         self._warned_sampling_fallback = False
+@@ -598,6 +701,86 @@
+             context="DFLASH req_to_token segment gather",
+         )
+ 
++    def _record_draft_sparse_prompts(self, batch) -> None:
++        """Remember, per request, which prompt positions the sparse draft sees."""
++        reqs = getattr(batch, "reqs", None)
++        if reqs is None:
++            raise RuntimeError(
++                "DFLASH draft sparse context needs ScheduleBatch.reqs at prefill"
++            )
++        pool_indices = batch.req_pool_indices.tolist()
++        for req, pool_idx in zip(reqs, pool_indices):
++            pool_idx = int(pool_idx)
++            entry = self._draft_sparse_prompt_masks.get(pool_idx)
++            if entry is not None and entry[0] == req.rid:
++                continue  # a later chunk of the same prompt
++            spans = []
++            mm_inputs = getattr(req, "multimodal_inputs", None)
++            for item in getattr(mm_inputs, "mm_items", None) or []:
++                for start, end in getattr(item, "offsets", None) or []:
++                    spans.append((int(start), int(end)))
++            prompt_len = len(req.origin_input_ids)
++            mask = self.draft_sparse.prompt_keep_mask(prompt_len, spans, self.device)
++            self._draft_sparse_prompt_masks[pool_idx] = (req.rid, mask)
++            if not self._draft_sparse_logged and self.tp_rank == 0:
++                logger.info(
++                    "DFLASH draft sparse context (%s): prompt_len=%d visual_spans=%d "
++                    "visual_tokens=%d kept_prompt_positions=%d",
++                    self.draft_sparse,
++                    prompt_len,
++                    len(spans),
++                    sum(end - start + 1 for start, end in spans),
++                    int(mask.sum().item()),
++                )
++                self._draft_sparse_logged = True
++
++    def _gather_draft_sparse_context(
++        self, batch, prefix_lens: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Kept-position counts (int32) and their cache slots, ascending per request."""
++        cfg = self.draft_sparse
++        pool_indices = batch.req_pool_indices
++        pool_list = pool_indices.tolist()
++        prefix_list = prefix_lens.tolist()
++        keep_positions = []
++        for pool_idx, seq_len in zip(pool_list, prefix_list):
++            seq_len = int(seq_len)
++            entry = self._draft_sparse_prompt_masks.get(int(pool_idx))
++            if entry is None:
++                raise RuntimeError(
++                    "DFLASH draft sparse context has no prompt mask for "
++                    f"req_pool_idx={pool_idx}; prefill did not record it"
++                )
++            prompt_mask = entry[1]
++            keep = torch.zeros(seq_len, dtype=torch.bool, device=self.device)
++            n_prompt = min(seq_len, int(prompt_mask.numel()))
++            keep[:n_prompt] = prompt_mask[:n_prompt]
++            if cfg.text and seq_len > n_prompt:
++                keep[n_prompt:] = True  # generated tokens are text
++            if cfg.window > 0:
++                keep[max(seq_len - cfg.window, 0) :] = True
++            keep_positions.append(keep.nonzero(as_tuple=True)[0])
++        bs = len(keep_positions)
++        lengths = torch.tensor(
++            [int(p.numel()) for p in keep_positions],
++            dtype=torch.int64,
++            device=self.device,
++        )
++        max_len = int(lengths.max().item()) if bs else 0
++        pos2d = torch.zeros((bs, max_len), dtype=torch.int64, device=self.device)
++        mask = torch.zeros((bs, max_len), dtype=torch.bool, device=self.device)
++        for i, positions in enumerate(keep_positions):
++            pos2d[i, : positions.numel()] = positions
++            mask[i, : positions.numel()] = True
++        cache_loc = self._gather_req_to_token_masked(
++            req_to_token=self.model_runner.req_to_token_pool.req_to_token,
++            req_pool_indices=pool_indices,
++            pos2d=pos2d,
++            mask=mask,
++            context="DFLASH draft sparse context gather",
++        )
++        return lengths.to(torch.int32), cache_loc
++
+     def _compute_compact_draft_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
+         assert self.draft_window_size is not None
+         visible_lens = torch.clamp(
+@@ -1360,6 +1543,9 @@
+             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
+             logits_output.hidden_states = None
+ 
++            if self.draft_sparse is not None:
++                self._record_draft_sparse_prompts(model_worker_batch)
++
+             batch_output.next_draft_input = self._make_next_draft_input_prefill(
+                 verified_id=next_token_ids,
+                 seq_lens=model_worker_batch.seq_lens,
+@@ -1499,19 +1685,25 @@
+ 
+         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+         if self.use_compact_draft_cache:
+-            # Rebuild the draft-local sliding-window view from committed target state.
+-            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
++            if self.draft_sparse is not None:
++                # Sparse view: sink + text + strided visual overview + recent
++                # window, gathered from the committed target state.
++                draft_prefix_lens, suffix_cache_loc = (
++                    self._gather_draft_sparse_context(model_worker_batch, prefix_lens)
++                )
++            else:
++                # Rebuild the draft-local sliding-window view from committed target state.
++                draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
++                suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
++                    torch.int64
++                )
++                suffix_cache_loc = self._gather_req_to_token_segments(
++                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
++                    req_pool_indices=model_worker_batch.req_pool_indices,
++                    start=suffix_start,
++                    lengths=draft_prefix_lens,
++                )
+             seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
+-
+-            suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
+-                torch.int64
+-            )
+-            suffix_cache_loc = self._gather_req_to_token_segments(
+-                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+-                req_pool_indices=model_worker_batch.req_pool_indices,
+-                start=suffix_start,
+-                lengths=draft_prefix_lens,
+-            )
+             assign_req_to_token_pool_func(
+                 model_worker_batch.req_pool_indices,
+                 self.draft_model_runner.req_to_token_pool.req_to_token,

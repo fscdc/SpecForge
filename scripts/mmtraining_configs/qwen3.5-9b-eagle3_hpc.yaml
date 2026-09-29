@@ -1,9 +1,6 @@
-# @song：这里直接把下面的路径替换掉，然后把我发你的.pt文件也准备好，就可以直接开跑，目前下面的设置应该是准备好的，6epoch，这里训你可以直接用下面这个指令启动：
-# specforge train --config ${EAGLE3_CONFIG}
-
 model:
-  target_model_path: "Qwen/Qwen3.5-4B"
-  draft_model_config: "configs/qwen3.5-4b-eagle3.json"
+  target_model_path: "Qwen/Qwen3.5-9B"
+  draft_model_config: "configs/qwen3.5-9b-eagle3.json"
   target_backend: sglang
   # image+text capture: routes prompt building and server requests through the
   # multimodal ServerInputAdapter. Requires a vision-language target model.
@@ -11,26 +8,35 @@ model:
   trust_remote_code: true
   # A VL checkpoint nests the text stack under model.language_model.* (the
   # vision tower lives in model.visual.*), so the text-only key does not exist.
-  # lm_head_key is unused here because the model ties word embeddings.
+  # Unlike the 4B, Qwen3.5-9B does NOT tie word embeddings (tie_word_embeddings:
+  # false), so lm_head_key is read for real: the consumer's TargetHead loads
+  # the checkpoint's top-level lm_head.weight, which is the schema default and
+  # is spelled out here.
   embedding_key: "model.language_model.embed_tokens.weight"
+  lm_head_key: "lm_head.weight"
   # REQUIRED for EAGLE3 disaggregated (planning.py:172): producer and consumer
   # cannot each derive their own mapping, so they must share this file.
-  vocab_mapping_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/vocab_mapping/qwen3.5-4b-eagle3.pt"
+  # Build it once from the 9B regen (a frequency ranking, tokenizer-only):
+  #   python scripts/prepare_vocab_mapping.py \
+  #       --config scripts/mmtraining_configs/qwen3.5-9b-eagle3_hpc.yaml
+  vocab_mapping_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/vocab_mapping/qwen3.5-9b-eagle3.pt"
   torch_dtype: "bfloat16"
 data:
-  train_data_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M-prompted_regen_first_turn.jsonl"
+  # The 9B regen of llava-ov 1M with the boxed prompt, the same corpus the 9B
+  # DFlash baseline is configured for (the un-prompted regen was never
+  # produced for 9B).
+  train_data_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-9B_llava-ov15-1M-prompted_regen_first_turn.jsonl"
   max_length: 4096
   chat_template: "qwen3.5"
   build_dataset_num_proc: 32
   cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
-  max_prompts: 500
   # image_root stays empty: the regen records already carry absolute paths under
   # .../specforge/data/llava-ov15-1M/.
   # image_max_tokens stays 0 on purpose -- the capture server expands image_data
   # with the checkpoint's own resolution, so a client-side cap desyncs the prompt.
 training:
   strategy: "eagle3"
-  num_epochs: 1
+  num_epochs: 6
   # max_steps: 1000 # set for testing, comment out for full training
   batch_size: 1
   learning_rate: 0.0001
@@ -44,17 +50,17 @@ training:
 
 tracking:
   report_to: "tensorboard"
-run_id: "qwen3.5-4b-eagle3-llava-ov15-1M-prompted"
-output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-eagle3-llava-ov15-1M-prompted"
+run_id: "qwen3.5-9b-eagle3-llava-ov15-1M-prompted"
+output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-9b-eagle3-llava-ov15-1M-prompted"
 
 deployment:
   mode: disaggregated
   trainer:
     nnodes: 1
-    nproc_per_node: 1 # @sicheng: trainer GPUs only; the capture GPU is separate
+    nproc_per_node: 3 # @sicheng: same as the trainer GPU count below; the capture GPU is separate
   disaggregated:
-    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-eagle3-llava-ov15-1M-prompted/control"
-    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-eagle3-llava-ov15-1M-prompted/consumer-state"
+    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-9b-eagle3-llava-ov15-1M-prompted/control"
+    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-9b-eagle3-llava-ov15-1M-prompted/consumer-state"
     backend: mooncake
 
     # managed_local: the CLI supervises Mooncake and the SGLang capture server
@@ -64,6 +70,8 @@ deployment:
       # trainer (consumer) GPUs — must stay disjoint from the capture server's
       trainer_cuda_visible_devices:
         - "1"
+        - "2"
+        - "3"
       mooncake:
         protocol: tcp
       capture_servers:

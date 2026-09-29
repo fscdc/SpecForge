@@ -34,6 +34,36 @@ export SGLANG_NUMA_BIND_V2=0
 
 BLOCK_SIZE=16
 
+# Draft context window, in target tokens. Empty = the draft attends to the whole
+# context (default). Set it to add --speculative-draft-window-size: SGLang then
+# keeps a compact per-request draft cache and the DFlash draft attends only to
+# the most recent DRAFT_WINDOW target tokens (no sink, no top-k). Training-free,
+# so it is the cheapest "sparse attention for the draft" experiment; the result
+# name gets a _win<N> suffix so runs stay apart. scripts/sweep_draft_window.sh
+# drives a sweep. NAME_SUFFIX is a free extra tag appended after it.
+DRAFT_WINDOW="${DRAFT_WINDOW:-}"
+# Sparse draft context on top of the window (needs DRAFT_WINDOW set): the
+# patched worker reads SGLANG_DFLASH_DRAFT_SPARSE, e.g.
+#   DRAFT_SPARSE="sink=4,text=1,stride=32,window=2048"
+# meaning sink positions + every text token + one of every 32 visual tokens
+# per frame + the most recent 2048 tokens. patches/sglang/v0.5.14/
+# dflash-draft-sparse-context.patch documents the semantics; the result name
+# gets a _sparse-<spec> suffix. See scripts/sweep_draft_sparse.sh.
+DRAFT_SPARSE="${DRAFT_SPARSE:-}"
+if [ -n "${DRAFT_SPARSE}" ]; then
+    if [ -z "${DRAFT_WINDOW}" ]; then
+        echo "DRAFT_SPARSE needs DRAFT_WINDOW (the compact draft cache)" >&2
+        exit 1
+    fi
+    export SGLANG_DFLASH_DRAFT_SPARSE="${DRAFT_SPARSE}"
+    SPARSE_SUFFIX="_sparse-$(printf '%s' "${DRAFT_SPARSE}" | tr -d ' ' | sed -e 's/=//g' -e 's/,/-/g')"
+else
+    unset SGLANG_DFLASH_DRAFT_SPARSE
+    SPARSE_SUFFIX=""
+fi
+NAME_SUFFIX="${NAME_SUFFIX:-}"
+RUN_SUFFIX="${DRAFT_WINDOW:+_win${DRAFT_WINDOW}}${SPARSE_SUFFIX}${NAME_SUFFIX}"
+
 # Patch the installed SGLang so every response carries its prefill/decode split
 # (first_token_latency / decode_latency). Must run before launch_server imports
 # tokenizer_manager.py. `bash scripts/benchmark_helper.sh --unpatch` undoes it.
@@ -43,8 +73,6 @@ bash scripts/benchmark_helper.sh || exit 1
 IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 
-       
-#  --speculative-draft-window-size 512 \
 SERVER_ADDRESSES=()
 PORTS=()
 BASE_URLS=()
@@ -63,6 +91,7 @@ for idx in "${!GPU_IDS[@]}"; do
         --speculative-algorithm DFLASH \
         --speculative-draft-model-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-llava-ov15-1M-prompted-final \
         --speculative-dflash-block-size ${BLOCK_SIZE} \
+        ${DRAFT_WINDOW:+--speculative-draft-window-size ${DRAFT_WINDOW}} \
         --mem-fraction-static 0.7 \
         --tp 1 \
         --trust-remote-code \
@@ -107,26 +136,24 @@ fi
 
 
 
-# Sweep over request concurrency (requests in flight on the one server). Each
-# level gets its own results file, so a finished level is skipped on re-run.
-# Override with e.g. CONCURRENCIES="2 8" bash scripts/benchmark_mmflash.sh
-CONCURRENCIES="${CONCURRENCIES:-2 4 8 16}"
 
-for CONC in ${CONCURRENCIES}; do
-    echo "===== concurrency ${CONC} ====="
-    python benchmarks/bench_mm.py \
-        --model Qwen/Qwen3.5-4B \
-        --base-url "${BASE_URLS[@]}" \
-        --concurrency ${CONC} \
-        --block-size ${BLOCK_SIZE} \
-        --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
-        --reasoning off \
-        --temperature 0.0 \
-        --top-p 0.95 \
-        --top-k 20 \
-        --max-tokens 4096 \
-        --name "mmflash_qwen35-4B_concurrency${CONC}_temp0_4096"
-done
+# CONCURRENCIES="${CONCURRENCIES:-2 4 8 16}"
+
+# for CONC in ${CONCURRENCIES}; do
+#     echo "===== concurrency ${CONC} ====="
+#     python benchmarks/bench_mm.py \
+#         --model Qwen/Qwen3.5-4B \
+#         --base-url "${BASE_URLS[@]}" \
+#         --concurrency ${CONC} \
+#         --block-size ${BLOCK_SIZE} \
+#         --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
+#         --reasoning off \
+#         --temperature 0.0 \
+#         --top-p 0.95 \
+#         --top-k 20 \
+#         --max-tokens 4096 \
+#         --name "mmflash_qwen35-4B_concurrency${CONC}_temp0_4096"
+# done
 
 # python benchmarks/bench_mm.py \
 #     --model Qwen/Qwen3.5-4B \
@@ -156,6 +183,18 @@ done
 #     --name mmflash_qwen35-4B_concurrency1_temp1_4096
 
 
+python benchmarks/bench_mm.py \
+    --model Qwen/Qwen3.5-4B \
+    --base-url "${BASE_URLS[@]}" \
+    --concurrency 1 \
+    --block-size ${BLOCK_SIZE} \
+    --benchmark-list vdc:20  \
+    --reasoning off \
+    --temperature 0.0 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --max-tokens 4096 \
+    --name "video_mmflash_qwen35-4B_concurrency1_temp0_4096${RUN_SUFFIX}"
 
 
 # # for text benchmark

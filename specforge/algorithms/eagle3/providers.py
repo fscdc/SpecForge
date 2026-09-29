@@ -240,9 +240,18 @@ def algorithm_providers() -> AlgorithmProviders:
             ),
             # Image modality: same capture layout as text, but prompt building and
             # request construction are owned by the multimodal input adapter.
+            # capture_method is "dflash", not "eagle3": on SGLang's VL wrappers
+            # (Qwen3VLForConditionalGeneration and the Qwen3.5 subclass) only
+            # set_dflash_layers_to_capture() reaches the text stack's per-layer
+            # capture flags; set_eagle3_layers_to_capture() flips the wrapper's
+            # flag alone, the stack returns a plain tensor, and CUDA-graph
+            # capture dies unpacking it. Both setters map layer ids the same way
+            # (output of layer i), and the logits processor concatenates the
+            # captured layers and exposes the post-norm last hidden regardless
+            # of the method, so the artifacts are identical.
             ServerStreamingProvider(
                 modality="image",
-                capture_method="eagle3",
+                capture_method="dflash",
                 target_representation="hidden_state",
                 layout=ServerCaptureLayout(
                     aux_feature="hidden_state",

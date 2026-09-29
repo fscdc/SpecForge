@@ -3,9 +3,15 @@
 from typing import Any
 
 
+# Markers a "no thinking" regeneration must never contain: Qwen's <think>
+# block and Gemma 4's thought channel (``<|channel>thought ... <channel|>``,
+# opened by ``<|think|>`` in some prompts). Lower-cased before matching.
+THINK_MARKERS = ("<think>", "</think>", "<|channel>", "<channel|>", "<|think|>")
+
+
 def has_think_marker(content: str) -> bool:
     lowered = content.lower()
-    return "<think>" in lowered or "</think>" in lowered
+    return any(marker in lowered for marker in THINK_MARKERS)
 
 
 def validate_conversation(

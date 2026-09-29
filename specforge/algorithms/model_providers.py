@@ -265,6 +265,9 @@ def build_eagle3_model(
             lm_head_key=cfg.model.lm_head_key,
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
+            # a tied-embedding target (Qwen3.5) has no lm_head tensor; the
+            # head is loaded from this embedding instead
+            embedding_key=cfg.model.embedding_key,
         )
     return AlgorithmModelParts(
         model=model,

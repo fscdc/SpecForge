@@ -1,4 +1,4 @@
-"""Image+text ``ServerInputAdapter`` for DFlash-family online capture.
+"""Image+text ``ServerInputAdapter`` for online capture (DFlash family and EAGLE3).
 
 The runtime routes every non-text modality through this port
 (:class:`specforge.algorithms.common.providers.ServerInputAdapter`). The adapter
@@ -126,10 +126,18 @@ class ImageServerInputAdapter:
         input_tools: Any,
         *,
         draft_config: Any,
+        min_loss_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
+        """Encode the image records into prompts, dropping the ones too short to train on.
+
+        ``min_loss_tokens`` is the algorithm's own threshold (what the text path
+        reads from ``providers.model.minimum_loss_tokens``); the caller passes
+        it so the adapter serves every algorithm. Left unset, it falls back to
+        the DFlash-family rule of two blocks, which is what this adapter
+        assumed before it was shared with EAGLE3.
+        """
         from concurrent.futures import ProcessPoolExecutor
 
-        from specforge.algorithms.model_providers import dflash_min_loss_tokens
         from specforge.data.prompt_builder import _iter_records
 
         del input_tools  # each pool worker loads its own processor
@@ -138,7 +146,10 @@ class ImageServerInputAdapter:
         if not source_path:
             raise ValueError("prompt preparation requires a non-empty data path")
 
-        min_loss_tokens = dflash_min_loss_tokens(config, draft_config)
+        if min_loss_tokens is None:
+            from specforge.algorithms.model_providers import dflash_min_loss_tokens
+
+            min_loss_tokens = dflash_min_loss_tokens(config, draft_config)
         max_prompts = config.data.max_prompts or None
 
         # Loaded before the corpus is walked: a sidecar that is missing or

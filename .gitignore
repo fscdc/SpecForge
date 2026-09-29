@@ -215,3 +215,5 @@ accept-probe.*
 figures/
 logs/
 results*
+
+*.o*

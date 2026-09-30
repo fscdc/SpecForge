@@ -116,19 +116,43 @@ fi
 #     --max-tokens 4096 \
 #     --name origin_qwen35-4B_concurrency1_temp0_4096
 
-# video
+# video: same benchmarks, counts and frame settings as scripts/benchmark_mmflash.sh
+VIDEO_BENCHES="${VIDEO_BENCHES:-vdc:20 longvideobench:20 moviechat:20 videomme:20 mvbench:20}"
+# Frames per video. VDC's frames are 1080p+ (~2.7k tokens each, ~43k per
+# prompt); LongVideoBench and MovieChat are 720p (~840 tokens each), so at 16
+# frames their prompts are only ~13k. 48 frames brings them to VDC's scale.
+# A non-16 setting goes into the result name as _f<vdc>-<lvb>-<moviechat>
+# (plus -vm<N>/-mv<N> when Video-MME/MVBench leave 48),
+# because bench_mm reuses a results file by name and would otherwise skip a
+# benchmark it already holds at the old frame count.
+export VDC_NUM_FRAMES="${VDC_NUM_FRAMES:-16}"
+export LVB_NUM_FRAMES="${LVB_NUM_FRAMES:-48}"
+export MOVIECHAT_NUM_FRAMES="${MOVIECHAT_NUM_FRAMES:-48}"
+# Video-MME (720p) and MVBench (480p clips, rescaled to a 720p frame's area so a
+# frame costs the same 880 tokens) at 48 frames are ~42k image tokens as well.
+export VIDEOMME_NUM_FRAMES="${VIDEOMME_NUM_FRAMES:-48}"
+export MVBENCH_NUM_FRAMES="${MVBENCH_NUM_FRAMES:-48}"
+export MVBENCH_FRAME_PIXELS="${MVBENCH_FRAME_PIXELS:-1280x720}"
+FRAMES_SUFFIX=""
+if [ "${VDC_NUM_FRAMES}" != 16 ] || [ "${LVB_NUM_FRAMES}" != 16 ] || [ "${MOVIECHAT_NUM_FRAMES}" != 16 ]; then
+    FRAMES_SUFFIX="_f${VDC_NUM_FRAMES}-${LVB_NUM_FRAMES}-${MOVIECHAT_NUM_FRAMES}"
+fi
+# the two newer benchmarks only tag the name when moved off their 48-frame default
+if [ "${VIDEOMME_NUM_FRAMES}" != 48 ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-vm${VIDEOMME_NUM_FRAMES}"; fi
+if [ "${MVBENCH_NUM_FRAMES}" != 48 ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-mv${MVBENCH_NUM_FRAMES}"; fi
+if [ "${MVBENCH_FRAME_PIXELS}" != "1280x720" ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-mvpx${MVBENCH_FRAME_PIXELS}"; fi
 python benchmarks/bench_mm.py \
     --model Qwen/Qwen3.5-4B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
     --block-size 0 \
-    --benchmark-list vdc:20 \
+    --benchmark-list ${VIDEO_BENCHES} \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 4096 \
-    --name video_origin_qwen35-4B_concurrency1_temp0_4096
+    --name "video_origin_qwen35-4B_concurrency1_temp0_4096${FRAMES_SUFFIX}"
 
 
 # # for text benchmark

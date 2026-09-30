@@ -23,14 +23,14 @@ data:
   chat_template: "qwen3.5"
   build_dataset_num_proc: 32
   cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
-  max_prompts: 500
+  # max_prompts: 500
   # image_root stays empty: the regen records already carry absolute paths under
   # .../specforge/data/llava-ov15-1M/.
   # image_max_tokens stays 0 on purpose -- the capture server expands image_data
   # with the checkpoint's own resolution, so a client-side cap desyncs the prompt.
 training:
   strategy: "eagle3"
-  num_epochs: 1
+  num_epochs: 6
   # max_steps: 1000 # set for testing, comment out for full training
   batch_size: 1
   learning_rate: 0.0001
@@ -51,7 +51,7 @@ deployment:
   mode: disaggregated
   trainer:
     nnodes: 1
-    nproc_per_node: 1 # @sicheng: trainer GPUs only; the capture GPU is separate
+    nproc_per_node: 3 # @sicheng: trainer GPUs only; the capture GPU is separate
   disaggregated:
     control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-eagle3-llava-ov15-1M-prompted/control"
     consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-eagle3-llava-ov15-1M-prompted/consumer-state"
@@ -64,6 +64,8 @@ deployment:
       # trainer (consumer) GPUs — must stay disjoint from the capture server's
       trainer_cuda_visible_devices:
         - "1"
+        - "2"
+        - "3"
       mooncake:
         protocol: tcp
       capture_servers:

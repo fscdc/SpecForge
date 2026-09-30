@@ -34,21 +34,34 @@ export SGLANG_NUMA_BIND_V2=0
 
 BLOCK_SIZE=16
 
-# Draft context window, in target tokens. Empty = the draft attends to the whole
-# context (default). Set it to add --speculative-draft-window-size: SGLang then
-# keeps a compact per-request draft cache and the DFlash draft attends only to
-# the most recent DRAFT_WINDOW target tokens (no sink, no top-k). Training-free,
-# so it is the cheapest "sparse attention for the draft" experiment; the result
-# name gets a _win<N> suffix so runs stay apart. scripts/sweep_draft_window.sh
-# drives a sweep. NAME_SUFFIX is a free extra tag appended after it.
+
+VIDEO_BENCHES="${VIDEO_BENCHES:-vdc:20 longvideobench:20 moviechat:20 videomme:20 mvbench:20}"
+# Frames per video. VDC's frames are 1080p+ (~2.7k tokens each, ~43k per
+# prompt); LongVideoBench and MovieChat are 720p (~840 tokens each), so at 16
+# frames their prompts are only ~13k. 48 frames brings them to VDC's scale.
+# The benchmarks read these variables (defaults live in their modules, 16), and
+# any non-16 setting goes into the result name as _f<vdc>-<lvb>-<moviechat>
+# (plus -vm<N>/-mv<N> when Video-MME/MVBench leave 48),
+# because bench_mm reuses a results file by name and would otherwise skip a
+# benchmark it already holds at the old frame count.
+export VDC_NUM_FRAMES="${VDC_NUM_FRAMES:-16}"
+export LVB_NUM_FRAMES="${LVB_NUM_FRAMES:-48}"
+export MOVIECHAT_NUM_FRAMES="${MOVIECHAT_NUM_FRAMES:-48}"
+# Video-MME (720p) and MVBench (480p clips, rescaled to a 720p frame's area so a
+# frame costs the same 880 tokens) at 48 frames are ~42k image tokens as well.
+export VIDEOMME_NUM_FRAMES="${VIDEOMME_NUM_FRAMES:-48}"
+export MVBENCH_NUM_FRAMES="${MVBENCH_NUM_FRAMES:-48}"
+export MVBENCH_FRAME_PIXELS="${MVBENCH_FRAME_PIXELS:-1280x720}"
+FRAMES_SUFFIX=""
+if [ "${VDC_NUM_FRAMES}" != 16 ] || [ "${LVB_NUM_FRAMES}" != 16 ] || [ "${MOVIECHAT_NUM_FRAMES}" != 16 ]; then
+    FRAMES_SUFFIX="_f${VDC_NUM_FRAMES}-${LVB_NUM_FRAMES}-${MOVIECHAT_NUM_FRAMES}"
+fi
+# the two newer benchmarks only tag the name when moved off their 48-frame default
+if [ "${VIDEOMME_NUM_FRAMES}" != 48 ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-vm${VIDEOMME_NUM_FRAMES}"; fi
+if [ "${MVBENCH_NUM_FRAMES}" != 48 ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-mv${MVBENCH_NUM_FRAMES}"; fi
+if [ "${MVBENCH_FRAME_PIXELS}" != "1280x720" ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-mvpx${MVBENCH_FRAME_PIXELS}"; fi
+RUN_NAME="${RUN_NAME:-video_mmflash_qwen35-4B_concurrency1_temp0_4096}"
 DRAFT_WINDOW="${DRAFT_WINDOW:-}"
-# Sparse draft context on top of the window (needs DRAFT_WINDOW set): the
-# patched worker reads SGLANG_DFLASH_DRAFT_SPARSE, e.g.
-#   DRAFT_SPARSE="sink=4,text=1,stride=32,window=2048"
-# meaning sink positions + every text token + one of every 32 visual tokens
-# per frame + the most recent 2048 tokens. patches/sglang/v0.5.14/
-# dflash-draft-sparse-context.patch documents the semantics; the result name
-# gets a _sparse-<spec> suffix. See scripts/sweep_draft_sparse.sh.
 DRAFT_SPARSE="${DRAFT_SPARSE:-}"
 if [ -n "${DRAFT_SPARSE}" ]; then
     if [ -z "${DRAFT_WINDOW}" ]; then
@@ -64,9 +77,7 @@ fi
 NAME_SUFFIX="${NAME_SUFFIX:-}"
 RUN_SUFFIX="${DRAFT_WINDOW:+_win${DRAFT_WINDOW}}${SPARSE_SUFFIX}${NAME_SUFFIX}"
 
-# Patch the installed SGLang so every response carries its prefill/decode split
-# (first_token_latency / decode_latency). Must run before launch_server imports
-# tokenizer_manager.py. `bash scripts/benchmark_helper.sh --unpatch` undoes it.
+
 bash scripts/benchmark_helper.sh || exit 1
 
 
@@ -188,13 +199,13 @@ python benchmarks/bench_mm.py \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
     --block-size ${BLOCK_SIZE} \
-    --benchmark-list vdc:20  \
+    --benchmark-list ${VIDEO_BENCHES} \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 4096 \
-    --name "video_mmflash_qwen35-4B_concurrency1_temp0_4096${RUN_SUFFIX}"
+    --name "${RUN_NAME}${FRAMES_SUFFIX}${RUN_SUFFIX}"
 
 
 # # for text benchmark

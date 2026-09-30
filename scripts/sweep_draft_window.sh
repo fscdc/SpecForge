@@ -13,6 +13,11 @@
 # throughput numbers of the sweep come from the same GPU at the same time.
 #
 #   qsub -l select=1:ngpus=1 -l walltime=06:00:00 scripts/sweep_draft_window.sh
+#
+# Which video benchmarks run is VIDEO_BENCHES (default "vdc:20 longvideobench:20
+# moviechat:20 videomme:20 mvbench:20", see scripts/benchmark_mmflash.sh); the result files hold all of
+# them under their own keys, and a file that already has one benchmark only
+# gets the missing ones on a re-run.
 #   WINDOWS="1024 4096" bash scripts/sweep_draft_window.sh
 #
 # ~12 min per window on one H100 (20 videos x ~25 s prefill + decode, plus the
@@ -65,4 +70,5 @@ for w in ${WINDOWS}; do
 done
 
 echo "==================== summary $(date '+%F %T') ===================="
-python3 scripts/summarize_video_results.py
+# one table per video benchmark in VIDEO_BENCHES
+python3 scripts/summarize_video_results.py --benchmark "$(for b in ${VIDEO_BENCHES:-vdc:20 longvideobench:20 moviechat:20 videomme:20 mvbench:20}; do printf '%s,' "${b%%:*}"; done)"

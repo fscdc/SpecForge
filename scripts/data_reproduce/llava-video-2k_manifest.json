@@ -1,0 +1,30 @@
+{
+  "repo": "lmms-lab/LLaVA-Video-178K",
+  "revision": "6d8c562dc26d70042a0d9704d1cae58c94b89098",
+  "subset": "2_3_m_youtube_v0_1",
+  "sample_size": 2000,
+  "per_video": 10,
+  "oe_share": 0.3,
+  "num_frames": 48,
+  "frame_pixels": "1280x720",
+  "seed": 42,
+  "archives": [
+    "2_3_m_youtube_v0_1/2_3_m_youtube_v0_1_videos_1.tar.gz",
+    "2_3_m_youtube_v0_1/2_3_m_youtube_v0_1_videos_2.tar.gz"
+  ],
+  "records": 2000,
+  "videos": 200,
+  "styles": {
+    "longvideobench": 800,
+    "mvbench": 600,
+    "moviechat": 600
+  },
+  "prompt_templates": {
+    "longvideobench": "<question>\nA. <option A>\nB. <option B>\nThink through what happens in the video step by step first, then give your final answer as the option's letter.\n",
+    "mvbench": "Question:<question>\nOption:\n(A) <option A>\n(B) <option B>\nThink through what happens in the video step by step first, then give your final answer as the option's letter.\n",
+    "moviechat": "You are able to understand the visual content that the user provides.Follow the instructions carefully and explain your answers in detail.\n<question>"
+  },
+  "versions": {
+    "datasets": "5.0.1"
+  }
+}

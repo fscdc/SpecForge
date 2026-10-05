@@ -471,6 +471,9 @@ def build_mmflash_model(
 ) -> AlgorithmModelParts:
     from specforge.algorithms.common.mmflash_model import OnlineMMFlashModel
 
+    if cfg.training.draft_sparse is not None:
+        return _build_sparse_mmflash_model(cfg, draft_model, _target_config, tokenizer)
+
     return _build_dflash_family_model(
         cfg,
         draft_model,
@@ -481,6 +484,50 @@ def build_mmflash_model(
             dpace_alpha=cfg.training.dpace_alpha,
             visual_alpha=cfg.training.visual_alpha,
             mmflash_smoothing=cfg.training.mmflash_smoothing,
+        ),
+    )
+
+
+def _build_sparse_mmflash_model(
+    cfg: Config,
+    draft_model: Any,
+    target_config: Any,
+    tokenizer: Any,
+) -> AlgorithmModelParts:
+    """``training.draft_sparse`` set: the same model, trained on the sparse context.
+
+    Kept apart from ``build_mmflash_model`` so a run without the block builds
+    exactly what it always did. The visual spans are the runs of the target's
+    image/video pad tokens, read from the full (vision-language) target config
+    -- the same ids SGLang builds the multimodal offsets of the served request
+    from.
+    """
+    from specforge.algorithms.common.mmflash_sparse import (
+        DraftSparseContext,
+        OnlineSparseMMFlashModel,
+        visual_token_ids_of,
+    )
+
+    draft_sparse = DraftSparseContext.from_config(cfg.training.draft_sparse)
+    visual_token_ids = visual_token_ids_of(target_config)
+    if not visual_token_ids:
+        raise ValueError(
+            "training.draft_sparse needs the target's image/video pad token ids "
+            f"(image_token_id / video_token_id), but {cfg.model.target_model_path!r} "
+            "exposes none in its config"
+        )
+    return _build_dflash_family_model(
+        cfg,
+        draft_model,
+        tokenizer,
+        lambda common: OnlineSparseMMFlashModel(
+            **common,
+            loss_type=cfg.training.loss_type,
+            dpace_alpha=cfg.training.dpace_alpha,
+            visual_alpha=cfg.training.visual_alpha,
+            mmflash_smoothing=cfg.training.mmflash_smoothing,
+            draft_sparse=draft_sparse,
+            visual_token_ids=visual_token_ids,
         ),
     )
 

@@ -324,6 +324,10 @@ class ImageServerInputAdapter:
         the ones with nothing to load, while a list of lists lets it assign no
         modality to the empty ones. When the whole batch is text, ``image_data``
         is left out and the request is an ordinary text one.
+
+        A multi-image row (a video's frames) carries a list under ``image``; its
+        entry is that list as is, so SGLang pairs the i-th path with the i-th
+        ``<|vision_start|>...<|vision_end|>`` run of the prompt.
         """
         input_ids: list[list[int]] = []
         image_data: list[list[Any]] = []
@@ -331,7 +335,10 @@ class ImageServerInputAdapter:
             payload = task.payload
             input_ids.append(list(payload["input_ids"]))
             image = payload.get("image")
-            image_data.append([image] if image else [])
+            if isinstance(image, (list, tuple)):
+                image_data.append([str(path) for path in image])
+            else:
+                image_data.append([image] if image else [])
         if not any(image_data):
             return {"input_ids": input_ids}
         return {"input_ids": input_ids, "image_data": image_data}

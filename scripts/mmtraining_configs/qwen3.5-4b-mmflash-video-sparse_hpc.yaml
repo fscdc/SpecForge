@@ -1,0 +1,96 @@
+# MMFlash 4B, continued training on the ~2k LLaVA-Video rows with a SPARSE draft
+# context, served with the same sparse context at inference. The dense control,
+# identical except draft_sparse, is qwen3.5-4b-mmflash-video-dense_hpc.yaml.
+#
+#   specforge train --config scripts/mmtraining_configs/qwen3.5-4b-mmflash-video-sparse_hpc.yaml
+#
+# After training (the export stamps dflash_config.draft_sparse from the run):
+#   specforge export --to hf --checkpoint <output_dir>/<run_id>-step<N> \
+#       --draft-config configs/qwen3.5-4b-mmflash.json --output-dir <export>
+#   python scripts/gates/normalize_dflash_export.py --config <export>/config.json --block-size 16
+#   flags=$(python scripts/draft_sparse_env.py <export>) || exit 1
+#   eval "$flags"    # exports DRAFT_MODEL / DRAFT_SPARSE / DRAFT_WINDOW / NAME_SUFFIX
+#   bash scripts/benchmark_mmflash-video.sh   # with --speculative-draft-model-path "${DRAFT_MODEL}"
+model:
+  target_model_path: "Qwen/Qwen3.5-4B"
+  # The warm-start export is normalised for SGLang (DFlashDraftModel), so the
+  # MMFlash architecture has to come from here.
+  draft_model_config: "configs/qwen3.5-4b-mmflash.json"
+  # Weights-only warm start: fresh optimizer, LR schedule and step counter.
+  draft_checkpoint_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-llava-ov15-1M-prompted-final"
+  target_backend: sglang
+  input_modality: image
+  trust_remote_code: true
+  embedding_key: "model.language_model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+data:
+  # 1,951 rows: 48 frames (880 tokens each) + a benchmark-style question + the target's answer.
+  train_data_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_llava-video-2k_regen.jsonl"
+  # Rows are 42.4k-45.0k tokens; longer rows are dropped, never truncated.
+  max_length: 49152
+  chat_template: "qwen3.5"
+  build_dataset_num_proc: 16
+  dataloader_num_workers: 2
+  cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
+  # Shared with the dense run. Made by:
+  #   GPUS=0,1,2,3 bash scripts/score_visual_kl_hpc.sh scripts/mmtraining_configs/<this yaml>
+  visual_score_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/visual_kl/llava-video-2k"
+  visual_score_transform: "quantile"
+  visual_score_confidence_gate: true
+training:
+  strategy: "mmflash"
+  loss_type: "mmflash"
+  mmflash_smoothing: 0.5
+  visual_alpha: 1.0
+  # The same four numbers become SGLANG_DFLASH_DRAFT_SPARSE at inference.
+  draft_sparse:
+    sink: 4         # first positions always visible
+    text: true      # all non-image tokens visible
+    stride: 32      # image tokens at offsets 16, 48, ... of every frame (27 of 880)
+    window: 512    # plus the most recent 512 positions before the anchor
+  num_epochs: 6
+  batch_size: 2
+  accumulation_steps: 4
+  learning_rate: 0.0001
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  attention_backend: "flex_attention"
+  num_anchors: 512
+  loss_decay_gamma: 7
+  save_interval: 100
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+runtime:
+  producer_lease: 1
+  in_flight_high_watermark: 16   # captured rows waiting for the trainer, ~1.1 GB each
+  in_flight_low_watermark: 8
+
+tracking:
+  report_to: "tensorboard"
+run_id: "qwen3.5-4b-mmflash-video-sparse-1"
+output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-video-sparse-1"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
+  disaggregated:
+    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-video-sparse-1/control"
+    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-video-sparse-1/consumer-state"
+    backend: mooncake
+    client_buffer_size: 2147483648   # above one row's ~1.1 GB of hidden states
+    managed_local:
+      trainer_cuda_visible_devices:
+        - "1"
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 51539607552   # 48 GiB: the in-flight rows with headroom
+        local_buffer_size_bytes: 2147483648
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices:
+            - "0"
+          tp_size: 1
+          mem_fraction_static: 0.70

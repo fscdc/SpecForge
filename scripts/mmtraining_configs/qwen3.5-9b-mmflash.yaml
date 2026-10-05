@@ -48,15 +48,15 @@ training:
   attention_backend: "flex_attention"
   num_anchors: 512
   loss_decay_gamma: 7
-  save_interval: 50000
+  save_interval: 10000
   log_interval: 50
   dist_timeout: 30
   seed: 42
 
 tracking:
   report_to: "tensorboard"
-run_id: "qwen3.5-9b-mmflash-llava-ov15-1M-prompted-mmloss"
-output_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-9b-mmflash-llava-ov15-1M-prompted-mmloss"
+run_id: "qwen3.5-9b-mmflash-llava-ov15-1M-prompted"
+output_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-9b-mmflash-llava-ov15-1M-prompted"
 
 deployment:
   mode: disaggregated
@@ -64,8 +64,8 @@ deployment:
     nnodes: 1
     nproc_per_node: 3 # @sicheng: same as gpu count
   disaggregated:
-    control_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-9b-mmflash-llava-ov15-1M-prompted-mmloss/control"
-    consumer_state_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-9b-mmflash-llava-ov15-1M-prompted-mmloss/consumer-state"
+    control_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-9b-mmflash-llava-ov15-1M-prompted/control"
+    consumer_state_dir: "/local_home2/fengsicheng/specforge/outputs/qwen3.5-9b-mmflash-llava-ov15-1M-prompted/consumer-state"
     backend: mooncake
     # server_urls:
     #   - http://127.0.0.1:30000

@@ -27,8 +27,15 @@ if [[ "$SGL_VERSION" != 0.5.14* ]]; then
     echo "WARNING: installed sglang is $SGL_VERSION; the patch targets v0.5.14" >&2
 fi
 
+# Reversals use --force, never --batch: when a hunk does not match, GNU patch
+# with --batch prints "Unreversed patch detected! Ignoring -R." and applies it
+# FORWARD, which is how a stale tree could end up with a hunk twice.
 if [[ "${1:-}" == "--reverse" ]]; then
-    patch --reverse -p2 --batch -N -d "$SGL_PARENT" < "$PATCH"
+    # Reverse what is actually applied: the recorded copy, not the repo's
+    # patch, which may be a newer revision than the tree carries.
+    applied="$PATCH"
+    [[ -f "$APPLIED_COPY" ]] && applied="$APPLIED_COPY"
+    patch --reverse -p2 --force --no-backup-if-mismatch -d "$SGL_PARENT" < "$applied"
     rm -f "$APPLIED_COPY"
     echo "spec-capture patch --reverse at $SGL_PARENT/sglang (sglang $SGL_VERSION)"
     exit 0
@@ -40,7 +47,7 @@ if [[ -f "$APPLIED_COPY" ]]; then
         exit 0
     fi
     echo "spec-capture patch changed; reversing the recorded version first"
-    patch --reverse -p2 --batch -d "$SGL_PARENT" < "$APPLIED_COPY"
+    patch --reverse -p2 --force --no-backup-if-mismatch -d "$SGL_PARENT" < "$APPLIED_COPY"
 elif [[ -f "$SINK" ]]; then
     # Patched before the applied-copy record existed. Adopt only a tree that
     # provably matches the current patch; otherwise demand a clean reinstall.
@@ -60,6 +67,6 @@ elif [[ -f "$SINK" ]]; then
     exit 1
 fi
 
-patch -p2 --batch -N -d "$SGL_PARENT" < "$PATCH"
+patch -p2 --batch -N --no-backup-if-mismatch -d "$SGL_PARENT" < "$PATCH"
 cp "$PATCH" "$APPLIED_COPY"
 echo "spec-capture patch applied at $SGL_PARENT/sglang (sglang $SGL_VERSION)"

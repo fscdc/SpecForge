@@ -29,10 +29,11 @@ mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" || {
 
 # DFLASH_CONFIG=scripts/mmtraining_configs/qwen3.5-9b-dflash.yaml
 # MMFLASH_CONFIG=scripts/mmtraining_configs/qwen3.5-4b-mmflash.yaml
-EAGLE3_CONFIG=scripts/mmtraining_configs/qwen3.5-4b-eagle3_hpc.yaml
+# EAGLE3_CONFIG=scripts/mmtraining_configs/qwen3.5-4b-eagle3_hpc.yaml
+# MMFLASH_VIDEO_CONFIG=scripts/mmtraining_configs/qwen3.5-4b-mmflash-video-sparse_hpc.yaml
 
 
 # bash scripts/score_visual_kl_hpc.sh ${MMFLASH_CONFIG} # only need for mmflash
 
-specforge train --config ${EAGLE3_CONFIG}
+# specforge train --config ${EAGLE3_CONFIG}
 

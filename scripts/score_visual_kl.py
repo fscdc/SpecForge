@@ -101,6 +101,24 @@ def fingerprint_input_ids(input_ids) -> str:
     ).hexdigest()
 
 
+def _load_images(image) -> list:
+    """The record's picture(s) as RGB PIL images, in placeholder order.
+
+    ``image`` is one path for an image row, or a list of frame paths for a
+    video row (``prepare_data_mm.py --dataset llava-video-178k``); either way
+    the processor gets every picture of the row at once, exactly as
+    ``encode_mm_record`` expanded it.
+    """
+    from PIL import Image
+
+    paths = image if isinstance(image, (list, tuple)) else [image]
+    images = []
+    for path in paths:
+        with Image.open(path) as handle:
+            images.append(handle.convert("RGB"))
+    return images
+
+
 def _shard_paths(output_dir: str, shard: int, num_shards: int):
     tag = f"shard{shard:03d}-of-{num_shards:03d}"
     return (
@@ -127,6 +145,31 @@ def _already_done(path: str) -> set:
     with open(path, encoding="utf-8") as handle:
         for line in handle:
             if line.strip():
+                try:
+                    done.add(str(json.loads(line)["id"]))
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    return done
+
+
+def _ids_in_other_shards(output_dir: str, own_path: str) -> set:
+    """Ids already scored by ANY other shard file in the output directory.
+
+    Rows go to shards by line index modulo --num-shards, so re-running with a
+    different shard count (e.g. finishing a 1-GPU run on 4 GPUs) assigns rows
+    already scored under the old split to new shards. Skipping every id found
+    in the directory keeps such a resume from scoring a row twice, which the
+    training loader rejects. Other files may be appended to concurrently, so
+    they are only read, and a torn last line is skipped.
+    """
+    import glob
+
+    done = set()
+    for path in glob.glob(os.path.join(output_dir, "visual_kl.*.jsonl")):
+        if os.path.abspath(path) == os.path.abspath(own_path):
+            continue
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
                 try:
                     done.add(str(json.loads(line)["id"]))
                 except (json.JSONDecodeError, KeyError):
@@ -187,6 +230,15 @@ def main() -> None:
     done = set() if args.no_resume else _already_done(out_path)
     if done:
         print(f"[scorer] resuming: {len(done)} rows already in {out_path}", flush=True)
+    if not args.no_resume:
+        elsewhere = _ids_in_other_shards(args.output_dir, out_path) - done
+        if elsewhere:
+            print(
+                f"[scorer] skipping {len(elsewhere)} rows already scored by other shard "
+                f"files in {args.output_dir}",
+                flush=True,
+            )
+            done |= elsewhere
     mode = "w" if args.no_resume else "a"
 
     counts: Dict[str, int] = {
@@ -249,14 +301,14 @@ def main() -> None:
                 continue
 
             try:
-                with Image.open(payload["image"]) as handle:
-                    image = handle.convert("RGB")
-                    text = processor.apply_chat_template(
-                        to_chat_messages(record["conversations"]),
-                        tokenize=False,
-                        add_generation_prompt=False,
-                    )
-                    inputs = processor(text=[text], images=[image], return_tensors="pt")
+                images = _load_images(payload["image"])
+                text = processor.apply_chat_template(
+                    to_chat_messages(record["conversations"]),
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+                inputs = processor(text=[text], images=images, return_tensors="pt")
+                del images
             except (OSError, ValueError):
                 counts["image_error"] += 1
                 continue

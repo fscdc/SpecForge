@@ -1,5 +1,6 @@
 import argparse
 import base64
+import functools
 import json
 import mimetypes
 import os
@@ -558,6 +559,18 @@ SUPPORTED_MM_MODELS = (
 )
 
 
+def is_video_row(data: Any) -> bool:
+    """Whether a row carries a LIST of images: one frame per `<image>`.
+
+    prepare_data_mm.py's llava-video-178k preset writes these: `image` holds a
+    video's 48 frame paths, in order, and the user turn opens with one
+    placeholder per frame followed by the question in the exact wording of
+    the LongVideoBench, MVBench or MovieChat benchmark. Every other preset
+    writes a single path (or null) there.
+    """
+    return isinstance(data, dict) and isinstance(data.get("image"), list)
+
+
 def validate_regen_input(data: Any) -> str | None:
     """Return why a ShareGPT row cannot be regenerated, or ``None``."""
     if not isinstance(data, dict):
@@ -569,6 +582,29 @@ def validate_regen_input(data: Any) -> str | None:
     )
     if conversation_error is not None:
         return conversation_error
+
+    if is_video_row(data):
+        # Every frame must exist and be claimed by exactly one placeholder: a
+        # frame without one would never be sent, a placeholder without one
+        # would leave the request (and later the trainer) short of an image.
+        # Only user turns count, since only they are sent with their images.
+        frames = data["image"]
+        if not frames:
+            return "Row has an empty `image` list"
+        for frame in frames:
+            if not isinstance(frame, str) or not os.path.isfile(frame):
+                return f"Image file not found: {frame!r}"
+        placeholders = sum(
+            message["content"].count(IMAGE_PLACEHOLDER)
+            for message in data["conversations"]
+            if message.get("role") == "user"
+        )
+        if placeholders != len(frames):
+            return (
+                f"Row has {len(frames)} images but {placeholders} "
+                f"{IMAGE_PLACEHOLDER} placeholders in its user turns"
+            )
+        return None
 
     image_path = data.get("image")
     if image_path is not None:
@@ -596,6 +632,48 @@ def set_skipped(data: Any, error: str) -> Dict[str, Any]:
 def count_lines(path: str) -> int:
     with open(path, encoding="utf-8") as handle:
         return sum(1 for _ in handle)
+
+
+def drop_partial_last_line(path: str) -> bool:
+    """Cut a JSONL file's last line if a killed run left it half written.
+
+    Rows are written through a buffered handle, so a run killed by a walltime
+    limit or a closed interactive session leaves the buffer's tail on disk:
+    one row cut mid-JSON at the end of the file. That row is not done -- it is
+    regenerated like any other missing one -- but its fragment would make
+    every later read of the file (resume, the filter pass, training) fail, so
+    it goes. A last line that is complete JSON only missing its newline gets
+    the newline instead. Returns whether a fragment was cut.
+    """
+    if not os.path.exists(path):
+        return False
+    with open(path, "rb+") as handle:
+        end = handle.seek(0, os.SEEK_END)
+        if end == 0:
+            return False
+        handle.seek(end - 1)
+        if handle.read(1) == b"\n":
+            # every row is one write ending in "\n", and json.dumps escapes
+            # newlines inside strings, so a file ending in one is whole
+            return False
+        start, position = 0, end
+        while position > 0:
+            begin = max(0, position - (1 << 16))
+            handle.seek(begin)
+            newline = handle.read(position - begin).rfind(b"\n")
+            if newline != -1:
+                start = begin + newline + 1
+                break
+            position = begin
+        handle.seek(start)
+        try:
+            json.loads(handle.read(end - start))
+        except ValueError:
+            handle.truncate(start)
+            return True
+        handle.seek(end)
+        handle.write(b"\n")
+        return False
 
 
 def collect_row_ids(path: str) -> set | None:
@@ -895,8 +973,88 @@ def _image_to_data_url(image_path: str) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
+#: Data URLs of video frames, by path. The ~10 records of one video share its
+#: 48 frames and sit next to each other in the input, so they are read and
+#: encoded once per video rather than once per record. 256 entries are five
+#: videos' worth (~200 KB of base64 a 720p frame, ~50 MB in all), more than
+#: the requests a single server keeps in flight. Thread-safe; single-image rows
+#: do not go through it.
+_frame_data_url = functools.lru_cache(maxsize=256)(_image_to_data_url)
+
+
+def interleave_image_parts(
+    content: str, image_urls: Sequence[str]
+) -> List[Dict[str, Any]]:
+    """One user turn as an OpenAI content array, one image part per placeholder.
+
+    Built to be exactly what benchmarks/bench_mm.py sends for the video
+    benchmarks, `[image_url x N, text]`: every placeholder becomes an
+    `image_url` part, in order, and the text around them is kept VERBATIM --
+    no strip, because the benchmarks' questions end in a newline that the
+    server's chat template renders into the prompt. The one thing removed is
+    the newline prepare_data_mm.py writes after the last placeholder
+    (`"<image>" * N + "\\n" + question`), which only keeps the JSONL readable
+    and is not part of the benchmark prompt.
+    """
+    chunks = content.split(IMAGE_PLACEHOLDER)
+    if len(chunks) - 1 != len(image_urls):
+        raise ValueError(
+            f"{len(chunks) - 1} {IMAGE_PLACEHOLDER} placeholders but "
+            f"{len(image_urls)} images"
+        )
+    if len(chunks) > 1 and chunks[-1].startswith("\n"):
+        chunks[-1] = chunks[-1][1:]
+    parts: List[Dict[str, Any]] = []
+    for index, chunk in enumerate(chunks):
+        if index:
+            parts.append(
+                {"type": "image_url", "image_url": {"url": image_urls[index - 1]}}
+            )
+        if chunk:
+            parts.append({"type": "text", "text": chunk})
+    return parts
+
+
+def to_interleaved_messages(
+    messages: List[Dict[str, Any]], image_data_urls: Sequence[str]
+) -> List[Dict[str, Any]]:
+    """Return a copy of ``messages`` with every user-turn placeholder replaced
+    by the next image, in order -- the multi-image counterpart of
+    `to_multimodal_messages`.
+
+    Images are matched to placeholders from the first message on each call,
+    so the growing history `call_sglang` sends turn by turn always pairs the
+    same frame with the same placeholder. The stored messages keep their
+    placeholders, exactly as for single-image rows.
+    """
+    remaining = list(image_data_urls)
+    converted = []
+    for message in messages:
+        content = message.get("content")
+        if (
+            message.get("role") != "user"
+            or not isinstance(content, str)
+            or IMAGE_PLACEHOLDER not in content
+        ):
+            converted.append(message)
+            continue
+        count = content.count(IMAGE_PLACEHOLDER)
+        if count > len(remaining):
+            raise ValueError(
+                f"the conversation has more {IMAGE_PLACEHOLDER} placeholders "
+                f"than its {len(image_data_urls)} images"
+            )
+        converted_message = dict(message)
+        converted_message["content"] = interleave_image_parts(
+            content, remaining[:count]
+        )
+        remaining = remaining[count:]
+        converted.append(converted_message)
+    return converted
+
+
 def to_multimodal_messages(
-    messages: List[Dict[str, Any]], image_data_url: str
+    messages: List[Dict[str, Any]], image_data_url: str | Sequence[str]
 ) -> List[Dict[str, Any]]:
     """Return a copy of ``messages`` with the first `<image>` placeholder
     replaced by an OpenAI-style image content part.
@@ -905,7 +1063,12 @@ def to_multimodal_messages(
     intact) is left untouched; this copy exists only to be sent over the
     wire, so every regenerated row keeps writing the placeholder back to
     disk.
+
+    A list of data URLs (a video row) is handed to `to_interleaved_messages`
+    instead, which places one image per placeholder.
     """
+    if isinstance(image_data_url, (list, tuple)):
+        return to_interleaved_messages(messages, image_data_url)
     converted = []
     image_injected = False
     for message in messages:
@@ -996,9 +1159,21 @@ def call_sglang(
 
     messages = data["conversations"]
     regenerated_messages = []
+    finish_reasons: List[Optional[str]] = []
 
     image_path = data.get("image")
-    image_data_url = _image_to_data_url(image_path) if image_path is not None else None
+    try:
+        if is_video_row(data):
+            # one data URL per frame, in placeholder order
+            image_data_url = [_frame_data_url(path) for path in image_path]
+        else:
+            image_data_url = (
+                _image_to_data_url(image_path) if image_path is not None else None
+            )
+    except OSError as error:
+        # validated as present before submission, so this is a file that went
+        # missing or unreadable since; retrying would not bring it back
+        return set_skipped(data, f"Cannot read image: {error}")
 
     # ignore data which starts with an assistant message
     if messages[0]["role"] == "assistant":
@@ -1025,6 +1200,7 @@ def call_sglang(
                 data["error"] = str(e)
                 return data
             response_text = resp.choices[0].message.content
+            finish_reasons.append(resp.choices[0].finish_reason)
             if args.reasoning == "disable" and (
                 not isinstance(response_text, str)
                 or not response_text.strip()
@@ -1084,6 +1260,14 @@ def call_sglang(
             data["error"] = f"Invalid message role: {message['role']}"
             return data
     data["conversations"] = regenerated_messages
+    if is_video_row(data):
+        # Kept for the filter pass: a video answer cut at --max-tokens is a
+        # runaway (the smoke run's was 4,096 tokens of counting), which
+        # is_degenerate misses because counting never repeats a chunk. Video
+        # rows only, so the image files keep their exact schema.
+        data["finish_reason"] = (
+            "length" if "length" in finish_reasons else finish_reasons[-1]
+        )
     data["status"] = "success"
     return data
 
@@ -1153,6 +1337,8 @@ def filter_regenerated(output_file_path: str) -> tuple[int, "Counter"]:
                 reason = "answer repeats the prompt"
             elif is_degenerate(answer):
                 reason = "degenerate repetition"
+            elif is_video_row(data) and data.get("finish_reason") == "length":
+                reason = "video answer cut at --max-tokens"
             else:
                 reason = None
 
@@ -1186,6 +1372,8 @@ def summarise_regenerated(output_file_path: str) -> None:
 
     total = 0
     with_image = 0
+    with_video = 0
+    video_frames = 0
     with_system = 0
     prompts: Dict[str, List[int]] = defaultdict(list)
     answers: Dict[str, List[int]] = defaultdict(list)
@@ -1199,8 +1387,16 @@ def summarise_regenerated(output_file_path: str) -> None:
             with_image += data.get("image") is not None
             conversations = data["conversations"]
             with_system += any(m.get("role") == "system" for m in conversations)
-            family = row_family(data) or "unlabelled"
-            prompts[family].append(len(conversations[-2]["content"]))
+            prompt = conversations[-2]["content"]
+            if is_video_row(data):
+                with_video += 1
+                video_frames += len(data["image"])
+                # 48 placeholders would otherwise be most of the prompt length
+                prompt = prompt.replace(IMAGE_PLACEHOLDER, "")
+            # video rows carry no LLaVA-OneVision config in their id; they are
+            # told apart by the benchmark whose prompt they were given
+            family = row_family(data) or data.get("style") or "unlabelled"
+            prompts[family].append(len(prompt))
             answers[family].append(len(conversations[-1]["content"]))
     if not total:
         print("No rows to summarise.")
@@ -1211,6 +1407,12 @@ def summarise_regenerated(output_file_path: str) -> None:
         f"  {total:,} rows -- {with_image:,} with an image, "
         f"{total - with_image:,} text-only, {with_system:,} with a system turn"
     )
+    if with_video:
+        print(
+            f"  {with_video:,} of the image rows are videos, "
+            f"{video_frames / with_video:.1f} frames each on average "
+            "(prompt lengths below exclude the frame placeholders)"
+        )
     print(
         f"  {'family':<18}{'rows':>10}{'share':>8}"
         f"{'prompt p50':>12}{'answer p50':>12}{'p90':>9}{'<=3 chars':>11}"
@@ -1291,6 +1493,19 @@ def main():
     error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
     skipped_file_path = args.output_file_path.replace(".jsonl", "_skipped.jsonl")
     rejected_file_path = args.output_file_path.replace(".jsonl", "_rejected.jsonl")
+
+    if args.resume:
+        for path in (
+            args.output_file_path,
+            error_file_path,
+            skipped_file_path,
+            rejected_file_path,
+        ):
+            if drop_partial_last_line(path):
+                print(
+                    f"Resume: cut a half-written last row from {path} (the "
+                    "previous run was killed mid-write); it is regenerated"
+                )
 
     if args.resume and os.path.exists(args.output_file_path):
         existing_success = count_lines(args.output_file_path)
@@ -1430,7 +1645,10 @@ def main():
             if resume_by_id and isinstance(data, dict) and data.get("id") in done_ids:
                 continue
             unusable = sanitize_regen_row(data)
-            if unusable is None and args.align_prompts:
+            # Video rows are never rewritten: prepare_data_mm.py already built
+            # their prompts with the video benchmarks' own formatters, so any
+            # rewrite could only move them away from what is benchmarked.
+            if unusable is None and args.align_prompts and not is_video_row(data):
                 # The terse rule runs FIRST. A text-math row can carry a terse
                 # preamble ("First conduct reasoning ... provide the corret
                 # option letter at the end."), and the math rule would append

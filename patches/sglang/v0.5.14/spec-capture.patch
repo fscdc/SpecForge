@@ -657,3 +657,72 @@ diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/
          num_image_tokens = self._processor._get_num_multimodal_tokens(
              image_sizes=image_sizes
          ).num_image_tokens
+diff --git a/python/sglang/srt/managers/mm_utils.py b/python/sglang/srt/managers/mm_utils.py
+--- a/python/sglang/srt/managers/mm_utils.py
++++ b/python/sglang/srt/managers/mm_utils.py
+@@ -1476,6 +1476,56 @@
+     return True
+ 
+ 
++def _owned(value):
++    """value itself, or a copy when it is a CPU tensor viewing a larger storage."""
++    if (
++        isinstance(value, torch.Tensor)
++        and value.is_cpu
++        and value.untyped_storage().nbytes() > value.numel() * value.element_size()
++    ):
++        return value.clone()
++    return value
++
++
++def _own_split_storage(items):
++    """Give every split CPU tensor its own storage when the request will be
++    pickled in-band (spec-capture patch).
++
++    The per-image/per-video items made below share ONE bundled tensor: each
++    item's feature (and its model_specific_data slices) are views. Pickling a
++    view writes its whole base storage, so N items that stay views of one
++    tensor send N copies of ALL N images to the scheduler: O(N^2) bytes. The
++    /dev/shm transport copies each view on its own and never hits this, but
++    --skip-tokenizer-init (the hidden-state capture server) and the
++    cross-node "default" transport bypass it (wrap_shm_features) and pickle
++    the features in-band. For a 48-frame 1280x720 video, 1.04 GB of
++    pixel_values became a 49.8 GB message: ~98 s and ~230 GB of host RAM
++    (tokenizer + scheduler) per request before the scheduler saw it, against
++    ~3.4 s and ~10 GB with this copy (measured, Qwen3.5-4B, one H200). On the
++    /dev/shm path the copy would only be redundant, so it is skipped there.
++    """
++    try:
++        args = get_global_server_args()
++        in_band = args.skip_tokenizer_init or _get_is_default_transport()
++    except ValueError:  # no server args (offline use, tests): assume in-band
++        in_band = True
++    if not in_band:
++        return items
++    for item in items:
++        for name in ("feature", "precomputed_embeddings"):
++            value = getattr(item, name, None)
++            owned = _owned(value)
++            if owned is not value:
++                setattr(item, name, owned)
++        data = getattr(item, "model_specific_data", None)
++        if isinstance(data, dict):
++            for key, value in data.items():
++                owned = _owned(value)
++                if owned is not value:
++                    data[key] = owned
++    return items
++
++
+ def get_new_expanded_mm_items(original_mm_items):
+     expanded_mm_items = []
+     for item in original_mm_items:
+@@ -1625,7 +1675,7 @@
+ 
+         else:
+             expanded_mm_items.append(item)
+-    return expanded_mm_items
++    return _own_split_storage(expanded_mm_items)
+ 
+ 
+ class ShmPointerMMData:

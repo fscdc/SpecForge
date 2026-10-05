@@ -41,12 +41,12 @@ for idx in "${!GPU_IDS[@]}"; do
     PORTS+=("${port}")
     BASE_URLS+=("http://localhost:${port}")
     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
-        --model Qwen/Qwen3.5-4B \
+        --model Qwen/Qwen3.5-9B \
         --mem-fraction-static 0.7 \
         --tp 1 \
         --trust-remote-code \
         --cuda-graph-max-bs 128 \
-        --attention-backend fa3 \
+        --attention-backend triton \
         --mm-attention-backend sdpa \
         --host 0.0.0.0 \
         --port ${port} \
@@ -85,74 +85,90 @@ if [ $? -ne 0 ]; then
 fi
 
 
-# CONCURRENCIES="${CONCURRENCIES:-2 4 8 16 32}"
-
-# for CONC in ${CONCURRENCIES}; do
-#     echo "===== concurrency ${CONC} ====="
-#     python benchmarks/bench_mm.py \
-#         --model Qwen/Qwen3.5-4B \
-#         --base-url "${BASE_URLS[@]}" \
-#         --concurrency ${CONC} \
-#         --block-size 0 \
-#         --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
-#         --reasoning off \
-#         --temperature 0.0 \
-#         --top-p 0.95 \
-#         --top-k 20 \
-#         --max-tokens 4096 \
-#         --name "origin_qwen35-4B_concurrency${CONC}_temp0_4096"
-# done
-
-# python benchmarks/bench_mm.py \
-#     --model Qwen/Qwen3.5-4B \
-#     --base-url "${BASE_URLS[@]}" \
-#     --concurrency 1 \
-#     --block-size 0 \
-#     --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200 \
-#     --reasoning off \
-#     --temperature 0.0 \
-#     --top-p 0.95 \
-#     --top-k 20 \
-#     --max-tokens 4096 \
-#     --name origin_qwen35-4B_concurrency1_temp0_4096
-
-# video: same benchmarks, counts and frame settings as scripts/benchmark_mmflash.sh
-VIDEO_BENCHES="${VIDEO_BENCHES:-vdc:20 longvideobench:20 moviechat:20 videomme:20 mvbench:20}"
-# Frames per video. VDC's frames are 1080p+ (~2.7k tokens each, ~43k per
-# prompt); LongVideoBench and MovieChat are 720p (~840 tokens each), so at 16
-# frames their prompts are only ~13k. 48 frames brings them to VDC's scale.
-# A non-16 setting goes into the result name as _f<vdc>-<lvb>-<moviechat>
-# (plus -vm<N>/-mv<N> when Video-MME/MVBench leave 48),
-# because bench_mm reuses a results file by name and would otherwise skip a
-# benchmark it already holds at the old frame count.
-export VDC_NUM_FRAMES="${VDC_NUM_FRAMES:-16}"
-export LVB_NUM_FRAMES="${LVB_NUM_FRAMES:-48}"
-export MOVIECHAT_NUM_FRAMES="${MOVIECHAT_NUM_FRAMES:-48}"
-# Video-MME (720p) and MVBench (480p clips, rescaled to a 720p frame's area so a
-# frame costs the same 880 tokens) at 48 frames are ~42k image tokens as well.
-export VIDEOMME_NUM_FRAMES="${VIDEOMME_NUM_FRAMES:-48}"
-export MVBENCH_NUM_FRAMES="${MVBENCH_NUM_FRAMES:-48}"
-export MVBENCH_FRAME_PIXELS="${MVBENCH_FRAME_PIXELS:-1280x720}"
-FRAMES_SUFFIX=""
-if [ "${VDC_NUM_FRAMES}" != 16 ] || [ "${LVB_NUM_FRAMES}" != 16 ] || [ "${MOVIECHAT_NUM_FRAMES}" != 16 ]; then
-    FRAMES_SUFFIX="_f${VDC_NUM_FRAMES}-${LVB_NUM_FRAMES}-${MOVIECHAT_NUM_FRAMES}"
-fi
-# the two newer benchmarks only tag the name when moved off their 48-frame default
-if [ "${VIDEOMME_NUM_FRAMES}" != 48 ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-vm${VIDEOMME_NUM_FRAMES}"; fi
-if [ "${MVBENCH_NUM_FRAMES}" != 48 ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-mv${MVBENCH_NUM_FRAMES}"; fi
-if [ "${MVBENCH_FRAME_PIXELS}" != "1280x720" ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-mvpx${MVBENCH_FRAME_PIXELS}"; fi
 python benchmarks/bench_mm.py \
-    --model Qwen/Qwen3.5-4B \
+    --model Qwen/Qwen3.5-9B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
     --block-size 0 \
-    --benchmark-list ${VIDEO_BENCHES} \
+    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200 mmbench:200 \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 4096 \
-    --name "video_origin_qwen35-4B_concurrency1_temp0_4096${FRAMES_SUFFIX}"
+    --name origin_qwen35-9B_concurrency1_temp0_4096
+
+python benchmarks/bench_mm.py \
+    --model Qwen/Qwen3.5-9B \
+    --base-url "${BASE_URLS[@]}" \
+    --concurrency 1 \
+    --block-size 0 \
+    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200 mmbench:200 \
+    --reasoning off \
+    --temperature 1.0 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --max-tokens 4096 \
+    --name origin_qwen35-9B_concurrency1_temp1_4096
+
+
+# Concurrency sweep last: the single-request runs above feed the main tables, so
+# they must land first if the walltime cuts the job short.
+CONCURRENCIES="${CONCURRENCIES:-2 4 8 16 32}"
+
+for CONC in ${CONCURRENCIES}; do
+    echo "===== concurrency ${CONC} ====="
+    python benchmarks/bench_mm.py \
+        --model Qwen/Qwen3.5-9B \
+        --base-url "${BASE_URLS[@]}" \
+        --concurrency ${CONC} \
+        --block-size 0 \
+        --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 mmbench:200 dynamath:200 mathvista:200 mathverse:200  \
+        --reasoning off \
+        --temperature 0.0 \
+        --top-p 0.95 \
+        --top-k 20 \
+        --max-tokens 4096 \
+        --name "origin_qwen35-9B_concurrency${CONC}_temp0_4096"
+done
+
+# # video: same benchmarks, counts and frame settings as scripts/benchmark_mmflash.sh
+# VIDEO_BENCHES="${VIDEO_BENCHES:-longvideobench:20 moviechat:20 mvbench:20}"
+# # Frames per video. VDC's frames are 1080p+ (~2.7k tokens each, ~43k per
+# # prompt); LongVideoBench and MovieChat are 720p (~840 tokens each), so at 16
+# # frames their prompts are only ~13k. 48 frames brings them to VDC's scale.
+# # A non-16 setting goes into the result name as _f<vdc>-<lvb>-<moviechat>
+# # (plus -vm<N>/-mv<N> when Video-MME/MVBench leave 48),
+# # because bench_mm reuses a results file by name and would otherwise skip a
+# # benchmark it already holds at the old frame count.
+# export VDC_NUM_FRAMES="${VDC_NUM_FRAMES:-16}"
+# export LVB_NUM_FRAMES="${LVB_NUM_FRAMES:-48}"
+# export MOVIECHAT_NUM_FRAMES="${MOVIECHAT_NUM_FRAMES:-48}"
+# # Video-MME (720p) and MVBench (480p clips, rescaled to a 720p frame's area so a
+# # frame costs the same 880 tokens) at 48 frames are ~42k image tokens as well.
+# export VIDEOMME_NUM_FRAMES="${VIDEOMME_NUM_FRAMES:-48}"
+# export MVBENCH_NUM_FRAMES="${MVBENCH_NUM_FRAMES:-48}"
+# export MVBENCH_FRAME_PIXELS="${MVBENCH_FRAME_PIXELS:-1280x720}"
+# FRAMES_SUFFIX=""
+# if [ "${VDC_NUM_FRAMES}" != 16 ] || [ "${LVB_NUM_FRAMES}" != 16 ] || [ "${MOVIECHAT_NUM_FRAMES}" != 16 ]; then
+#     FRAMES_SUFFIX="_f${VDC_NUM_FRAMES}-${LVB_NUM_FRAMES}-${MOVIECHAT_NUM_FRAMES}"
+# fi
+# # the two newer benchmarks only tag the name when moved off their 48-frame default
+# if [ "${VIDEOMME_NUM_FRAMES}" != 48 ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-vm${VIDEOMME_NUM_FRAMES}"; fi
+# if [ "${MVBENCH_NUM_FRAMES}" != 48 ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-mv${MVBENCH_NUM_FRAMES}"; fi
+# if [ "${MVBENCH_FRAME_PIXELS}" != "1280x720" ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-mvpx${MVBENCH_FRAME_PIXELS}"; fi
+# python benchmarks/bench_mm.py \
+#     --model Qwen/Qwen3.5-4B \
+#     --base-url "${BASE_URLS[@]}" \
+#     --concurrency 1 \
+#     --block-size 0 \
+#     --benchmark-list ${VIDEO_BENCHES} \
+#     --reasoning off \
+#     --temperature 0.0 \
+#     --top-p 0.95 \
+#     --top-k 20 \
+#     --max-tokens 4096 \
+#     --name "video_origin_qwen35-4B_concurrency1_temp0_4096${FRAMES_SUFFIX}"
 
 
 # # for text benchmark

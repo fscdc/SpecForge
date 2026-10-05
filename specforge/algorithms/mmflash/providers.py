@@ -59,8 +59,29 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 
 
 def resume_contract(_config, draft_model, training_model):
-    """Persist resolved MMFlash architecture, sampling, and loss semantics."""
+    """Persist resolved MMFlash architecture, sampling, and loss semantics.
 
+    A run with ``training.draft_sparse`` also records the sparse context it
+    trained under (``mmflash_draft_sparse``, the SGLang env string), so the
+    export can stamp it into the served config, and a sparse resume must match
+    it (a different pattern, or a sparse resume of a dense checkpoint, is
+    rejected; the trainer only compares the CURRENT run's keys, so resuming a
+    sparse checkpoint without the block is not caught -- unreachable with
+    managed_local, which forbids resume). The key is absent for every dense
+    run: an unconditional key would make all existing MMFlash checkpoints
+    unresumable, since the check requires every current key in the checkpoint.
+    """
+
+    contract = _dense_resume_contract(draft_model, training_model)
+    draft_sparse = getattr(training_model, "draft_sparse", None)
+    if draft_sparse is not None:
+        from specforge.algorithms.common.mmflash_sparse import CONTRACT_KEY
+
+        contract[CONTRACT_KEY] = draft_sparse.to_sglang_env()
+    return contract
+
+
+def _dense_resume_contract(draft_model, training_model):
     return {
         "mmflash_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "mmflash_target_layer_ids": tuple(

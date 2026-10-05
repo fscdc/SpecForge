@@ -14,7 +14,7 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.11/site-pack
 export FLASHINFER_USE_CUDA_NORM=1
 export SGLANG_NUMA_BIND_V2=0
 
-EAGLE3_DRAFT_MODEL_PATH="${EAGLE3_DRAFT_MODEL_PATH:-/TODO/exports/qwen3.5-4b-eagle3-sglang}"
+EAGLE3_DRAFT_MODEL_PATH="${EAGLE3_DRAFT_MODEL_PATH:-/TODO/exports/qwen3.5-9b-eagle3-sglang}"
 
 
 bash scripts/benchmark_helper.sh || exit 1
@@ -27,7 +27,7 @@ IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 # No draft model. Note: --speculative-ngram-max-bfs-breadth > 1 together with
 # --page-size > 1 would require --attention-backend flashinfer; page_size is
 # left at its default of 1, so triton is fine.
-# NAME=mtp_ngram16_qwen35-4B_concurrency1
+# NAME=mtp_ngram16_qwen35-9B_concurrency1
 
 # SERVER_ADDRESSES=()
 # PORTS=()
@@ -43,7 +43,7 @@ IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 #     PORTS+=("${port}")
 #     BASE_URLS+=("http://localhost:${port}")
 #     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
-#         --model Qwen/Qwen3.5-4B \
+#         --model Qwen/Qwen3.5-9B \
 #         --speculative-algorithm NGRAM \
 #         --speculative-num-draft-tokens 16 \
 #         --speculative-ngram-max-bfs-breadth 10 \
@@ -65,7 +65,7 @@ IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 # topk 1, and leaving it unset lets auto-tuning pick topk>1 without always
 # erroring out. For tree drafting use --speculative-eagle-topk 4
 # --speculative-num-draft-tokens 16 plus --disable-overlap-schedule.
-# NAME=baseline_eagle3_qwen35-4B_concurrency1
+# NAME=baseline_eagle3_qwen35-9B_concurrency1
 #
 # SERVER_ADDRESSES=()
 # PORTS=()
@@ -81,7 +81,7 @@ IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 #     PORTS+=("${port}")
 #     BASE_URLS+=("http://localhost:${port}")
 #     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
-#         --model Qwen/Qwen3.5-4B \
+#         --model Qwen/Qwen3.5-9B \
 #         --speculative-algorithm EAGLE3 \
 #         --speculative-draft-model-path "${EAGLE3_DRAFT_MODEL_PATH}" \
 #         --speculative-num-steps 3 \
@@ -118,9 +118,9 @@ IFS=',' read -ra VISIBLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
         # --speculative-eagle-topk 1 \
         # --speculative-num-draft-tokens 16 \
 
-# NAME=mtp-15step_qwen35-4B_concurrency1
-# NAME=mtp-7step_qwen35-4B_concurrency1
-NAME=mtp-3step_qwen35-4B_concurrency1
+# NAME=mtp-15step_qwen35-9B_concurrency1
+# NAME=mtp-7step_qwen35-9B_concurrency1
+NAME=mtp-3step_qwen35-9B_concurrency1
 
 SERVER_ADDRESSES=()
 PORTS=()
@@ -136,7 +136,7 @@ for idx in "${!GPU_IDS[@]}"; do
     PORTS+=("${port}")
     BASE_URLS+=("http://localhost:${port}")
     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
-        --model Qwen/Qwen3.5-4B \
+        --model Qwen/Qwen3.5-9B \
         --speculative-algorithm NEXTN \
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
@@ -188,7 +188,7 @@ fi
 # # temperature = 1.0
 # NAME="${NAME}_temp1"
 # python benchmarks/bench_mm.py \
-#     --model Qwen/Qwen3.5-4B \
+#     --model Qwen/Qwen3.5-9B \
 #     --base-url "${BASE_URLS[@]}" \
 #     --concurrency 1 \
 #     --benchmark-list mmstar:200 mathvision:200 \
@@ -207,10 +207,10 @@ fi
 
 RUN_NAME="${NAME}_temp0_4096"
 python benchmarks/bench_mm.py \
-    --model Qwen/Qwen3.5-4B \
+    --model Qwen/Qwen3.5-9B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
-    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200 \
+    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 mmbench:200 dynamath:200 mathvista:200 mathverse:200 \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \
@@ -221,10 +221,10 @@ python benchmarks/bench_mm.py \
 
 RUN_NAME="${NAME}_temp1_4096"
 python benchmarks/bench_mm.py \
-    --model Qwen/Qwen3.5-4B \
+    --model Qwen/Qwen3.5-9B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
-    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200 \
+    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 mmbench:200 dynamath:200 mathvista:200 mathverse:200 \
     --reasoning off \
     --temperature 1.0 \
     --top-p 0.95 \
@@ -235,7 +235,7 @@ python benchmarks/bench_mm.py \
 # # for text benchmark
 # NAME="${NAME}_temp0"
 # python benchmarks/bench_text.py \
-#     --model Qwen/Qwen3.5-4B \
+#     --model Qwen/Qwen3.5-9B \
 #     --base-url "${BASE_URLS[@]}" \
 #     --concurrency 1 \
 #     --benchmark-list gsm8k:200 \

@@ -255,6 +255,97 @@ def build_loss_mask(
     return loss_mask
 
 
+def resolve_image_paths(images: Any, image_root: str) -> list[str]:
+    """Resolve a record's LIST of image references (a video's frames), in order.
+
+    Multi-image records (``scripts/prepare_data_mm.py --dataset
+    llava-video-178k``) store every frame path under ``image``, one per
+    ``<image>`` placeholder. An empty list or a non-string entry is malformed
+    rather than "text only", so it raises like a bad single path does.
+    """
+    if not isinstance(images, (list, tuple)) or not images:
+        raise ValueError(
+            f"record image list must be a non-empty list of paths, got {images!r}"
+        )
+    paths = []
+    for image in images:
+        # None means "no image" for a single-image record, never a frame
+        if not isinstance(image, str) or not image:
+            raise ValueError(
+                f"record image list entries must be non-empty paths, got {image!r}"
+            )
+        paths.append(resolve_image_path(image, image_root))
+    return paths
+
+
+def _encode_multi_image_record(
+    record: Mapping[str, Any],
+    processor,
+    *,
+    image_root: str,
+    max_length: int,
+    train_only_last_turn: bool,
+    header_ids: Sequence[int],
+    end_ids: set[int],
+) -> dict[str, Any] | None:
+    """``encode_mm_record`` for a record whose ``image`` is a list of frames.
+
+    Same rendering, expansion, length rule and loss mask as a single-image
+    record; the i-th ``<image>`` placeholder is the i-th path. The processor
+    sees all frames at once, exactly as the capture server will when it
+    re-expands ``image_data`` in prompt order, so the two token counts agree.
+    The payload keeps the ordered list of paths under ``image``.
+    """
+    from PIL import Image
+
+    conversations = record.get("conversations")
+    if not conversations:
+        raise ValueError(f"record {record.get('id')!r} has no conversations")
+    image_paths = resolve_image_paths(record.get("image"), image_root)
+    placeholders = sum(
+        turn["content"].count(IMAGE_PLACEHOLDER)
+        for turn in conversations
+        if isinstance(turn.get("content"), str)
+    )
+    if placeholders != len(image_paths):
+        raise ValueError(
+            f"record {record.get('id')!r} carries {placeholders} "
+            f"{IMAGE_PLACEHOLDER} placeholder(s) but {len(image_paths)} image(s)"
+        )
+
+    messages = to_chat_messages(conversations)
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
+    )
+    images = []
+    for image_path in image_paths:
+        with Image.open(image_path) as handle:
+            images.append(handle.convert("RGB"))
+    batch = processor(text=[text], images=images, return_tensors="pt")
+    del images
+
+    input_ids = batch["input_ids"][0].tolist()
+    del batch  # the frames' pixel values: ~1 GB for 48 720p frames
+    if len(input_ids) > max_length:
+        # dropped, never truncated: see encode_mm_record
+        return None
+
+    loss_mask = build_loss_mask(
+        input_ids,
+        header_ids=header_ids,
+        end_ids=end_ids,
+        train_only_last_turn=train_only_last_turn,
+    )
+    if not any(loss_mask):
+        return None
+
+    return {
+        "input_ids": input_ids,
+        "loss_mask": loss_mask,
+        "image": list(image_paths),
+    }
+
+
 def encode_mm_record(
     record: Mapping[str, Any],
     processor,
@@ -269,7 +360,22 @@ def encode_mm_record(
 
     Returns ``None`` when the record carries no trainable assistant token, which
     matches how the text path drops unusable rows.
+
+    A record whose ``image`` is a list (a video's frames) is handled by
+    ``_encode_multi_image_record``; single-image and text-only records take the
+    path below, unchanged.
     """
+    if isinstance(record.get("image"), (list, tuple)):
+        return _encode_multi_image_record(
+            record,
+            processor,
+            image_root=image_root,
+            max_length=max_length,
+            train_only_last_turn=train_only_last_turn,
+            header_ids=header_ids,
+            end_ids=end_ids,
+        )
+
     from PIL import Image
 
     conversations = record.get("conversations")
@@ -342,5 +448,6 @@ __all__ = [
     "encode_mm_record",
     "load_mm_processor",
     "resolve_image_path",
+    "resolve_image_paths",
     "to_chat_messages",
 ]

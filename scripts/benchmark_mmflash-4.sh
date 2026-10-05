@@ -11,6 +11,7 @@
 
 export CUDA_VISIBLE_DEVICES=0
 export SGLANG_FORCE_STREAM_INTERVAL=1
+export SGLANG_DFLASH_ENTROPY_DUMP=/scratch/fengsicheng/tmp/dflash_bs8.jsonl
 
 GPU_IDS=(0)
 
@@ -32,10 +33,10 @@ export SGLANG_NUMA_BIND_V2=0
 # /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-dflash-baseline-llava-ov15-1M-prompted-final
 
 
-BLOCK_SIZE=24
+BLOCK_SIZE=8
 
 
-VIDEO_BENCHES="${VIDEO_BENCHES:-longvideobench:20 moviechat:20 mvbench:20}"
+VIDEO_BENCHES="${VIDEO_BENCHES:-vdc:20 longvideobench:20 moviechat:20 videomme:20 mvbench:20}"
 # Frames per video. VDC's frames are 1080p+ (~2.7k tokens each, ~43k per
 # prompt); LongVideoBench and MovieChat are 720p (~840 tokens each), so at 16
 # frames their prompts are only ~13k. 48 frames brings them to VDC's scale.
@@ -166,6 +167,8 @@ fi
 #         --name "mmflash_qwen35-9B_concurrency${CONC}_temp0_4096"
 # done
 
+
+
 python benchmarks/bench_mm.py \
     --model Qwen/Qwen3.5-9B \
     --base-url "${BASE_URLS[@]}" \
@@ -177,8 +180,8 @@ python benchmarks/bench_mm.py \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 4096 \
-    --name mmflash_qwen35-9B_concurrency1_temp0_4096_bs24
-
+    --name mmflash_qwen35-9B_concurrency1_temp0_4096_bs8_dump \
+    --verify-entropy-dump /scratch/fengsicheng/tmp/dflash_bs8.jsonl
 
 # python benchmarks/bench_mm.py \
 #     --model Qwen/Qwen3.5-9B \

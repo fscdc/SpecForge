@@ -1,9 +1,16 @@
-"""Convert the ShareGPT4V multimodal dataset to SpecForge conversation JSONL.
+"""Convert multimodal datasets to SpecForge conversation JSONL.
 
 Rows carry a stable id, a resolved local image path, and a conversations list
 containing an `<image>` placeholder. Heavy dataset dependencies stay behind
 loader functions so row conversion helpers and their tests remain usable in
 lightweight environments.
+
+The `llava-video-178k` preset writes video rows: `image` is then a *list* of
+frame paths (48 by default) and the user turn opens with one `<image>` per
+frame, exactly the frames-then-text layout the video benchmarks send. Its
+prompts are built by the benchmarks' own formatters so that a training prompt
+is byte-for-byte what `bench_mm.py` asks on LongVideoBench, MVBench and
+MovieChat. See `prepare_llava_video` for the sampling scheme.
 """
 
 from __future__ import annotations
@@ -13,7 +20,10 @@ import json
 import math
 import os
 import random
+import re
+import shutil
 import sys
+import tarfile
 import time
 import zlib
 from collections import Counter, defaultdict
@@ -22,10 +32,47 @@ from pathlib import Path
 from typing import Any
 
 LLAVA_OV_PRESET = "llava-onevision-1.5"
-SUPPORTED_DATASETS = ("sharegpt4v", "sharegpt4v-pt", LLAVA_OV_PRESET)
+LLAVA_VIDEO_PRESET = "llava-video-178k"
+SUPPORTED_DATASETS = ("sharegpt4v", "sharegpt4v-pt", LLAVA_OV_PRESET, LLAVA_VIDEO_PRESET)
 DEFAULT_OUTPUT_DIRECTORY = "/local_home1/fengsicheng/specforge/data/"
 SUPPORTED_DATA_PATH_SUFFIXES = {".json", ".jsonl"}
 IMAGE_PLACEHOLDER = "<image>"
+#: The benchmark implementations whose prompt builders the video preset reuses.
+BENCHMARKS_DIRECTORY = Path(__file__).resolve().parents[1] / "benchmarks"
+
+LLAVA_VIDEO_REPO = "lmms-lab/LLaVA-Video-178K"
+#: Pinned for the same reason as LLAVA_OV_REVISION below.
+LLAVA_VIDEO_REVISION = "6d8c562dc26d70042a0d9704d1cae58c94b89098"
+#: 2-3 minute YouTube videos: 24,685 of them in 98 ~5 GiB archives (~250 each),
+#: 9,999 with both multiple-choice and open-ended questions. 48 frames of a 2-3
+#: minute video are a few seconds apart, which is the regime of the three video
+#: benchmarks; the 1_2_m_youtube_v0_1 subset has the same layout.
+LLAVA_VIDEO_DEFAULT_SUBSET = "2_3_m_youtube_v0_1"
+#: The three benchmarks are run at 48 frames rescaled to (or natively at) a
+#: 1280x720 frame's area, 880 tokens a frame on Qwen3.5, ~42k a prompt.
+LLAVA_VIDEO_NUM_FRAMES = 48
+LLAVA_VIDEO_FRAME_PIXELS = "1280x720"
+#: Records per video and the open-ended share among them: 7 multiple-choice
+#: (the LongVideoBench and MVBench format, alternating) + 3 open-ended (the
+#: MovieChat format) mirrors two multiple-choice benchmarks against one
+#: open-ended one, and one 42k-token prefill serves all ten at regeneration.
+LLAVA_VIDEO_PER_VIDEO = 10
+LLAVA_VIDEO_OE_SHARE = 0.3
+#: Every multiple-choice question in the subset ends with one of these two
+#: lines (169,870 of 169,870 checked). They are dropped: the benchmark's own
+#: closing line goes on instead.
+LLAVA_VIDEO_MC_TAILS = frozenset(
+    {
+        "Please respond with only the letter of the correct answer.",
+        "Please provide your answer by stating the letter followed by the full option.",
+    }
+)
+#: Which benchmark's prompt a video record carries, kept in its `style` field.
+VIDEO_PROMPT_STYLES = ("longvideobench", "mvbench", "moviechat")
+_MC_OPTION_LINE = re.compile(r"^([A-F])\.\s*(.*)$")
+_VIDEO_ARCHIVE = re.compile(r"_videos_(\d+)\.tar\.gz$")
+#: Repo file listing, fetched once and reused.
+_LLAVA_VIDEO_FILES: list[str] | None = None
 # Lin-Chen/ShareGPT4V hosts both subsets in one repo, distinguished by the
 # `datasets.load_dataset` config name (its second positional argument).
 SHAREGPT4V_HF_CONFIGS = {
@@ -227,10 +274,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     onevision.add_argument(
         "--revision",
-        default=LLAVA_OV_REVISION,
+        default=None,
         help=(
             "Dataset commit to read, pinned so the same command reproduces the "
-            "same sample on another machine (default: %(default).12s)."
+            f"same sample on another machine (default: {LLAVA_OV_REVISION[:12]} "
+            f"for {LLAVA_OV_PRESET}, {LLAVA_VIDEO_REVISION[:12]} for "
+            f"{LLAVA_VIDEO_PRESET})."
         ),
     )
     onevision.add_argument(
@@ -273,6 +322,84 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    video = parser.add_argument_group(
+        f"{LLAVA_VIDEO_PRESET} (videos as frames, benchmark-format prompts)",
+        description=(
+            "Downloads whole ~5 GiB video archives of one subset in order until "
+            "--sample-size records are written, decodes each used video into "
+            "--num-frames JPEG frames under the image directory, and gives each "
+            "record the prompt of one of the three video benchmarks: multiple-"
+            "choice questions alternate between LongVideoBench's and MVBench's "
+            "layout, open-ended ones take MovieChat's. --image-root/--image-dir, "
+            "--seed, --manifest and --revision apply as above."
+        ),
+    )
+    video.add_argument(
+        "--subset",
+        default=LLAVA_VIDEO_DEFAULT_SUBSET,
+        help=(
+            "Folder of the repo to draw from; it must hold both a *_mc_* and a "
+            "*_oe_* qa_processed.json (default: %(default)s)."
+        ),
+    )
+    video.add_argument(
+        "--per-video",
+        type=int,
+        default=LLAVA_VIDEO_PER_VIDEO,
+        metavar="N",
+        help=(
+            "Records taken from each video; all of them share its frames and, "
+            "sent together, its prefill (default: %(default)s)."
+        ),
+    )
+    video.add_argument(
+        "--oe-share",
+        type=float,
+        default=LLAVA_VIDEO_OE_SHARE,
+        help=(
+            "Share of a video's records that are open-ended (MovieChat-style); "
+            "the rest are multiple-choice (default: %(default)s, i.e. 3 of 10)."
+        ),
+    )
+    video.add_argument(
+        "--num-frames",
+        type=int,
+        default=LLAVA_VIDEO_NUM_FRAMES,
+        help="Evenly spaced frames per video (default: %(default)s).",
+    )
+    video.add_argument(
+        "--frame-pixels",
+        default=LLAVA_VIDEO_FRAME_PIXELS,
+        help=(
+            "Area every frame is rescaled to, as WxH or a pixel count; 0 keeps "
+            "the native size. The benchmarks' frames are 1280x720 or rescaled "
+            "to that area, 880 tokens each (default: %(default)s)."
+        ),
+    )
+    video.add_argument(
+        "--archives",
+        default=None,
+        help=(
+            "Comma-separated archive numbers (the N of *_videos_N.tar.gz) to "
+            "take videos from, in that order; by default archives are consumed "
+            "from 1 upwards until the sample is full."
+        ),
+    )
+    video.add_argument(
+        "--video-dir",
+        type=Path,
+        help=(
+            "Where the extracted videos are kept (default: next to the frames, "
+            "<image directory>_videos). Only the videos actually used are "
+            "extracted; the archives themselves are dropped after use."
+        ),
+    )
+    video.add_argument(
+        "--keep-archives",
+        action="store_true",
+        help="Leave the downloaded archives in the Hugging Face cache.",
+    )
+
     parser.add_argument(
         "--dump-missing-prefix",
         action="append",
@@ -298,31 +425,53 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.sample_size is not None and args.sample_size <= 0:
         parser.error("--sample-size must be greater than zero")
 
-    if args.dataset == LLAVA_OV_PRESET:
+    sampled = args.dataset in (LLAVA_OV_PRESET, LLAVA_VIDEO_PRESET)
+    if sampled:
         if args.sample_size is None:
             parser.error(
-                f"--sample-size is required for {LLAVA_OV_PRESET}: the blend is "
-                "~3.6 TiB, so how much to stream has to be stated"
+                f"--sample-size is required for {args.dataset}: the source is "
+                "terabytes, so how much to take has to be stated"
             )
         if args.data_path is not None:
-            parser.error(f"--data-path is not supported for {LLAVA_OV_PRESET}")
+            parser.error(f"--data-path is not supported for {args.dataset}")
         if args.split_eval:
             parser.error(
-                f"--split-eval is not supported for {LLAVA_OV_PRESET}; sample "
+                f"--split-eval is not supported for {args.dataset}; sample "
                 "a separate evaluation set with a different --seed instead"
             )
-        if args.exclude_family is None:
-            args.exclude_family = list(LLAVA_OV_DEFAULT_EXCLUDED)
-        elif args.exclude_family == ["none"]:
-            args.exclude_family = []
-        if args.shuffle_buffer < 1:
-            parser.error("--shuffle-buffer must be at least 1")
         if args.image_root is not None and args.image_dir is not None:
             parser.error(
                 "--image-root and --image-dir both say where images go; "
                 "--image-root adds an <output-name> subdirectory under it, "
                 "--image-dir is used as given"
             )
+    if args.dataset == LLAVA_OV_PRESET:
+        if args.revision is None:
+            args.revision = LLAVA_OV_REVISION
+        if args.exclude_family is None:
+            args.exclude_family = list(LLAVA_OV_DEFAULT_EXCLUDED)
+        elif args.exclude_family == ["none"]:
+            args.exclude_family = []
+        if args.shuffle_buffer < 1:
+            parser.error("--shuffle-buffer must be at least 1")
+    elif args.dataset == LLAVA_VIDEO_PRESET:
+        if args.revision is None:
+            args.revision = LLAVA_VIDEO_REVISION
+        if args.per_video < 1:
+            parser.error("--per-video must be at least 1")
+        if not 0.0 <= args.oe_share <= 1.0:
+            parser.error("--oe-share must be between 0 and 1")
+        if args.num_frames < 1:
+            parser.error("--num-frames must be at least 1")
+        if not re.fullmatch(r"\d+(x\d+)?", str(args.frame_pixels).lower()):
+            parser.error("--frame-pixels must be WxH or a pixel count (0 = native)")
+        if args.archives is not None:
+            try:
+                args.archives = [int(part) for part in str(args.archives).split(",") if part.strip()]
+            except ValueError:
+                parser.error("--archives must be comma-separated archive numbers")
+            if not args.archives or min(args.archives) < 1:
+                parser.error("--archives must name archive numbers from 1 upwards")
     elif args.image_root is None:
         parser.error(f"--image-root is required for --dataset {args.dataset}")
 
@@ -652,21 +801,20 @@ def leaks_answer(question: str, answer: str) -> bool:
     return shorter in longer
 
 
-def process_llava_ov_row(
-    row: Mapping[str, Any], config: str, index: int, image_directory: Path
-) -> tuple[list[dict[str, Any]], int]:
-    """One blend row into SpecForge records, one per question/answer pair.
+def conversation_pairs(
+    messages: Sequence[Mapping[str, Any]],
+) -> tuple[list[str], list[tuple[str, str]], int, bool]:
+    """Split a row's turns into (system prompts, question/answer pairs, skipped, has image).
 
-    Most image subsets pack several independent questions about the same picture
-    into a single row -- visual7w reaches nineteen, dvqa more -- to amortise the
-    visual tokens. They are not a conversation: the questions neither refer to
-    each other nor depend on the order they are asked in, so each becomes its
-    own record, carrying a copy of the leading system prompt when the subset has
-    one. Every record from a row points at the same image file on disk.
+    Shared by the LLaVA-OneVision and LLaVA-Video presets, which both pack
+    several independent questions about one picture or video into a row.
+    Whether the row is a visual one is a property of the row, not of a pair:
+    only the first question carries the placeholder, yet every pair split out
+    of the row refers to the same picture.
     """
     turns: list[tuple[str, str]] = []
     skipped_count = 0
-    for message in row.get("conversations") or []:
+    for message in messages:
         turn = read_turn(message)
         if turn is None:
             skipped_count += 1
@@ -690,13 +838,28 @@ def process_llava_ov_row(
             pending = None
     if pending is not None:
         skipped_count += 1
+    wants_image = any(IMAGE_PLACEHOLDER in content for _role, content in turns)
+    return system, pairs, skipped_count, wants_image
+
+
+def process_llava_ov_row(
+    row: Mapping[str, Any], config: str, index: int, image_directory: Path
+) -> tuple[list[dict[str, Any]], int]:
+    """One blend row into SpecForge records, one per question/answer pair.
+
+    Most image subsets pack several independent questions about the same picture
+    into a single row -- visual7w reaches nineteen, dvqa more -- to amortise the
+    visual tokens. They are not a conversation: the questions neither refer to
+    each other nor depend on the order they are asked in, so each becomes its
+    own record, carrying a copy of the leading system prompt when the subset has
+    one. Every record from a row points at the same image file on disk.
+    """
+    system, pairs, skipped_count, wants_image = conversation_pairs(
+        row.get("conversations") or []
+    )
     if not pairs:
         return [], skipped_count + 1
 
-    # Whether this is an image row is a property of the row, not of a pair: only
-    # the first question carries the placeholder, yet every pair split out of
-    # the row refers to the same picture.
-    wants_image = any(IMAGE_PLACEHOLDER in content for _role, content in turns)
     image_path = write_llava_ov_image(row, config, index, image_directory)
     if image_path is None and wants_image:
         return [], skipped_count + len(pairs)  # an <image> with nothing behind it
@@ -1180,6 +1343,549 @@ def prepare_llava_onevision(args: argparse.Namespace) -> Path:
     )
 
 
+# ---------------------------------------------------------------------------
+# LLaVA-Video-178K: videos as frames, prompts in the video benchmarks' own format
+# ---------------------------------------------------------------------------
+
+
+def parse_mc_question(text: str) -> tuple[str, list[str]] | None:
+    """Question and options of one LLaVA-Video multiple-choice prompt.
+
+    The prompts are rigid: `<image>`, one question line, two to five option
+    lines `A. ...`, and one of two closing lines asking for the letter. The
+    closing line is dropped because the benchmark's own goes on instead.
+    Anything that does not fit the layout is refused rather than guessed at,
+    so a malformed row is skipped instead of producing a prompt no benchmark
+    would ask. More than five options are refused too: the benchmarks letter
+    up to E.
+    """
+    lines = [
+        line.strip()
+        for line in text.replace(IMAGE_PLACEHOLDER, "").strip().split("\n")
+        if line.strip()
+    ]
+    if len(lines) < 3:
+        return None
+    question = lines[0]
+    options: list[str] = []
+    index = 1
+    while index < len(lines) and len(options) < 6:
+        match = _MC_OPTION_LINE.match(lines[index])
+        if match is None or match.group(1) != "ABCDEF"[len(options)]:
+            break
+        options.append(match.group(2).strip())
+        index += 1
+    tail = " ".join(lines[index:]).strip()
+    if tail and tail not in LLAVA_VIDEO_MC_TAILS:
+        return None
+    if not 2 <= len(options) <= 5:
+        return None
+    return question, options
+
+
+def choose_video_questions(
+    video: str, num_mc: int, num_oe: int, per_video: int, oe_share: float, seed: int
+) -> tuple[list[int], list[int]]:
+    """Which of a video's questions become records, as sorted index lists.
+
+    Seeded by the video's name, so the choice does not depend on how many
+    videos came before it; a video short of questions gives what it has.
+    """
+    rng = random.Random(f"{seed}:{video}")
+    want_oe = int(round(per_video * oe_share))
+    want_mc = per_video - want_oe
+    picked_mc = sorted(rng.sample(range(num_mc), min(want_mc, num_mc)))
+    picked_oe = sorted(rng.sample(range(num_oe), min(want_oe, num_oe)))
+    return picked_mc, picked_oe
+
+
+def build_video_record(
+    subset: str,
+    video: str,
+    frames: Sequence[str],
+    kind: str,
+    position: int,
+    style: str,
+    text: str,
+    answer: str,
+) -> dict[str, Any]:
+    """One video record: frames first, then the benchmark-format text.
+
+    `image` is the list of frame paths, in order, and the user turn carries one
+    placeholder per frame -- the same frames-then-text layout the benchmarks
+    send, which the chat template turns into consecutive image blocks before the
+    question. The id keeps the `<config>#<row>-<pair>` shape of the other
+    presets, so the regeneration script reads it the same way.
+    """
+    stem = Path(video).stem
+    return {
+        "id": f"{subset}#{stem}-{kind}{position}",
+        "image": list(frames),
+        "video": video,
+        "style": style,
+        "conversations": [
+            {
+                "role": "user",
+                "content": IMAGE_PLACEHOLDER * len(frames) + "\n" + text,
+            },
+            {"role": "assistant", "content": answer},
+        ],
+    }
+
+
+def video_benchmark_tools() -> tuple[dict[str, Callable[..., str]], Callable[..., list[str]], Callable[[Any], int]]:
+    """The benchmarks' prompt builders, frame extractor and pixel parser.
+
+    Imported from benchmarks/ rather than copied: a training prompt is then
+    byte-for-byte what `bench_mm.py` sends, including the post-prompt text, the
+    option lettering, the newlines, and any `*_PRE_PROMPT`/`*_POST_PROMPT`
+    environment override in force; and the frames are sampled, rescaled and
+    encoded by the same function. The package import pulls in sglang (the
+    benchmarkers talk to a server), which is why it is deferred to here.
+    """
+    if str(BENCHMARKS_DIRECTORY) not in sys.path:
+        sys.path.insert(0, str(BENCHMARKS_DIRECTORY))
+    from mm_benchmarker import longvideobench as lvb
+    from mm_benchmarker import moviechat as mc
+    from mm_benchmarker import mvbench as mvb
+    from mm_benchmarker.video_utils import materialize_frames
+
+    def longvideobench(question: str, options: Sequence[str]) -> str:
+        row = {"question": question}
+        row.update({f"option{index}": option for index, option in enumerate(options)})
+        return lvb.format_question(
+            row,
+            os.environ.get("LVB_PRE_PROMPT", lvb.DEFAULT_PRE_PROMPT),
+            os.environ.get("LVB_POST_PROMPT", lvb.DEFAULT_POST_PROMPT),
+        )
+
+    def mvbench(question: str, options: Sequence[str]) -> str:
+        return mvb.format_question(
+            {"question": question, "candidates": list(options)},
+            os.environ.get("MVBENCH_POST_PROMPT", mvb.DEFAULT_POST_PROMPT),
+        )
+
+    def moviechat(question: str, options: Sequence[str] = ()) -> str:
+        del options
+        return mc.format_question(
+            question,
+            os.environ.get("MOVIECHAT_PRE_PROMPT", mc.DEFAULT_PRE_PROMPT),
+            os.environ.get("MOVIECHAT_POST_PROMPT", mc.DEFAULT_POST_PROMPT),
+        )
+
+    formatters = {
+        "longvideobench": longvideobench,
+        "mvbench": mvbench,
+        "moviechat": moviechat,
+    }
+    return formatters, materialize_frames, mvb.parse_pixels
+
+
+def llava_video_files(revision: str) -> list[str]:
+    from huggingface_hub import HfApi
+
+    global _LLAVA_VIDEO_FILES
+    if _LLAVA_VIDEO_FILES is None:
+        _LLAVA_VIDEO_FILES = HfApi().list_repo_files(
+            LLAVA_VIDEO_REPO, repo_type="dataset", revision=revision
+        )
+    return _LLAVA_VIDEO_FILES
+
+
+def llava_video_archives(
+    subset: str, revision: str, wanted: Sequence[int] | None = None
+) -> list[str]:
+    """Repo paths of a subset's video archives, by number or as requested."""
+    numbered = {}
+    for name in llava_video_files(revision):
+        match = _VIDEO_ARCHIVE.search(name)
+        if name.startswith(f"{subset}/") and match:
+            numbered[int(match.group(1))] = name
+    if not numbered:
+        raise ValueError(f"{subset!r} has no *_videos_N.tar.gz archives at {revision[:12]}")
+    if wanted is None:
+        return [numbered[number] for number in sorted(numbered)]
+    unknown = [number for number in wanted if number not in numbered]
+    if unknown:
+        raise ValueError(
+            f"{subset!r} has no archive(s) {unknown}; it has 1..{max(numbered)}"
+        )
+    return [numbered[number] for number in wanted]
+
+
+def load_llava_video_questions(
+    subset: str, revision: str
+) -> tuple[dict[str, dict[str, list]], Counter[str]]:
+    """Every question of the subset, by video path, split into mc and oe.
+
+    A multiple-choice question is kept as (question, options, answer) with its
+    closing instruction already removed; an open-ended one as (question,
+    answer). The answers only fill the assistant turn of the record, which the
+    regeneration discards, so they are kept as the source wrote them.
+    """
+    from huggingface_hub import hf_hub_download
+
+    files = llava_video_files(revision)
+    folder = f"{subset}/"
+    sources = {
+        kind: sorted(
+            name
+            for name in files
+            if name.startswith(folder)
+            and f"_{kind}_" in Path(name).name
+            and name.endswith("qa_processed.json")
+        )
+        for kind in ("mc", "oe")
+    }
+    missing = [kind for kind, names in sources.items() if not names]
+    if missing:
+        raise ValueError(
+            f"{subset!r} has no {' or '.join(missing)} qa_processed.json; the "
+            "video preset needs both question kinds"
+        )
+
+    questions: dict[str, dict[str, list]] = defaultdict(lambda: {"mc": [], "oe": []})
+    stats: Counter[str] = Counter()
+    for kind, names in sources.items():
+        for name in names:
+            local = hf_hub_download(
+                LLAVA_VIDEO_REPO, name, repo_type="dataset", revision=revision
+            )
+            with open(local, encoding="utf-8") as handle:
+                rows = json.load(handle)
+            for row in rows:
+                video = row.get("video")
+                if not isinstance(video, str) or not video:
+                    stats[f"{kind} rows without a video"] += 1
+                    continue
+                _system, pairs, skipped, _wants_image = conversation_pairs(
+                    row.get("conversations") or []
+                )
+                stats[f"{kind} turns skipped"] += skipped
+                for question, answer in pairs:
+                    if kind == "mc":
+                        parsed = parse_mc_question(question)
+                        if parsed is None:
+                            stats["mc questions off-layout"] += 1
+                            continue
+                        questions[video]["mc"].append((parsed[0], parsed[1], answer))
+                    else:
+                        text = question.replace(IMAGE_PLACEHOLDER, "").strip()
+                        if not text:
+                            stats["oe questions empty"] += 1
+                            continue
+                        questions[video]["oe"].append((text, answer))
+                    stats[f"{kind} questions"] += 1
+    return dict(questions), stats
+
+
+def _drop_cached_file(local: str) -> None:
+    """Remove a hf_hub_download result: the symlink and the blob behind it."""
+    path = Path(local)
+    target = path.resolve()
+    path.unlink(missing_ok=True)
+    if target != path:
+        target.unlink(missing_ok=True)
+
+
+def archive_videos(
+    archive: str,
+    wanted: Mapping[str, str],
+    video_directory: Path,
+    *,
+    revision: str,
+    keep_archive: bool,
+) -> list[str]:
+    """Extract an archive's wanted videos and return their paths, in archive order.
+
+    `wanted` maps a video file name to its path in the annotations. The
+    archive's member list is cached beside the videos, so a re-run whose
+    videos are all still on disk does not download 5 GiB to learn which ones
+    it held. Archives are gzip streams, hence read front to back.
+    """
+    from huggingface_hub import hf_hub_download
+
+    video_directory.mkdir(parents=True, exist_ok=True)
+    listing = video_directory / f"{Path(archive).name}.members.json"
+    members: list[str] | None = None
+    if listing.exists():
+        with listing.open(encoding="utf-8") as handle:
+            members = json.load(handle)
+        here = [name for name in members if name in wanted]
+        if all((video_directory / name).exists() for name in here):
+            return [wanted[name] for name in here]
+
+    started = time.monotonic()
+    local = hf_hub_download(
+        LLAVA_VIDEO_REPO, archive, repo_type="dataset", revision=revision
+    )
+    size = Path(local).stat().st_size
+    print(
+        f"    {Path(archive).name}: {size / 1024**3:.2f} GiB in "
+        f"{time.monotonic() - started:,.0f}s, extracting ...",
+        flush=True,
+    )
+    members = []
+    extracted: list[str] = []
+    with tarfile.open(local, "r|gz") as tar:
+        for member in tar:
+            if not member.isfile():
+                continue
+            name = Path(member.name).name
+            members.append(name)
+            video = wanted.get(name)
+            if video is None:
+                continue
+            target = video_directory / name
+            if not target.exists():
+                source = tar.extractfile(member)
+                if source is None:
+                    continue
+                staging = target.with_name(target.name + ".part")
+                with staging.open("wb") as sink:
+                    shutil.copyfileobj(source, sink, 1 << 20)
+                staging.replace(target)
+            extracted.append(video)
+    with listing.open("w", encoding="utf-8") as handle:
+        json.dump(members, handle)
+    if not keep_archive:
+        _drop_cached_file(local)
+    print(
+        f"    {len(members)} videos in the archive, {len(extracted)} with both "
+        f"question kinds kept",
+        flush=True,
+    )
+    return extracted
+
+
+def _frame_tokens(width: int, height: int) -> int:
+    """Roughly what one frame costs Qwen3.5: 32x32 pixels per visual token."""
+    return max(1, round(width / 32)) * max(1, round(height / 32))
+
+
+def prepare_llava_video(args: argparse.Namespace) -> Path:
+    """Write `--sample-size` video records whose prompts match the video benchmarks.
+
+    Videos come from whole archives of one subset, taken in order (or as
+    `--archives` says) until the sample is full; two ~5 GiB archives cover
+    2,000 records at ten per video. Only videos with both multiple-choice and
+    open-ended questions are used. Each is decoded once into `--num-frames`
+    frames at the benchmarks' 1280x720 area, and its records are drawn with
+    `choose_video_questions`: multiple-choice ones alternate between the
+    LongVideoBench and MVBench layouts, open-ended ones take MovieChat's, all
+    three through the benchmarks' own formatters.
+    """
+    formatters, materialize_frames, parse_pixels = video_benchmark_tools()
+    from PIL import Image
+
+    name = args.output_name or args.dataset
+    output_directory = Path(args.output_path)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    manifest_path = MANIFEST_DIRECTORY / f"{name}_manifest.json"
+    archives: list[str] | None = None
+    if args.manifest is not None:
+        recorded = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+        for key in ("subset", "seed", "per_video", "oe_share", "num_frames", "frame_pixels", "revision", "sample_size"):
+            setattr(args, key, recorded[key])
+        archives = list(recorded["archives"])
+        print(
+            f"Replaying {args.manifest}: {args.sample_size:,} records from "
+            f"{len(archives)} archive(s) of {args.subset} at {args.revision[:12]}"
+        )
+    if args.image_root is not None:
+        frames_directory = Path(args.image_root) / name
+    else:
+        frames_directory = Path(args.image_dir or output_directory / f"{name}_images")
+    frames_directory.mkdir(parents=True, exist_ok=True)
+    video_directory = Path(
+        args.video_dir or frames_directory.with_name(frames_directory.name + "_videos")
+    )
+    pixels = parse_pixels(args.frame_pixels)
+
+    questions, stats = load_llava_video_questions(args.subset, args.revision)
+    eligible = {
+        Path(video).name: video
+        for video, pools in questions.items()
+        if pools["mc"] and pools["oe"]
+    }
+    print(
+        f"{LLAVA_VIDEO_REPO}/{args.subset}: {len(questions):,} videos with "
+        f"questions, {len(eligible):,} with both kinds "
+        f"({stats['mc questions']:,} multiple-choice, {stats['oe questions']:,} "
+        "open-ended questions in all)"
+    )
+    dropped = {key: value for key, value in stats.items() if not key.endswith("questions") and value}
+    if dropped:
+        print(f"  not usable: {dropped}")
+    if archives is None:
+        archives = llava_video_archives(args.subset, args.revision, args.archives)
+    want_oe = int(round(args.per_video * args.oe_share))
+    print(
+        f"Taking {args.per_video} records per video ({args.per_video - want_oe} "
+        f"multiple-choice, {want_oe} open-ended) as {args.num_frames} frames at "
+        f"{args.frame_pixels} until {args.sample_size:,} records are written; "
+        f"archives are read from {Path(archives[0]).name} onwards."
+    )
+
+    train_output_path = output_directory / f"{name}_train.jsonl"
+    if train_output_path.exists():
+        print(f"Overwriting existing dataset at {train_output_path}.")
+    written = 0
+    videos_used = 0
+    videos_undecodable = 0
+    videos_short = 0
+    consumed: list[str] = []
+    style_counts: Counter[str] = Counter()
+    prompt_chars: dict[str, list[int]] = defaultdict(list)
+    frame_sizes: Counter[tuple[int, int]] = Counter()
+    frames_per_video: list[int] = []
+    staging = train_output_path.with_suffix(".jsonl.partial")
+    with staging.open("w", encoding="utf-8") as handle:
+        for archive in archives:
+            if written >= args.sample_size:
+                break
+            print(f"  archive {Path(archive).name} ...", flush=True)
+            videos = archive_videos(
+                archive,
+                eligible,
+                video_directory,
+                revision=args.revision,
+                keep_archive=args.keep_archives,
+            )
+            consumed.append(archive)
+            # which of an archive's videos are used first is random, but fixed
+            # by the seed and the archive, not by what came before
+            random.Random(f"{args.seed}:{archive}").shuffle(videos)
+            for video in videos:
+                if written >= args.sample_size:
+                    break
+                file_name = Path(video).name
+                frames = materialize_frames(
+                    str(frames_directory),
+                    str(video_directory / file_name),
+                    Path(video).stem,
+                    args.num_frames,
+                    target_pixels=pixels or None,
+                )
+                if not frames:
+                    videos_undecodable += 1
+                    continue
+                if len(frames) < args.num_frames:
+                    videos_short += 1
+                with Image.open(frames[0]) as first:
+                    frame_size = first.size
+                frame_sizes[frame_size] += 1
+                frames_per_video.append(len(frames))
+
+                pools = questions[video]
+                picked_mc, picked_oe = choose_video_questions(
+                    video, len(pools["mc"]), len(pools["oe"]), args.per_video, args.oe_share, args.seed
+                )
+                records: list[dict[str, Any]] = []
+                for position, index in enumerate(picked_mc):
+                    style = "longvideobench" if position % 2 == 0 else "mvbench"
+                    question, options, answer = pools["mc"][index]
+                    text = formatters[style](question, options)
+                    records.append(
+                        build_video_record(args.subset, video, frames, "mc", index, style, text, answer)
+                    )
+                for index in picked_oe:
+                    question, answer = pools["oe"][index]
+                    text = formatters["moviechat"](question)
+                    records.append(
+                        build_video_record(args.subset, video, frames, "oe", index, "moviechat", text, answer)
+                    )
+                for record in records[: args.sample_size - written]:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    written += 1
+                    style_counts[record["style"]] += 1
+                    prompt_chars[record["style"]].append(
+                        len(record["conversations"][0]["content"]) - len(frames) * len(IMAGE_PLACEHOLDER)
+                    )
+                videos_used += 1
+                print(
+                    f"    [{videos_used}] {Path(video).stem}: {len(frames)} frames "
+                    f"{frame_size[0]}x{frame_size[1]}, {len(picked_mc)} mc + "
+                    f"{len(picked_oe)} oe -> {written:,}/{args.sample_size:,}",
+                    flush=True,
+                )
+    staging.replace(train_output_path)
+
+    if written < args.sample_size:
+        print(
+            f"\nWARNING: only {written:,} of {args.sample_size:,} records could be "
+            f"written from {len(consumed)} archive(s); pass more via --archives."
+        )
+    print(
+        f"\nSaved {written:,} records over {videos_used:,} videos from "
+        f"{len(consumed)} archive(s) to {train_output_path}"
+    )
+    print(f"Frames written under {frames_directory}; videos kept under {video_directory}")
+    if videos_undecodable or videos_short:
+        print(
+            f"  {videos_undecodable} video(s) could not be decoded and were skipped; "
+            f"{videos_short} gave fewer than {args.num_frames} frames"
+        )
+    if frame_sizes:
+        size, count = frame_sizes.most_common(1)[0]
+        per_frame = _frame_tokens(*size)
+        median_frames = sorted(frames_per_video)[len(frames_per_video) // 2]
+        print(
+            f"  frames: {size[0]}x{size[1]} for {count} of {videos_used} videos "
+            f"(~{per_frame} tokens each on Qwen3.5), {median_frames} per video "
+            f"-> ~{per_frame * median_frames:,} image tokens per prompt"
+        )
+    print("\nRecords by prompt style:")
+    for style in VIDEO_PROMPT_STYLES:
+        lengths = sorted(prompt_chars[style])
+        if not lengths:
+            continue
+        print(
+            f"  {style:<16}{style_counts[style]:>7,}{style_counts[style] / max(written, 1):>8.1%}"
+            f"   text p50 {lengths[len(lengths) // 2]:,} chars"
+        )
+    if args.manifest is not None:
+        print(f"\nReusing {args.manifest}; not rewriting {manifest_path}")
+        return train_output_path
+
+    import datasets as _datasets
+
+    examples = {
+        "longvideobench": formatters["longvideobench"]("<question>", ["<option A>", "<option B>"]),
+        "mvbench": formatters["mvbench"]("<question>", ["<option A>", "<option B>"]),
+        "moviechat": formatters["moviechat"]("<question>"),
+    }
+    MANIFEST_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "repo": LLAVA_VIDEO_REPO,
+                "revision": args.revision,
+                "subset": args.subset,
+                "sample_size": args.sample_size,
+                "per_video": args.per_video,
+                "oe_share": args.oe_share,
+                "num_frames": args.num_frames,
+                "frame_pixels": args.frame_pixels,
+                "seed": args.seed,
+                "archives": consumed,
+                "records": written,
+                "videos": videos_used,
+                "styles": dict(style_counts),
+                # the exact prompt text each style produced, for the record
+                "prompt_templates": examples,
+                "versions": {"datasets": _datasets.__version__},
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(f"Wrote {manifest_path}")
+    return train_output_path
+
+
 def process_and_save_dataset(
     dataset: Iterable[Mapping[str, Any]],
     output_directory: Path,
@@ -1241,6 +1947,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     if args.dataset == LLAVA_OV_PRESET:
         prepare_llava_onevision(args)
+        return
+    if args.dataset == LLAVA_VIDEO_PRESET:
+        prepare_llava_video(args)
         return
 
     dataset, processor = load_dataset_preset(args.dataset, data_path=args.data_path)

@@ -1,0 +1,91 @@
+# MMFlash 4B, continued training on the ~2k LLaVA-Video rows with the DENSE
+# draft context: the control for qwen3.5-4b-mmflash-video-sparse_hpc.yaml,
+# identical except draft_sparse (and run paths/ports). Ports are offset so both
+# runs can land on one node as separate 2-GPU PBS jobs.
+#
+#   specforge train --config scripts/mmtraining_configs/qwen3.5-4b-mmflash-video-dense_hpc.yaml
+#
+# After training, export as for the sparse run; draft_sparse_env.py then exports
+# an empty DRAFT_SPARSE/DRAFT_WINDOW and the benchmark serves the full context.
+model:
+  target_model_path: "Qwen/Qwen3.5-4B"
+  # The warm-start export is normalised for SGLang (DFlashDraftModel), so the
+  # MMFlash architecture has to come from here.
+  draft_model_config: "configs/qwen3.5-4b-mmflash.json"
+  # Weights-only warm start: fresh optimizer, LR schedule and step counter.
+  draft_checkpoint_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-llava-ov15-1M-prompted-final"
+  target_backend: sglang
+  input_modality: image
+  trust_remote_code: true
+  embedding_key: "model.language_model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+data:
+  # 1,951 rows: 48 frames (880 tokens each) + a benchmark-style question + the target's answer.
+  train_data_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_llava-video-2k_regen.jsonl"
+  # Rows are 42.4k-45.0k tokens; longer rows are dropped, never truncated.
+  max_length: 49152
+  chat_template: "qwen3.5"
+  build_dataset_num_proc: 16
+  dataloader_num_workers: 2
+  cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
+  # Shared with the sparse run. Made by:
+  #   GPUS=0,1,2,3 bash scripts/score_visual_kl_hpc.sh scripts/mmtraining_configs/<this yaml>
+  visual_score_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/visual_kl/llava-video-2k"
+  visual_score_transform: "quantile"
+  visual_score_confidence_gate: true
+training:
+  strategy: "mmflash"
+  loss_type: "mmflash"
+  mmflash_smoothing: 0.5
+  visual_alpha: 1.0
+  # draft_sparse unset: dense context (the control)
+  num_epochs: 3
+  batch_size: 2
+  accumulation_steps: 4
+  learning_rate: 0.0001
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  attention_backend: "flex_attention"
+  num_anchors: 512
+  loss_decay_gamma: 7
+  save_interval: 100
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+runtime:
+  producer_lease: 1
+  in_flight_high_watermark: 16   # captured rows waiting for the trainer, ~1.1 GB each
+  in_flight_low_watermark: 8
+
+tracking:
+  report_to: "tensorboard"
+run_id: "qwen3.5-4b-mmflash-video-dense"
+output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-video-dense"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
+  disaggregated:
+    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-video-dense/control"
+    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-video-dense/consumer-state"
+    backend: mooncake
+    client_buffer_size: 2147483648   # above one row's ~1.1 GB of hidden states
+    managed_local:
+      trainer_cuda_visible_devices:
+        - "1"
+      mooncake:
+        protocol: tcp
+        # offset from the sparse run's defaults (35551/35880/35903)
+        rpc_port: 35651
+        metadata_port: 35980
+        metrics_port: 36003
+        global_segment_size_bytes: 51539607552   # 48 GiB: the in-flight rows with headroom
+        local_buffer_size_bytes: 2147483648
+      capture_servers:
+        - port: 30100
+          cuda_visible_devices:
+            - "0"
+          tp_size: 1
+          mem_fraction_static: 0.70

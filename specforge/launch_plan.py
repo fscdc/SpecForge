@@ -890,6 +890,26 @@ def _terminate_processes(
                 pass
 
 
+def _sglang_has_split_storage_fix() -> Optional[bool]:
+    """Whether the installed SGLang's mm_utils.py has the spec-capture patch's
+    split-storage fix; None when that cannot be told without importing it.
+
+    The file is located through the top-level package's search path and read
+    as text: importing sglang.srt.managers here would pull in torch and half of
+    SGLang just to look for one function name.
+    """
+    try:
+        spec = importlib.util.find_spec("sglang")
+    except (ImportError, ValueError):
+        return None
+    for base in list(getattr(spec, "submodule_search_locations", None) or []):
+        path = os.path.join(base, "srt", "managers", "mm_utils.py")
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as handle:
+                return "def _own_split_storage(" in handle.read()
+    return None
+
+
 def _managed_preflight(plan: LaunchPlan) -> None:
     if plan.managed_root is None:
         raise ValueError("managed supervisor plan is missing managed_root")
@@ -915,6 +935,13 @@ def _managed_preflight(plan: LaunchPlan) -> None:
         raise RuntimeError(
             "managed_local requires patched SGLang spec capture; run "
             "scripts/apply_sglang_spec_capture_patch.sh"
+        )
+    if _sglang_has_split_storage_fix() is False:
+        raise RuntimeError(
+            "the installed SGLang carries an older spec-capture patch without "
+            "its multimodal split-storage fix, under which a 48-frame capture "
+            "request takes ~100 s and ~230 GB of host RAM instead of ~5 s; "
+            "re-run scripts/apply_sglang_spec_capture_patch.sh"
         )
 
     for port in plan.managed_ports:

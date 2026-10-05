@@ -110,7 +110,40 @@ def export_to_hf(
         )
     full_state.update(state["draft_state_dict"])  # trained keys win
     model.save_pretrained(output_dir, state_dict=full_state)
+    _stamp_draft_sparse(state, output_dir)
     return output_dir
+
+
+def _stamp_draft_sparse(state: dict, output_dir: str) -> None:
+    """Record a sparse-trained draft's context pattern in its exported config.
+
+    The draft config comes from ``--draft-config``, which knows nothing about
+    how the run was trained; the checkpoint does (``mmflash_draft_sparse``,
+    persisted by the MMFlash resume contract only for ``training.draft_sparse``
+    runs). It is written as ``dflash_config.draft_sparse`` so whoever serves
+    the export can set ``SGLANG_DFLASH_DRAFT_SPARSE`` to exactly the training
+    pattern (``scripts/draft_sparse_env.py`` prints the flags). SGLang itself
+    ignores the key. Dense checkpoints carry no such key and export unchanged.
+    """
+    from specforge.algorithms.common.mmflash_sparse import (
+        CONTRACT_KEY,
+        EXPORT_CONFIG_KEY,
+        DraftSparseContext,
+    )
+
+    spec = state.get(CONTRACT_KEY)
+    if not spec:
+        return
+    sparse = DraftSparseContext.parse(spec)
+    config_path = os.path.join(output_dir, "config.json")
+    with open(config_path, encoding="utf-8") as handle:
+        config = json.load(handle)
+    method = dict(config.get("dflash_config") or {})
+    method[EXPORT_CONFIG_KEY] = sparse.as_dict()
+    config["dflash_config"] = method
+    with open(config_path, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, sort_keys=True)
+        handle.write("\n")
 
 
 def main(argv=None) -> int:

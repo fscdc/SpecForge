@@ -17,8 +17,9 @@
 #
 #   qsub scripts/sweep_draft_sparse.sh
 #
-# Which video benchmarks run is VIDEO_BENCHES (default "vdc:20 longvideobench:20
-# moviechat:20 videomme:20 mvbench:20", see scripts/benchmark_mmflash.sh); a result file that already
+# Which video benchmarks run is VIDEO_BENCHES (default "longvideobench:20 moviechat:20
+# mvbench:20", the three video benchmarks of the paper; vdc and videomme
+# are still available, see scripts/benchmark_mmflash.sh); a result file that already
 # holds a benchmark only gets the missing ones on a re-run.
 #   VARIANTS="sink=4,text=1,stride=16,window=2048" bash scripts/sweep_draft_sparse.sh
 #PBS -P CFP04-CF-054
@@ -73,4 +74,4 @@ done
 
 echo "==================== summary $(date '+%F %T') ===================="
 # one table per video benchmark in VIDEO_BENCHES
-python3 scripts/summarize_video_results.py --benchmark "$(for b in ${VIDEO_BENCHES:-vdc:20 longvideobench:20 moviechat:20 videomme:20 mvbench:20}; do printf '%s,' "${b%%:*}"; done)"
+python3 scripts/summarize_video_results.py --benchmark "$(for b in ${VIDEO_BENCHES:-longvideobench:20 moviechat:20 mvbench:20}; do printf '%s,' "${b%%:*}"; done)"

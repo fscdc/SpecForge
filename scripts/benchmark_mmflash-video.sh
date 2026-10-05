@@ -1,12 +1,12 @@
 # 1) export the training checkpoint to an HF directory
 # specforge export --to hf \
-#   --checkpoint /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-9b-mmflash-llava-ov15-1M/qwen3.5-9b-mmflash-step100000 \
-#   --draft-config configs/qwen3.5-9b-mmflash.json \
-#   --output-dir /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-mmflash-llava-ov15-1M-100000
+#   --checkpoint /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmflash-llava-ov15-1M/qwen3.5-4b-mmflash-step100000 \
+#   --draft-config configs/qwen3.5-4b-mmflash.json \
+#   --output-dir /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-llava-ov15-1M-100000
 #
 # 2) rewrite architectures -> DFlashDraftModel so SGLang's DFLASH loader accepts it
 # python scripts/gates/normalize_dflash_export.py \
-#   --config /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-mmflash-llava-ov15-1M-100000/config.json \
+#   --config /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-llava-ov15-1M-100000/config.json \
 #   --block-size 16
 
 export CUDA_VISIBLE_DEVICES=0
@@ -25,17 +25,17 @@ export FLASHINFER_USE_CUDA_NORM=1
 export SGLANG_NUMA_BIND_V2=0
 
 
-# z-lab/Qwen3.5-9B-DFlash
-# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-mmflash-sharegpt4v
-# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-mmflash-hf 这个是一个只有1000step的test版本
-# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-dflash-baseline-llava-ov15-1M-50000 用llava那个数据集训的baseline版本，数据没有改prompt
-# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-dflash-baseline-llava-ov15-1M-prompted-final
+# z-lab/Qwen3.5-4B-DFlash
+# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v
+# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-hf 这个是一个只有1000step的test版本
+# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-50000 用llava那个数据集训的baseline版本，数据没有改prompt
+# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-prompted-final
 
 
-BLOCK_SIZE=24
+BLOCK_SIZE=16
 
 
-VIDEO_BENCHES="${VIDEO_BENCHES:-longvideobench:20 moviechat:20 mvbench:20}"
+VIDEO_BENCHES="${VIDEO_BENCHES:-vdc:20 longvideobench:20 moviechat:20 videomme:20 mvbench:20}"
 # Frames per video. VDC's frames are 1080p+ (~2.7k tokens each, ~43k per
 # prompt); LongVideoBench and MovieChat are 720p (~840 tokens each), so at 16
 # frames their prompts are only ~13k. 48 frames brings them to VDC's scale.
@@ -60,7 +60,7 @@ fi
 if [ "${VIDEOMME_NUM_FRAMES}" != 48 ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-vm${VIDEOMME_NUM_FRAMES}"; fi
 if [ "${MVBENCH_NUM_FRAMES}" != 48 ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-mv${MVBENCH_NUM_FRAMES}"; fi
 if [ "${MVBENCH_FRAME_PIXELS}" != "1280x720" ]; then FRAMES_SUFFIX="${FRAMES_SUFFIX:-_f16-16-16}-mvpx${MVBENCH_FRAME_PIXELS}"; fi
-RUN_NAME="${RUN_NAME:-video_mmflash_qwen35-9B_concurrency1_temp0_4096}"
+RUN_NAME="${RUN_NAME:-video_mmflash_qwen35-4B_concurrency1_temp0_4096}"
 DRAFT_WINDOW="${DRAFT_WINDOW:-}"
 DRAFT_SPARSE="${DRAFT_SPARSE:-}"
 if [ -n "${DRAFT_SPARSE}" ]; then
@@ -98,9 +98,9 @@ for idx in "${!GPU_IDS[@]}"; do
     PORTS+=("${port}")
     BASE_URLS+=("http://localhost:${port}")
     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
-        --model Qwen/Qwen3.5-9B \
+        --model Qwen/Qwen3.5-4B \
         --speculative-algorithm DFLASH \
-        --speculative-draft-model-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-mmflash-llava-ov15-1M-prompted-final \
+        --speculative-draft-model-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-llava-ov15-1M-prompted-final \
         --speculative-dflash-block-size ${BLOCK_SIZE} \
         ${DRAFT_WINDOW:+--speculative-draft-window-size ${DRAFT_WINDOW}} \
         --mem-fraction-static 0.7 \
@@ -148,54 +148,54 @@ fi
 
 
 
-# CONCURRENCIES="${CONCURRENCIES:-2 4 8 16 32}"
+# CONCURRENCIES="${CONCURRENCIES:-2 4 8 16}"
 
 # for CONC in ${CONCURRENCIES}; do
 #     echo "===== concurrency ${CONC} ====="
 #     python benchmarks/bench_mm.py \
-#         --model Qwen/Qwen3.5-9B \
+#         --model Qwen/Qwen3.5-4B \
 #         --base-url "${BASE_URLS[@]}" \
 #         --concurrency ${CONC} \
 #         --block-size ${BLOCK_SIZE} \
-#         --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200 mmbench:200 \
+#         --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
 #         --reasoning off \
 #         --temperature 0.0 \
 #         --top-p 0.95 \
 #         --top-k 20 \
 #         --max-tokens 4096 \
-#         --name "mmflash_qwen35-9B_concurrency${CONC}_temp0_4096"
+#         --name "mmflash_qwen35-4B_concurrency${CONC}_temp0_4096"
 # done
 
 python benchmarks/bench_mm.py \
-    --model Qwen/Qwen3.5-9B \
+    --model Qwen/Qwen3.5-4B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
     --block-size ${BLOCK_SIZE} \
-    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench:200 dynamath:200 mathvista:200 mathverse:200 \
+    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 4096 \
-    --name mmflash_qwen35-9B_concurrency1_temp0_4096_bs24
+    --name mmflash_qwen35-4B_concurrency1_temp0_4096
+
+
+python benchmarks/bench_mm.py \
+    --model Qwen/Qwen3.5-4B \
+    --base-url "${BASE_URLS[@]}" \
+    --concurrency 1 \
+    --block-size ${BLOCK_SIZE} \
+    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
+    --reasoning off \
+    --temperature 1.0 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --max-tokens 4096 \
+    --name mmflash_qwen35-4B_concurrency1_temp1_4096
 
 
 # python benchmarks/bench_mm.py \
-#     --model Qwen/Qwen3.5-9B \
-#     --base-url "${BASE_URLS[@]}" \
-#     --concurrency 1 \
-#     --block-size ${BLOCK_SIZE} \
-#     --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200 mmbench:200 \
-#     --reasoning off \
-#     --temperature 1.0 \
-#     --top-p 0.95 \
-#     --top-k 20 \
-#     --max-tokens 4096 \
-#     --name mmflash_qwen35-9B_concurrency1_temp1_4096
-
-
-# python benchmarks/bench_mm.py \
-#     --model Qwen/Qwen3.5-9B \
+#     --model Qwen/Qwen3.5-4B \
 #     --base-url "${BASE_URLS[@]}" \
 #     --concurrency 1 \
 #     --block-size ${BLOCK_SIZE} \
@@ -210,7 +210,7 @@ python benchmarks/bench_mm.py \
 
 # # for text benchmark
 # python benchmarks/bench_text.py \
-#     --model Qwen/Qwen3.5-9B \
+#     --model Qwen/Qwen3.5-4B \
 #     --base-url "${BASE_URLS[@]}" \
 #     --concurrency 1 \
 #     --block-size ${BLOCK_SIZE} \
@@ -220,7 +220,7 @@ python benchmarks/bench_mm.py \
 #     --top-p 0.95 \
 #     --top-k 20 \
 #     --max-tokens 8192 \
-#     --name dflash_qwen35-9B_concurrency1
+#     --name dflash_qwen35-4B_concurrency1
 
 
 pkill -f "sglang.launch_server"

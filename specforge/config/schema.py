@@ -504,6 +504,31 @@ class DeploymentConfig(StrictConfigModel):
         return self
 
 
+class DraftSparseConfig(StrictConfigModel):
+    """MMFlash sparse draft context, the training twin of SGLang's sparse mode.
+
+    Same knobs and meaning as ``SGLANG_DFLASH_DRAFT_SPARSE``
+    (patches/sglang/v0.5.14/dflash-draft-sparse-context.patch): a draft block
+    anchored at ``a`` sees context ``p < a`` only if ``p < sink``, or ``p`` is
+    a non-visual token and ``text``, or ``p`` is a strided position of an
+    image span, or ``p >= a - window``. ``window`` has no default on purpose:
+    SGLang falls back to ``--speculative-draft-window-size`` when it is
+    omitted, and training must state the value it will be served with.
+    """
+
+    sink: int = Field(default=0, ge=0)
+    text: bool = True
+    stride: int = Field(default=0, ge=0)
+    window: int = Field(ge=0)
+
+    def to_sglang_env(self) -> str:
+        """The ``SGLANG_DFLASH_DRAFT_SPARSE`` value serving this pattern."""
+        return (
+            f"sink={self.sink},text={int(self.text)},stride={self.stride},"
+            f"window={self.window}"
+        )
+
+
 class TrainingConfig(StrictConfigModel):
     strategy: str = "eagle3"
     num_epochs: int = Field(default=1, gt=0)
@@ -554,6 +579,11 @@ class TrainingConfig(StrictConfigModel):
     #: times how far the draft still is from the token (p = its probability on
     #: the target). Bounded in [1, 1 + visual_alpha]; 0 is exactly ``loss_type``.
     visual_alpha: float = Field(default=1.0, ge=0.0)
+    #: MMFlash only -- train the draft on a sparse view of the target context
+    #: (sink + text + strided image tokens + recent window), exactly the
+    #: pattern SGLang serves with ``SGLANG_DFLASH_DRAFT_SPARSE``. ``null`` (the
+    #: default) keeps the dense context, i.e. every position before the anchor.
+    draft_sparse: Optional[DraftSparseConfig] = None
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_ce_loss_alpha: float = 0.1
@@ -608,6 +638,20 @@ class TrainingConfig(StrictConfigModel):
                 "training.sp_ulysses_size/sp_ring_size require "
                 "training.attention_backend=usp"
             )
+        if self.draft_sparse is not None:
+            if self.strategy != "mmflash":
+                raise ValueError(
+                    "training.draft_sparse is implemented for "
+                    f"training.strategy=mmflash only, got {self.strategy!r}"
+                )
+            # eager adds a bool mask to the scores instead of applying it, and
+            # fa/usp take no per-position mask at all
+            if self.attention_backend not in ("flex_attention", "sdpa"):
+                raise ValueError(
+                    "training.draft_sparse requires training.attention_backend "
+                    f"flex_attention (or sdpa for short sequences), got "
+                    f"{self.attention_backend!r}"
+                )
         return self
 
 

@@ -1,6 +1,6 @@
-# DFlash baseline: z-lab's released Qwen3.5-4B drafter, same benchmark list and
+# DFlash baseline: z-lab's released Qwen3.5-9B drafter, same benchmark list and
 # settings as benchmark_mmflash.sh. Results resume into the existing
-# dflash_zlab_qwen35-4B_concurrency1_* files (already-recorded benchmarks are skipped).
+# dflash_zlab_qwen35-9B_concurrency1_* files (already-recorded benchmarks are skipped).
 
 export CUDA_VISIBLE_DEVICES=0
 export SGLANG_FORCE_STREAM_INTERVAL=1
@@ -18,11 +18,11 @@ export FLASHINFER_USE_CUDA_NORM=1
 export SGLANG_NUMA_BIND_V2=0
 
 
-# z-lab/Qwen3.5-4B-DFlash
-# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-sharegpt4v
-# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-hf 这个是一个只有1000step的test版本
-# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-50000 用llava那个数据集训的baseline版本，数据没有改prompt
-# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-dflash-baseline-llava-ov15-1M-prompted-final
+# z-lab/Qwen3.5-9B-DFlash
+# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-mmflash-sharegpt4v
+# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-mmflash-hf 这个是一个只有1000step的test版本
+# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-dflash-baseline-llava-ov15-1M-50000 用llava那个数据集训的baseline版本，数据没有改prompt
+# /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-dflash-baseline-llava-ov15-1M-prompted-final
 
 
 BLOCK_SIZE=16
@@ -52,9 +52,9 @@ for idx in "${!GPU_IDS[@]}"; do
     PORTS+=("${port}")
     BASE_URLS+=("http://localhost:${port}")
     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
-        --model Qwen/Qwen3.5-4B \
+        --model Qwen/Qwen3.5-9B \
         --speculative-algorithm DFLASH \
-        --speculative-draft-model-path z-lab/Qwen3.5-4B-DFlash \
+        --speculative-draft-model-path z-lab/Qwen3.5-9B-DFlash \
         --speculative-dflash-block-size ${BLOCK_SIZE} \
         --mem-fraction-static 0.7 \
         --tp 1 \
@@ -102,37 +102,37 @@ fi
 #  dynamath:200 mathvista:200 mathverse:200
 
 python benchmarks/bench_mm.py \
-    --model Qwen/Qwen3.5-4B \
+    --model Qwen/Qwen3.5-9B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
     --block-size ${BLOCK_SIZE} \
-    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
+    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200 mmbench:200 \
     --reasoning off \
     --temperature 0.0 \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 4096 \
-    --name dflash_zlab_qwen35-4B_concurrency1_temp0_4096
+    --name dflash_zlab_qwen35-9B_concurrency1_temp0_4096
 
 python benchmarks/bench_mm.py \
-    --model Qwen/Qwen3.5-4B \
+    --model Qwen/Qwen3.5-9B \
     --base-url "${BASE_URLS[@]}" \
     --concurrency 1 \
     --block-size ${BLOCK_SIZE} \
-    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200  \
+    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200 mmbench:200  \
     --reasoning off \
     --temperature 1.0 \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 4096 \
-    --name dflash_zlab_qwen35-4B_concurrency1_temp1_4096
+    --name dflash_zlab_qwen35-9B_concurrency1_temp1_4096
 
 
 
 
 # # for text benchmark
 # python benchmarks/bench_text.py \
-#     --model Qwen/Qwen3.5-4B \
+#     --model Qwen/Qwen3.5-9B \
 #     --base-url "${BASE_URLS[@]}" \
 #     --concurrency 1 \
 #     --block-size ${BLOCK_SIZE} \
@@ -142,7 +142,7 @@ python benchmarks/bench_mm.py \
 #     --top-p 0.95 \
 #     --top-k 20 \
 #     --max-tokens 8192 \
-#     --name dflash_zlab_qwen35-4B_concurrency1
+#     --name dflash_zlab_qwen35-9B_concurrency1
 
 
 pkill -f "sglang.launch_server"

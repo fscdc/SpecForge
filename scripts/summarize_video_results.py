@@ -103,8 +103,11 @@ def main() -> int:
     parser.add_argument("--results-dir", default="results")
     parser.add_argument(
         "--benchmark",
-        default="vdc,longvideobench,moviechat,videomme,mvbench",
-        help="comma-separated benchmark keys, one table each",
+        default="longvideobench,moviechat,mvbench",
+        help=(
+            "comma-separated benchmark keys, one table each (default: the three "
+            "video benchmarks of the paper; vdc and videomme are also recorded)"
+        ),
     )
     parser.add_argument("--csv", default=None, help="also write the rows to this CSV")
     parser.add_argument(

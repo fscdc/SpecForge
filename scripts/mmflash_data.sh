@@ -17,6 +17,10 @@ export HF_HUB_DOWNLOAD_TIMEOUT=120
 #     --output-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/data/ \
 #     --overwrite
 
+# python scripts/prepare_data_mm.py --dataset llava-video-178k \
+#     --sample-size 2000 --image-root /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/data/ --output-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/data/ \
+#     --output-name llava-video-2k
+
 # python scripts/prepare_data_mm.py \
 #     --dataset sharegpt4v \
 #     --image-root /local_home1/fengsicheng/specforge/data \

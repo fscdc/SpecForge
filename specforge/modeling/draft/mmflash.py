@@ -468,7 +468,7 @@ class MMFlashDraftModel(Qwen3PreTrainedModel):
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
-            noise_embedding = target.model.embed_tokens(block_output_ids)
+            noise_embedding = target.get_input_embeddings()(block_output_ids)
             draft_hidden = self(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,

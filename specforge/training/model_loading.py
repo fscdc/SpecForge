@@ -206,6 +206,29 @@ def _serializable_config_value(value: Any) -> Any:
     return value
 
 
+def _rope_field_keyed_by_layer_type(target_config: Any) -> Optional[str]:
+    """Name the target's RoPE field that holds one entry per layer type.
+
+    Such a target (Gemma 4: sliding and full attention with different thetas)
+    has no single RoPE a one-attention-type draft could copy, and no top-level
+    ``rope_theta`` either. A field qualifies when every key is one of the
+    target's layer types (Transformers' own test) or every value is itself a
+    parameter dict.
+    """
+    layer_types = set(getattr(target_config, "layer_types", None) or ())
+    for field in ("rope_parameters", "rope_scaling"):
+        value = getattr(target_config, field, None)
+        if hasattr(value, "to_dict"):
+            value = value.to_dict()
+        if not isinstance(value, dict) or not value:
+            continue
+        if set(value) <= layer_types or all(
+            isinstance(entry, dict) for entry in value.values()
+        ):
+            return field
+    return None
+
+
 def _generate_draft_config(
     cfg: "Config", provider: "DraftConfigProvider"
 ) -> "PretrainedConfig":
@@ -229,6 +252,13 @@ def _generate_draft_config(
         trust_remote_code=cfg.model.trust_remote_code,
     )
     target_config = target_text_config(target_config)
+    rope_field = _rope_field_keyed_by_layer_type(target_config)
+    if rope_field is not None:
+        raise ValueError(
+            f"target config {cfg.model.target_model_path!r} keys {rope_field} "
+            "by layer type, so no draft config can be derived from it; set "
+            "model.draft_model_config to an explicit draft config"
+        )
     payload: Dict[str, Any] = {}
     for field in _TARGET_ARCHITECTURE_FIELDS:
         value = getattr(target_config, field, None)

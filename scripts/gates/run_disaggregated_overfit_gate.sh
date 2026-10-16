@@ -221,10 +221,10 @@ COMMON_OVERRIDES=(
     "model.mask_token_id=$MASK_TOKEN_ID"
     model.shard_target_output=false
     "data.train_data_path=$SINGLE_DATA_PATH"
-    'data.prompts_path=""'
-    'data.hidden_states_path=""'
-    'data.eval_data_path=""'
-    'data.eval_hidden_states_path=""'
+    'data.prompts_path='
+    'data.hidden_states_path='
+    'data.eval_data_path='
+    'data.eval_hidden_states_path='
     data.max_prompts=1
     "data.max_length=$MAX_LENGTH"
     "data.chat_template=$CHAT_TEMPLATE"
@@ -241,6 +241,7 @@ COMMON_OVERRIDES=(
     training.sp_ring_size=1
     "deployment.trainer.nproc_per_node=$NPROC_PER_NODE"
     "deployment.disaggregated.control_dir=$WORK_DIR"
+    "deployment.disaggregated.consumer_state_dir=$WORK_DIR/consumer-state"
     "deployment.disaggregated.server_urls=[\"$DISAGG_SERVER_URL\"]"
     tracking.report_to=none
     "runtime.in_flight_high_watermark=$IN_FLIGHT_HIGH_WATERMARK"
@@ -291,6 +292,7 @@ if ! gate_dry_run; then
         gate_require_tcp_port_free \
             "$PYTHON" "$CAPTURE_HOST" "$CAPTURE_PORT" CAPTURE_PORT
     fi
+    gate_require_gemma4_spec_patch "$SGLANG_PYTHON" "$TARGET_MODEL_PATH"
     mkdir -p "$PRODUCER_OUTPUT_DIR" "$CONSUMER_OUTPUT_DIR" "$DISAGG_INBOX_DIR"
 fi
 

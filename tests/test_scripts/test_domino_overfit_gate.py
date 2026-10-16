@@ -252,6 +252,25 @@ class TestDominoOverfitGate(unittest.TestCase):
                 result["checkpoint"], str(checkpoint / "training_state.pt")
             )
 
+    def test_accepts_the_dflash_trainer_acc_metric(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "train.log"
+            log.write_text(
+                "step 400: {'loss': 3.6e-05, 'acc': 1.0, 'accuracy_denom': 5684.0}\n",
+                encoding="utf-8",
+            )
+            checkpoint = Path(tmp) / "consumer" / "run-step400"
+            checkpoint.mkdir(parents=True)
+            (checkpoint / "training_state.pt").touch()
+            result = check_overfit.check_overfit(
+                str(log),
+                str(Path(tmp) / "consumer"),
+                expected_step=400,
+                max_loss=1e-4,
+                min_accuracy=1.0,
+            )
+            self.assertTrue(result["passed"])
+
     def test_accepts_unified_trainer_log_and_selects_latest_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "train.log"

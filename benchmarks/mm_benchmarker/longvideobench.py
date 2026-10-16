@@ -219,7 +219,10 @@ class LongVideoBenchBenchmarker(MMBenchmarker):
         split: "test" (the default, no answers) or "validation".
         num_frames: how many evenly spaced frames a video is sent as. A video
             shorter than that many seconds contributes one frame per second,
-            as in lmms-eval.
+            as in lmms-eval, unless `fps_cap` is off.
+        fps_cap: the one-frame-per-second cap above (default on). Off sends
+            every video as `num_frames` frames, as MVBench and Video-MME do, so
+            every prompt has the same length (~42k tokens at 48 frames).
         video_dir: directory holding the videos. Defaults to
             `$HF_HOME/longvideobench_videos`, which is also where the archive
             parts are unpacked to.
@@ -246,6 +249,7 @@ class LongVideoBenchBenchmarker(MMBenchmarker):
         auto_download: Optional[bool] = None,
         max_parts: Optional[int] = None,
         frames_dir: Optional[str] = None,
+        fps_cap: Optional[bool] = None,
         pre_prompt: Optional[str] = None,
         post_prompt: Optional[str] = None,
     ):
@@ -279,6 +283,7 @@ class LongVideoBenchBenchmarker(MMBenchmarker):
             or os.environ.get("LVB_FRAMES_DIR")
             or os.path.join(".cache", "longvideobench_frames_specforge")
         )
+        self.fps_cap = fps_cap if fps_cap is not None else env_flag("LVB_FPS_CAP", True)
         self.pre_prompt = (
             pre_prompt
             if pre_prompt is not None
@@ -520,7 +525,7 @@ class LongVideoBenchBenchmarker(MMBenchmarker):
             duration = 0.0
         # lmms-eval samples one frame per second for videos shorter than the budget
         count = self.num_frames
-        if duration > 0:
+        if self.fps_cap and duration > 0:
             count = max(1, min(self.num_frames, int(duration)))
         return materialize_frames(self.frames_dir, video_path, str(row["video_id"]), count)
 

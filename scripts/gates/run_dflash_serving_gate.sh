@@ -122,10 +122,15 @@ NORMALIZE_COMMAND=(
     --block-size "$BLOCK_SIZE"
 )
 
+# Gemma 4 shifts positions by one IN PLACE unless this is set. Under the eager
+# DFLASH verify below (--disable-cuda-graph) that tensor is the one RoPE is
+# applied to when the accepted draft K/V are committed, so the draft attends to
+# shifted keys. Only gemma4_mm.py reads the variable.
 SERVER_ENV=(
     env
     "CUDA_VISIBLE_DEVICES=$SERVING_GPUS"
     PYTHONUNBUFFERED=1
+    "SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION=${SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION:-1}"
 )
 if [[ -n "$SGLANG_ROOT" ]]; then
     SERVER_ENV+=("PYTHONPATH=$SGLANG_ROOT/python${PYTHONPATH:+:$PYTHONPATH}")
@@ -181,6 +186,13 @@ if ! gate_dry_run; then
     gate_require_command curl curl
     gate_require_tcp_port_free \
         "$PYTHON" "$SERVING_HOST" "$SERVING_PORT" SERVING_PORT
+    # inspect the sglang tree the server will import, not site-packages
+    if [[ -n "$SGLANG_ROOT" ]]; then
+        PYTHONPATH="$SGLANG_ROOT/python${PYTHONPATH:+:$PYTHONPATH}" \
+            gate_require_gemma4_spec_patch "$SGLANG_PYTHON" "$TARGET_MODEL_PATH"
+    else
+        gate_require_gemma4_spec_patch "$SGLANG_PYTHON" "$TARGET_MODEL_PATH"
+    fi
     mkdir -p "$WORK_DIR"
 fi
 

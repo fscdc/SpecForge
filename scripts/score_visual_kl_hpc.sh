@@ -16,13 +16,30 @@
 # deployment.managed_local -- the capture servers' plus the trainer's -- runs
 # one shard, because scoring happens before training and both roles are idle.
 # GPUS=0,1,2,3 overrides; a config that claims none falls back to
-# CUDA_VISIBLE_DEVICES and then to nvidia-smi.
+# CUDA_VISIBLE_DEVICES and then to nvidia-smi. GPUS=job uses exactly the cards
+# this job was given (CUDA_VISIBLE_DEVICES), which is what a qsub job wants:
+# PBS hands out UUIDs, so the config's indices name other cards, and the UUIDs
+# are not known when the job is submitted. One shard per card, e.g. the whole
+# Gemma 4 smoke subset into the MMFlash smoke recipe's own sidecar, on one GPU:
+#
+#   qsub -l select=1:ngpus=1 -v CONFIG=scripts/mmtraining_configs/gemma4-e4b-mmflash-smoke_hpc.yaml,GPUS=job scripts/score_visual_kl_hpc.sh
+#
+# WARNING: a MAX_ROWS run leaves a partial sidecar that training still loads (unscored rows get g=0): give it its own OUTPUT_DIR.
 #
 # Each GPU runs shard SHARD_BASE + i of NUM_SHARDS. With two 4-GPU jobs use
 # NUM_SHARDS=8 and SHARD_BASE=0 / 4:
 #
 #   qsub -l select=1:ngpus=4 -v NUM_SHARDS=8,SHARD_BASE=0 scripts/score_visual_kl_hpc.sh
 #   qsub -l select=1:ngpus=4 -v NUM_SHARDS=8,SHARD_BASE=4 scripts/score_visual_kl_hpc.sh
+#
+# SHARDS_PER_GPU=k runs k shards on every card, each its own process with its
+# own copy of the target (Gemma 4 E4B: ~16 GB). One scorer leaves an H200 idle
+# about half the time (HF's eager forward of a 4B model is launch-bound, and the
+# images are decoded and processed on the CPU), so a few per card add up. The
+# job's CPU cores are split evenly across its shards (THREADS_PER_SHARD
+# overrides). E.g. the whole Gemma corpus, 3 shards on each of 2 cards:
+#
+#   qsub -l select=1:ngpus=2 -l walltime=96:00:00 -v CONFIG=scripts/mmtraining_configs/gemma4-e4b-mmflash_hpc.yaml,GPUS=job,SHARDS_PER_GPU=3 scripts/score_visual_kl_hpc.sh
 #
 # Re-submitting the same command resumes: each shard skips the ids already in
 # its own file. Two jobs cannot be given the same shard by accident -- each
@@ -166,7 +183,8 @@ if [ -z "${EXPECTED_ROWS:-}" ]; then
 fi
 
 # Which GPUs to use, in order of precedence:
-#   1. GPUS=...            explicit override
+#   1. GPUS=...            explicit override; GPUS=job means the job's own
+#                          CUDA_VISIBLE_DEVICES
 #   2. the config          every card deployment.managed_local claims -- the
 #                          capture servers' plus the trainer's. Scoring runs
 #                          before training, so both roles are idle and the whole
@@ -174,7 +192,15 @@ fi
 #                          cards that belong to someone else on a shared box.
 #   3. CUDA_VISIBLE_DEVICES / nvidia-smi   when the config claims none
 #                          (colocated mode, or an externally managed deployment)
-if [ -n "${GPUS_OVERRIDE:-${GPUS:-}}" ]; then
+if [ "${GPUS_OVERRIDE:-${GPUS:-}}" = "job" ]; then
+    if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        echo "ERROR: GPUS=job, but CUDA_VISIBLE_DEVICES is empty: this job was" >&2
+        echo "       given no GPU. Submit with -l select=1:ngpus=N." >&2
+        exit 1
+    fi
+    IFS=',' read -r -a GPUS <<< "${CUDA_VISIBLE_DEVICES}"
+    GPU_SOURCE="the job's CUDA_VISIBLE_DEVICES (GPUS=job)"
+elif [ -n "${GPUS_OVERRIDE:-${GPUS:-}}" ]; then
     IFS=',' read -r -a GPUS <<< "${GPUS_OVERRIDE:-${GPUS}}"
     GPU_SOURCE="GPUS override"
 elif [ -n "${CFG_GPUS}" ]; then
@@ -192,7 +218,8 @@ fi
 # PBS on this cluster passes UUIDs -- those indices mean something else, so say
 # so rather than quietly scoring on cards this job may not even own.
 if [ -n "${CFG_GPUS}" ] && [ -n "${CUDA_VISIBLE_DEVICES:-}" ] \
-   && [ "${CFG_GPUS}" != "${CUDA_VISIBLE_DEVICES}" ]; then
+   && [ "${CFG_GPUS}" != "${CUDA_VISIBLE_DEVICES}" ] \
+   && [ "${GPU_SOURCE}" != "the job's CUDA_VISIBLE_DEVICES (GPUS=job)" ]; then
     _job_count=$(printf '%s' "${CUDA_VISIBLE_DEVICES}" | awk -F, '{print NF}')
     _cfg_count=$(printf '%s' "${CFG_GPUS}" | awk -F, '{print NF}')
     echo "[warn] config asks for GPUs [${CFG_GPUS}] but this job was given" >&2
@@ -200,7 +227,21 @@ if [ -n "${CFG_GPUS}" ] && [ -n "${CUDA_VISIBLE_DEVICES:-}" ] \
     echo "[warn] using the config's (${_cfg_count} card(s), job has ${_job_count})." >&2
     echo "[warn] Pass GPUS=\"${CUDA_VISIBLE_DEVICES}\" to use the job's instead." >&2
 fi
-LOCAL=${#GPUS[@]}
+SHARDS_PER_GPU=${SHARDS_PER_GPU:-1}
+case "${SHARDS_PER_GPU}" in
+    ''|*[!0-9]*|0)
+        echo "ERROR: SHARDS_PER_GPU must be a positive integer, got '${SHARDS_PER_GPU}'" >&2
+        exit 1
+        ;;
+esac
+# one entry per shard this job runs: the card it runs on
+SLOTS=()
+for gpu in "${GPUS[@]}"; do
+    for _ in $(seq 1 "${SHARDS_PER_GPU}"); do
+        SLOTS+=("${gpu}")
+    done
+done
+LOCAL=${#SLOTS[@]}
 if [ "${LOCAL}" -eq 0 ]; then
     echo "ERROR: no GPU to score on." >&2
     echo "       ${CONFIG} names none under deployment.managed_local, and neither" >&2
@@ -214,9 +255,13 @@ if [ -n "${PBS_ARRAY_INDEX:-}" ] && [ -z "${SHARD_BASE:-}" ]; then
 fi
 SHARD_BASE=${SHARD_BASE:-0}
 if [ $(( SHARD_BASE + LOCAL )) -gt "${NUM_SHARDS}" ]; then
-    echo "ERROR: SHARD_BASE(${SHARD_BASE}) + local GPUs(${LOCAL}) exceeds NUM_SHARDS(${NUM_SHARDS})" >&2
+    echo "ERROR: SHARD_BASE(${SHARD_BASE}) + local shards(${LOCAL}) exceeds NUM_SHARDS(${NUM_SHARDS})" >&2
     exit 1
 fi
+# CPU threads per scorer: torch's CPU ops and the image processor, the job's
+# cores split across its shards so that several per card do not oversubscribe
+JOB_CPUS=${NCPUS:-$(nproc 2>/dev/null || echo 1)}
+THREADS_PER_SHARD=${THREADS_PER_SHARD:-$(( JOB_CPUS / LOCAL > 0 ? JOB_CPUS / LOCAL : 1 ))}
 
 if ! mkdir -p "${OUTPUT_DIR}/logs" 2>/dev/null; then
     echo "ERROR: cannot create ${OUTPUT_DIR}/logs -- check the path and permissions" >&2
@@ -227,7 +272,7 @@ echo "[plan] data=${TRAIN_DATA} (${EXPECTED_ROWS} rows)"
 echo "[plan] config=${CONFIG}"
 echo "[plan] output=${OUTPUT_DIR}"
 echo "[plan] gpus=${GPUS[*]}  (from ${GPU_SOURCE})"
-echo "[plan] local_shards=${LOCAL} shard_base=${SHARD_BASE} num_shards=${NUM_SHARDS} max_rows=${MAX_ROWS:-all}"
+echo "[plan] local_shards=${LOCAL} (${SHARDS_PER_GPU} per GPU, ${THREADS_PER_SHARD} CPU threads each) shard_base=${SHARD_BASE} num_shards=${NUM_SHARDS} max_rows=${MAX_ROWS:-all}"
 
 # One shard must never be written by two processes: the appends would interleave
 # into torn lines. An flock is enough and needs no cleanup -- the kernel drops it
@@ -239,16 +284,17 @@ command -v flock >/dev/null 2>&1 || {
 }
 
 PIDS=()
-for i in "${!GPUS[@]}"; do
+for i in "${!SLOTS[@]}"; do
     shard=$(( SHARD_BASE + i ))
     tag="shard$(printf '%03d' "${shard}")"
     log="${OUTPUT_DIR}/logs/${tag}.log"
     extra=()
     if [ -n "${MAX_ROWS}" ]; then extra+=(--max-rows "${MAX_ROWS}"); fi
-    echo "[launch] shard ${shard}/${NUM_SHARDS} on GPU ${GPUS[$i]} -> ${log}"
+    echo "[launch] shard ${shard}/${NUM_SHARDS} on GPU ${SLOTS[$i]} -> ${log}"
     if [ "${LOCKED}" = "1" ]; then
         flock -n -E 99 "${OUTPUT_DIR}/logs/${tag}.lock" \
-            env CUDA_VISIBLE_DEVICES="${GPUS[$i]}" python3 "${SCORER}" \
+            env CUDA_VISIBLE_DEVICES="${SLOTS[$i]}" OMP_NUM_THREADS="${THREADS_PER_SHARD}" \
+            MKL_NUM_THREADS="${THREADS_PER_SHARD}" python3 "${SCORER}" \
             --config "${CONFIG}" \
             --output-dir "${OUTPUT_DIR}" \
             --shard-index "${shard}" \
@@ -258,7 +304,8 @@ for i in "${!GPUS[@]}"; do
             "${extra[@]}" \
             > "${log}" 2>&1 &
     else
-        CUDA_VISIBLE_DEVICES="${GPUS[$i]}" python3 "${SCORER}" \
+        CUDA_VISIBLE_DEVICES="${SLOTS[$i]}" OMP_NUM_THREADS="${THREADS_PER_SHARD}" \
+            MKL_NUM_THREADS="${THREADS_PER_SHARD}" python3 "${SCORER}" \
             --config "${CONFIG}" \
             --output-dir "${OUTPUT_DIR}" \
             --shard-index "${shard}" \

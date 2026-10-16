@@ -230,7 +230,9 @@ def _resolve_mask_token_id(cfg: Config, draft_model: Any, tokenizer: Any) -> int
 
     return resolve_mask_token_id(
         explicit=cfg.model.mask_token_id,
-        tokenizer=tokenizer,
+        # An image run's input tools are a processor, which carries no token ids
+        # of its own; its tokenizer does.
+        tokenizer=getattr(tokenizer, "tokenizer", tokenizer),
         draft_model=draft_model,
         embedding_vocab_size=int(draft_model.config.vocab_size),
     )
@@ -269,6 +271,13 @@ def build_eagle3_model(
             # head is loaded from this embedding instead
             embedding_key=cfg.model.embedding_key,
         )
+        if cfg.training.compact_teacher:
+            from specforge.core.compact_teacher import reject_softcapped_target_head
+
+            reject_softcapped_target_head(target_head)
+        # The soft labels follow the target's capped distribution (Gemma); the
+        # EAGLE3 resume contract records the cap the head applies.
+        model.target_logit_softcap = target_head.final_logit_softcapping
     return AlgorithmModelParts(
         model=model,
         target_head=target_head,
@@ -330,6 +339,9 @@ def _build_dflash_family_model(
     method_config["mask_token_id"] = mask_token_id
     method_config["target_layer_ids"] = list(draft_model.target_layer_ids)
 
+    # SGLang serves the draft's noise and anchor tokens through the target's
+    # own embedding module, which for Gemma 3/3n/4 scales its lookups; the
+    # embedding built here applies the same factor (lm_head stays raw).
     target_parts = TargetEmbeddingsAndHead.from_pretrained(
         cfg.model.target_model_path,
         embed_key=cfg.model.embedding_key,
@@ -338,6 +350,7 @@ def _build_dflash_family_model(
         device=_device().type,
         dtype=_torch_dtype(cfg),
         trust_remote_code=cfg.model.trust_remote_code,
+        embed_scale=cfg.model.target_embedding_scale,
     )
     common = {
         "draft_model": draft_model,

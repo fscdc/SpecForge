@@ -76,6 +76,54 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def test_segmented_online_run_validates_its_range_and_continuation(self):
+        payload = _managed_local_payload(ep_size=1)
+        payload["training"] = {
+            "strategy": "eagle3",
+            "num_epochs": 6,
+            "online_epoch_range": [3, 6],
+            "continue_from": "/ckpt",
+        }
+        cfg = Config.model_validate(copy.deepcopy(payload))
+        self.assertEqual(cfg.training.online_epoch_range, [3, 6])
+        self.assertEqual(cfg.training.continue_from, "/ckpt")
+
+        for bad in ([0, 7], [3, 3], [4, 2], [1]):
+            invalid = copy.deepcopy(payload)
+            invalid["training"]["online_epoch_range"] = bad
+            with self.assertRaisesRegex(ValueError, "online_epoch_range"):
+                Config.model_validate(invalid)
+        first_segment = copy.deepcopy(payload)
+        first_segment["training"]["online_epoch_range"] = [0, 3]
+        with self.assertRaisesRegex(ValueError, "continue_from"):
+            Config.model_validate(first_segment)
+        both = copy.deepcopy(payload)
+        both["training"]["resume_from"] = "/other"
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            Config.model_validate(both)
+        warm = copy.deepcopy(payload)
+        warm["model"]["draft_checkpoint_path"] = "/weights"
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            Config.model_validate(warm)
+        offline = copy.deepcopy(MINIMAL)
+        offline["training"] = {"num_epochs": 2, "online_epoch_range": [0, 1]}
+        with self.assertRaisesRegex(ValueError, "online disaggregated"):
+            Config.model_validate(offline)
+
+    def test_override_sets_a_structured_value_on_an_optional_field(self):
+        from specforge.config.schema import apply_overrides
+
+        payload = _managed_local_payload(ep_size=1)
+        payload["training"] = {"strategy": "eagle3", "num_epochs": 6}
+        cfg = Config.model_validate(payload)
+        self.assertIsNone(cfg.training.online_epoch_range)
+        cfg = apply_overrides(
+            cfg,
+            ["training.online_epoch_range=[3,6]", "training.continue_from=/ckpt"],
+        )
+        self.assertEqual(cfg.training.online_epoch_range, [3, 6])
+        self.assertEqual(cfg.training.continue_from, "/ckpt")
+
     def test_liger_kernel_flag_is_typed_and_defaults_off(self):
         default = Config.model_validate(copy.deepcopy(MINIMAL))
         self.assertFalse(default.model.use_liger_kernel)

@@ -186,8 +186,13 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
             self.embed_tokens.weight.copy_(emb_tokens)
         else:
             # this is the case where model_path is a huggingface repository
-            # we first need to locate its local cache
-            local_cache_path = snapshot_download(repo_id=model_path)
+            # we first need to locate its local cache; only the weight files are
+            # needed, and asking for them alone keeps an offline cache that
+            # lacks the repo's README or .gitattributes resolvable
+            local_cache_path = snapshot_download(
+                repo_id=model_path,
+                allow_patterns=["*.json", "*.safetensors", "*.bin"],
+            )
             self.load_embedding(local_cache_path, embedding_key)
 
     def load_vocab_mapping(self, file_path: str) -> None:

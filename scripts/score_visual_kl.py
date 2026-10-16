@@ -70,6 +70,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flush-every", type=int, default=50)
     parser.add_argument("--no-resume", action="store_true", help="overwrite this shard's file instead of appending")
     parser.add_argument("--expected-rows", type=int, default=None, help="rows in the jsonl, only used for the ETA (wc -l)")
+    parser.add_argument(
+        "--cudnn-sdpa",
+        action="store_true",
+        help="keep PyTorch's cuDNN attention backend for SDPA (off by default: it builds an "
+        "execution plan on the CPU for every new sequence length, and nearly every row has one)",
+    )
     return parser.parse_args()
 
 
@@ -117,6 +123,36 @@ def _load_images(image) -> list:
         with Image.open(path) as handle:
             images.append(handle.convert("RGB"))
     return images
+
+
+def _iter_complete_records(path: str, iter_records):
+    """``iter_records(path)``, minus a half-written last line.
+
+    A corpus can be scored while the regen is still appending to it. Its last
+    line may then lack the newline, and parsing it would fail the whole shard,
+    so the scan stops there instead; resume scores the row on the next run.
+    """
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        if size:
+            handle.seek(size - 1)
+            last = handle.read(1)
+    if not size or last == b"\n":
+        yield from iter_records(path)
+        return
+    with open(path, encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.endswith("\n"):
+                print(f"[scorer] line {line_number} is still being written; stopping before it", flush=True)
+                return
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError(f"JSON record in {path!r} at line {line_number} must be an object")
+            yield line_number, record
 
 
 def _shard_paths(output_dir: str, shard: int, num_shards: int):
@@ -187,6 +223,14 @@ def main() -> None:
     import torch
     from PIL import Image
     from transformers import AutoModelForImageTextToText
+
+    if not args.cudnn_sdpa:
+        # SDPA's cuDNN backend plans each new query/key length on the CPU, and a
+        # row's two forwards almost never repeat a length. On Gemma 4 E4B (H200,
+        # torch 2.11, cuDNN 9.19) that was ~0.9 s per forward against ~75 ms
+        # with it off, the GPU idle meanwhile; the flash, mem-efficient and math
+        # kernels need no plan.
+        torch.backends.cuda.enable_cudnn_sdp(False)
 
     from specforge.config.schema import load_config
     from specforge.data.mm_preprocessing import (
@@ -272,7 +316,7 @@ def main() -> None:
             json.dump({**counts, "elapsed_s": elapsed, "mean_kl": mean_kl, "mean_entropy": mean_h}, handle)
 
     with open(out_path, mode, encoding="utf-8") as sink:
-        for line_number, record in _iter_records(source):
+        for line_number, record in _iter_complete_records(source, _iter_records):
             if (line_number - 1) % args.num_shards != args.shard_index:
                 continue
             counts["seen"] += 1
@@ -382,6 +426,7 @@ def main() -> None:
         "header_ids": list(header_ids),
         "end_ids": sorted(int(i) for i in end_ids),
         "dtype": args.dtype,
+        "cudnn_sdpa": args.cudnn_sdpa,
         "shard_index": args.shard_index,
         "num_shards": args.num_shards,
         "counts": counts,

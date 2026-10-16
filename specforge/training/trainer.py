@@ -102,6 +102,7 @@ class Trainer:
         per_sample_transform=None,
         durable_ack: bool = True,
         resume_from: Optional[str] = None,
+        continue_new_stream: bool = False,
         resume_state: Optional[dict] = None,
         dataset_size: Optional[int] = None,
         checkpoint_extra: Optional[dict] = None,
@@ -278,6 +279,11 @@ class Trainer:
         # masters (cloned at build) start from them; this rank's own optimizer/RNG
         # shard (``state['backend']``) loads after the wrap builds the optimizer.
         resume = None
+        if continue_new_stream and not resume_from:
+            raise ValueError(
+                "continue_new_stream needs the previous segment's checkpoint "
+                "in resume_from"
+            )
         if resume_from:
             state = (
                 resume_state
@@ -403,6 +409,19 @@ class Trainer:
                     f"checkpoint {resume_from} has a streamed mid-epoch position, "
                     "but the queue was not rebuilt as prepositioned"
                 )
+            if continue_new_stream:
+                # The next segment of a run split by epochs: the checkpoint must
+                # close its own stream (every ref it was sent is trained, so no
+                # data is skipped or replayed), and the new stream starts at its
+                # first batch with the restored optimizer, RNG and global_step.
+                if saved_epoch != num_epochs or samples:
+                    raise ValueError(
+                        f"checkpoint {resume_from} stopped inside its stream "
+                        f"(epoch={saved_epoch}/{num_epochs}, epoch_samples="
+                        f"{samples}); continue only from a segment's final "
+                        "checkpoint"
+                    )
+                saved_epoch = start_batch = start_samples = 0
             resume = {
                 "backend": state["backend"],
                 "global_step": state["global_step"],
@@ -475,6 +494,7 @@ class Trainer:
             # completed run or max_steps cap makes fit() a no-op, do not rewrite
             # it as a new checkpoint with altered epoch counters.
             controller_obj.last_checkpoint_step = resume["global_step"]
+            controller_obj.last_checkpoint_position = controller_obj.position()
 
         # Runtime pieces remain inspectable behind the single Trainer lifecycle.
         self.algorithm_name = algorithm_name
@@ -525,7 +545,11 @@ class Trainer:
             )
             with context:
                 step = self._controller.fit(self._loader)
-            if step > 0 and self.last_checkpoint_step != step:
+            if step > 0 and (
+                self.last_checkpoint_step != step
+                or self._controller.last_checkpoint_position
+                != self._controller.position()
+            ):
                 self.save_checkpoint()
             # A distributed consumer is not successful until prefetch has
             # stopped and every never-yielded lease has an explicit outcome.

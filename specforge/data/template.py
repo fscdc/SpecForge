@@ -317,6 +317,21 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# Gemma 4 renders '<|turn>' / '<turn|>' markers; the Gemma 3 '<start_of_turn>'
+# headers above are '<unk>' to its tokenizer and would match no reply. No
+# default system prompt (the official template adds none), and the reply ends
+# at '<turn|>' without the following '\n', exactly where the image path's mask
+# stops (mm_preprocessing._end_token_ids).
+TEMPLATE_REGISTRY.register(
+    name="gemma4",
+    template=ChatTemplate(
+        assistant_header="<|turn>model\n",
+        user_header="<|turn>user\n",
+        system_prompt=None,
+        end_of_turn_token="<turn|>",
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="longcat",
     template=ChatTemplate(

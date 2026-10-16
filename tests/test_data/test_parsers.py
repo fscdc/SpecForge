@@ -335,6 +335,14 @@ class TestTemplatePreprocessing(unittest.TestCase):
             messages=self.complete_reasoning_tool_conversation,
         )
 
+    def test_gemma4(self):
+        model_name = "google/gemma-4-E4B-it"
+        try:
+            AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+        except Exception:  # not cached / offline machine
+            self.skipTest(f"{model_name} tokenizer not cached locally")
+        self._run_template_test(model_name, "gemma4")
+
 
 if __name__ == "__main__":
     unittest.main()

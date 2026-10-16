@@ -488,6 +488,17 @@ class LaunchPlanTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValidationError, message):
                     Config.model_validate(raw)
 
+    def test_managed_local_shares_a_gpu_only_when_asked(self):
+        raw = _managed_config("/fresh/managed-attempt").model_dump()
+        managed = raw["deployment"]["disaggregated"]["managed_local"]
+        managed.update(trainer_cuda_visible_devices=["0", "5"])
+        with self.assertRaisesRegex(ValidationError, "must be disjoint"):
+            Config.model_validate(raw)
+        managed["share_trainer_gpu"] = True
+        shared = Config.model_validate(raw).deployment.disaggregated.managed_local
+        self.assertTrue(shared.share_trainer_gpu)
+        self.assertEqual(shared.trainer_cuda_visible_devices, ["0", "5"])
+
     def test_managed_local_rejects_external_and_nonlocal_modes(self):
         cfg = _managed_config("/fresh/managed-attempt")
         invalid_cases = {

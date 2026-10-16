@@ -74,23 +74,99 @@ def target_vocab_size(config) -> int:
     )
 
 
+# Targets whose input-embedding module multiplies every lookup by
+# sqrt(hidden_size). SGLang's DFLASH worker embeds draft blocks through that
+# module (target_model.get_input_embeddings()), so the trainer must too. Gemma
+# and Gemma 2 apply their normalizer in the model forward instead, so their
+# embedding modules, and the draft inputs SGLang builds from them, are unscaled.
+_SCALED_EMBEDDING_MODEL_TYPES = frozenset(
+    {"gemma3", "gemma3_text", "gemma3n", "gemma3n_text", "gemma4", "gemma4_text"}
+)
+
+
+def target_embedding_scale(config) -> Optional[float]:
+    """The factor the target's own embedding module applies, or None.
+
+    This is SGLang's Python float ``hidden_size ** 0.5`` (50.596 for hidden
+    2560), not HF's copy of it cast to the weight dtype (50.5 in bf16):
+    SGLang's embedding is what serves DFlash-family drafts.
+    """
+    text_config = target_text_config(config)
+    model_types = {
+        getattr(config, "model_type", None),
+        getattr(text_config, "model_type", None),
+    }
+    if model_types.isdisjoint(_SCALED_EMBEDDING_MODEL_TYPES):
+        return None
+    return float(text_config.hidden_size) ** 0.5
+
+
+def target_logit_softcap(config) -> Optional[float]:
+    """The target's ``final_logit_softcapping``, or None when it has none.
+
+    The served logits are ``cap * tanh(logits / cap)``. A missing, zero or
+    negative cap is off, as in SGLang's logits processor.
+    """
+    cap = getattr(target_text_config(config), "final_logit_softcapping", None)
+    if cap is None:
+        cap = getattr(config, "final_logit_softcapping", None)
+    if cap is None or float(cap) <= 0:
+        return None
+    return float(cap)
+
+
+class _ScaledEmbedding(nn.Embedding):
+    """An embedding whose lookups are multiplied by a Python-float scale.
+
+    Mirrors SGLang's ``Gemma3TextScaledWordEmbedding`` (also used by Gemma 3n
+    and Gemma 4). The scale is a plain attribute, not a buffer, so moving the
+    module to bf16 cannot round it, and the weight itself stays raw for a tied
+    LM head that shares it.
+    """
+
+    def __init__(self, *args, embed_scale: float, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.embed_scale = float(embed_scale)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return super().forward(input_ids) * self.embed_scale
+
+    def extra_repr(self) -> str:
+        return f"{super().extra_repr()}, embed_scale={self.embed_scale}"
+
+
 class TargetEmbeddingsAndHead(nn.Module):
     """
     Efficiently loads only the embedding layer and lm_head from a pretrained model.
     Handles safetensors slicing and Weight Tying correctly.
+
+    ``embed_scale`` multiplies embedding lookups (never the weight, which a tied
+    LM head shares): None takes the target's own scale (sqrt(hidden_size) for
+    Gemma 3/3n/4, otherwise none), and 1.0 turns scaling off.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, embed_scale: Optional[float] = None):
         super().__init__()
         self.config = config
         text_config = target_text_config(config)
         vocab_size = target_vocab_size(text_config)
         hidden_size = int(text_config.hidden_size)
-        self.embed_tokens = nn.Embedding(
-            vocab_size,
-            hidden_size,
-            padding_idx=getattr(text_config, "pad_token_id", None),
-        )
+        if embed_scale is None:
+            embed_scale = target_embedding_scale(config)
+        padding_idx = getattr(text_config, "pad_token_id", None)
+        if embed_scale is None or float(embed_scale) == 1.0:
+            self.embed_tokens = nn.Embedding(
+                vocab_size,
+                hidden_size,
+                padding_idx=padding_idx,
+            )
+        else:
+            self.embed_tokens = _ScaledEmbedding(
+                vocab_size,
+                hidden_size,
+                padding_idx=padding_idx,
+                embed_scale=embed_scale,
+            )
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
     @classmethod
@@ -103,6 +179,7 @@ class TargetEmbeddingsAndHead(nn.Module):
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         trust_remote_code: bool = False,
+        embed_scale: Optional[float] = None,
     ) -> "TargetEmbeddingsAndHead":
 
         # 1. Load Config
@@ -111,7 +188,12 @@ class TargetEmbeddingsAndHead(nn.Module):
             cache_dir=cache_dir,
             trust_remote_code=trust_remote_code,
         )
-        instance = cls(config)
+        instance = cls(config, embed_scale=embed_scale)
+        if isinstance(instance.embed_tokens, _ScaledEmbedding):
+            print(
+                "Scaling target embedding lookups by "
+                f"{instance.embed_tokens.embed_scale!r}; the LM head stays unscaled."
+            )
 
         if embed_key is None:
             embed_key = "model.embed_tokens.weight"
@@ -278,6 +360,8 @@ class TargetEmbeddingsAndHead(nn.Module):
 __all__ = [
     "TargetEmbeddingsAndHead",
     "load_target_config",
+    "target_embedding_scale",
+    "target_logit_softcap",
     "target_text_config",
     "target_vocab_size",
 ]

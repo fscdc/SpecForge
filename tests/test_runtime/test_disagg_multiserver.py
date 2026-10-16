@@ -441,6 +441,48 @@ class TestMultiServerProducer(unittest.TestCase):
         )
         self.assertTrue(channel.is_closed())
 
+    def test_prompt_epoch_range_streams_exactly_its_epochs_of_the_plan(self):
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        N, E = 3, 4
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(N),
+            store,
+            channel,
+            lease=2,
+            prompt_epochs=E,
+            prompt_epoch_range=[1, 3],
+        )
+
+        self.assertEqual(drive(), N * 2)
+        ids = _published_sample_ids(channel.path)
+        # the segment's epochs keep the ids (and so the plan) of the full run
+        self.assertEqual(
+            sorted(ids),
+            sorted(
+                f"run0:epoch{epoch:04d}-prompt{idx:012d}"
+                for epoch in (1, 2)
+                for idx in range(N)
+            ),
+        )
+        self.assertTrue(channel.is_closed())
+
+        for bad in ([3, 5], [2, 2], [-1, 1]):
+            with self.assertRaisesRegex(ValueError, "prompt_epoch_range"):
+                _build(
+                    [_adapter(store, stub)],
+                    _prompts(N),
+                    store,
+                    StreamingRefChannel(
+                        os.path.join(self._workdir(), f"bad{bad[0]}{bad[1]}.jsonl")
+                    ),
+                    prompt_epochs=E,
+                    prompt_epoch_range=bad,
+                )
+
     def test_prompt_epoch_order_is_seeded_and_reconstruction_stable(self):
         prompts = _prompts(12)
 

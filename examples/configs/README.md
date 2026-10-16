@@ -149,6 +149,7 @@ should make their training strategy and topology explicit.
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
+| `model.target_embedding_scale` | `null` | DFlash-family factor on target embedding lookups, never on the tied LM head. `null` takes the target's own scale (`sqrt(hidden_size)` for Gemma 3/3n/4, which SGLang serves the draft with); `1.0` turns it off. |
 | `model.vocab_mapping_path` | `""` | Target-to-draft vocabulary mapping. EAGLE3 disaggregated runs require an explicit shared file. |
 | `model.load_target_embedding` | `true` | Copy the frozen target embedding into a fresh draft when supported. |
 | `model.aux_hidden_state_layer_ids` | `null` | Optional EAGLE3/P-EAGLE capture override containing exactly three non-negative layer IDs. Other strategies derive layers from the draft config. |
@@ -158,6 +159,7 @@ should make their training strategy and topology explicit.
 | `model.mask_token_id` | `null` | DFlash-family/P-EAGLE mask token override. Otherwise it resolves from the draft config and then the tokenizer. |
 | `model.tokenizer_pad_token_id` | `null` | Explicit non-negative tokenizer pad ID. Use it for released tokenizers that omit padding metadata. |
 | `model.sglang_attention_backend` | `flashinfer` | SGLang attention implementation for an in-process or managed capture server. |
+| `model.sglang_mm_attention_backend` | `null` | SGLang vision-tower attention (`--mm-attention-backend`) for managed capture servers. Gemma 4 image runs require `sdpa`, the backend that applies the padding-patch mask. |
 | `model.sglang_mem_fraction_static` | `0.4` | SGLang static-memory fraction in `(0, 1]`; inherited by managed capture servers unless they override it. |
 | `model.sglang_context_length` | `null` | Positive explicit context limit. Managed capture requires at least `data.max_length + 7`; omitting it derives that value. |
 | `model.sglang_enable_nccl_nvls` | `false` | Pass the matching SGLang NCCL NVLS optimization flag. |
@@ -336,10 +338,11 @@ Managed-local fields:
 
 | Field | Default | What to write |
 | --- | --- | --- |
-| `deployment.disaggregated.managed_local.trainer_cuda_visible_devices` | required | One device token per `nproc_per_node`; trainer and capture devices must not overlap. |
+| `deployment.disaggregated.managed_local.trainer_cuda_visible_devices` | required | One device token per `nproc_per_node`; trainer and capture devices must not overlap unless `share_trainer_gpu` is set. |
 | `deployment.disaggregated.managed_local.mooncake` | default object | Owned loopback Mooncake configuration described by the nested fields below. |
 | `deployment.disaggregated.managed_local.capture_servers` | required | One or more owned patched SGLang server definitions. |
 | `deployment.disaggregated.managed_local.shutdown_grace_s` | `30` | Positive graceful process-group shutdown window. |
+| `deployment.disaggregated.managed_local.share_trainer_gpu` | `false` | Allow a capture server and the trainer on the same device (one-GPU runs); the capture server's `mem_fraction_static` must leave the trainer room. |
 | `deployment.disaggregated.managed_local.mooncake.rpc_port` | `35551` | Owned Mooncake RPC port. |
 | `deployment.disaggregated.managed_local.mooncake.metadata_port` | `35880` | Owned metadata HTTP port. |
 | `deployment.disaggregated.managed_local.mooncake.metrics_port` | `35903` | Owned metrics port. |

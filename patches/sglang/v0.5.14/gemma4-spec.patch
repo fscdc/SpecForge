@@ -1,0 +1,71 @@
+--- a/python/sglang/srt/models/gemma4_causal.py
++++ b/python/sglang/srt/models/gemma4_causal.py
+@@ -963,7 +963,14 @@
+             per_layer_inputs = self.project_per_layer_inputs(
+                 input_embeds, per_layer_inputs
+             )
+-            hidden_states = input_embeds
++            # On CUDA every decoder layer overwrites its input in place: the
++            # fused add-RMSNorm in front of the MLP accumulates the attention
++            # branch into `residual`, which aliases the input. Embeddings
++            # passed in by the caller must survive layer 0, because the
++            # multimodal path keeps them as forward_batch.mm_input_embeds, the
++            # prompt embeddings of the EAGLE3 draft. So the stack runs on a
++            # copy of them.
++            hidden_states = input_embeds.clone() if input_ids is None else input_embeds
+         else:
+             assert (
+                 pp_proxy_tensors is not None
+@@ -978,7 +985,13 @@
+ 
+         for layer_idx in range(self.start_layer, self.end_layer):
+             if layer_idx in self.layers_to_capture:
+-                aux_hidden_states.append(hidden_states)
++                # Capture a copy. The layer about to run overwrites its input
++                # in place (see above), so a reference would be read back as
++                # the previous layer's output plus this layer's attention
++                # branch, and only on the fused CUDA kernel: the native norm
++                # (torch.compile, batch-invariant mode) is out of place. With
++                # the copy, every tap matches HF's hidden_states[layer_idx].
++                aux_hidden_states.append(hidden_states.clone())
+ 
+             if per_layer_inputs is not None:
+                 per_layer_input = per_layer_inputs[:, layer_idx, :]
+--- a/python/sglang/srt/models/gemma4_mm.py
++++ b/python/sglang/srt/models/gemma4_mm.py
+@@ -631,9 +631,19 @@
+         # Prepare bidirectional attention masks for image tokens during prefill.
+         # mm_inputs is preserved on every PP rank up to the first-rank embed
+         # routine, so each rank's attn_backend can install the mask locally.
++        # Only the Gemma 4 models whose config sets use_bidirectional_attention
++        # to "vision" attend bidirectionally within an image, as in HF's
++        # Gemma4Model.forward. The others (E2B, E4B: None) are causal over the
++        # whole prompt: the mask would let their image tokens attend to later
++        # tokens of the same image, which they never did in training.
++        text_config = self.config.text_config
++        vision_bidirectional = (
++            getattr(text_config, "use_bidirectional_attention", None) == "vision"
++        )
+         if (
+             forward_batch.forward_mode == ForwardMode.EXTEND
+             and forward_batch.contains_image_inputs()
++            and vision_bidirectional
+         ):
+             self.prepare_attn_masks(
+                 forward_batch,
+--- a/python/sglang/srt/multimodal/processors/gemma4.py
++++ b/python/sglang/srt/multimodal/processors/gemma4.py
+@@ -32,6 +32,13 @@
+     """Multimodal processor for Gemma4 supporting image, video, and audio inputs."""
+ 
+     models = [Gemma4ForConditionalGeneration]
++    # Decode JPEGs with PIL, not nvJPEG. nvJPEG turns a grayscale JPEG into a
++    # 1-channel tensor, and the HF Gemma4 image processor converts only PIL
++    # images to RGB, so the vision projection fails ("mat1 and mat2 shapes
++    # cannot be multiplied (2520x256 and 768x768)") and the server dies. PIL
++    # images are converted to RGB on load. The number of image tokens depends
++    # only on the image size, so prompts are unchanged.
++    gpu_image_decode = False
+ 
+     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

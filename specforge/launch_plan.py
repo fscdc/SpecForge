@@ -23,6 +23,7 @@ from specforge.config import SGLANG_CAPTURE_CONTEXT_HEADROOM, Config, ModelConfi
 
 if TYPE_CHECKING:
     from specforge.algorithms.registry import AlgorithmRegistration
+    from specforge.training.capture_contract import ServerCaptureContract
 
 LaunchRole = Literal["auto", "all", "producer", "consumer", "both"]
 PlanKind = Literal["worker", "command", "supervisor", "managed_supervisor"]
@@ -38,6 +39,35 @@ _SECRET_NAMES = (
     "wandb_key",
     "swanlab_key",
 )
+
+# SGLang model classes of Gemma 4 targets. SGLang asserts they run on the
+# triton or trtllm_mha attention backend (server_args.py) on CUDA.
+_GEMMA4_ARCHITECTURES = frozenset(
+    {
+        "Gemma4ForConditionalGeneration",
+        "Gemma4ForCausalLM",
+        "Gemma4UnifiedForConditionalGeneration",
+    }
+)
+_GEMMA4_ATTENTION_BACKENDS = ("triton", "trtllm_mha")
+# The gemma4-spec SGLang patch (registered under that name in
+# scripts/benchmark_helper.sh) must be installed wherever a Gemma 4 draft is
+# captured for or served: it makes the captured hidden states real layer
+# outputs, not tensors the next layer's fused add-norm overwrites, keeps image
+# tokens causal on the targets whose config does not ask for bidirectional
+# vision attention (E2B, E4B), and stops grayscale JPEGs from crashing the
+# server. Each pair is a file under the sglang package and the text the patch
+# leaves in it.
+_GEMMA4_SGLANG_PATCH = "gemma4-spec"
+_GEMMA4_SGLANG_SENTINELS = (
+    (
+        "srt/models/gemma4_causal.py",
+        "aux_hidden_states.append(hidden_states.clone())",
+    ),
+    ("srt/models/gemma4_mm.py", "and vision_bidirectional"),
+    ("srt/multimodal/processors/gemma4.py", "gpu_image_decode = False"),
+)
+_ALLOW_UNPATCHED_GEMMA4_ENV = "SPECFORGE_ALLOW_UNPATCHED_GEMMA4"
 
 
 class _ForwardedSignal(BaseException):
@@ -149,6 +179,9 @@ class LaunchPlan:
     # SIGTERM-trapped workers run Mooncake drains, checkpoint flushes, and
     # failure-sentinel publication inside this window before SIGKILL.
     shutdown_grace_s: float = 30.0
+    # Model-specific SGLang patches the managed capture servers need; the
+    # managed preflight checks that the installed SGLang carries them.
+    required_sglang_patches: tuple[str, ...] = ()
 
     def render(self) -> str:
         payload = {
@@ -166,6 +199,10 @@ class LaunchPlan:
                     "shutdown_grace_s": self.shutdown_grace_s,
                 }
             )
+            if self.required_sglang_patches:
+                payload["required_sglang_patches"] = list(
+                    self.required_sglang_patches
+                )
         return json.dumps(
             payload,
             indent=2,
@@ -386,13 +423,58 @@ def _sglang_argv(
     return argv
 
 
+def _is_gemma4_target(contract: "ServerCaptureContract") -> bool:
+    return not _GEMMA4_ARCHITECTURES.isdisjoint(contract.target_architectures)
+
+
+def _required_sglang_patches(contract: "ServerCaptureContract") -> tuple[str, ...]:
+    return (_GEMMA4_SGLANG_PATCH,) if _is_gemma4_target(contract) else ()
+
+
+def _check_gemma4_capture(cfg: Config) -> None:
+    """Refuse, before a 16 GB load, a Gemma 4 capture server that SGLang would
+    reject or whose image features would differ from the regen and serving
+    servers', which run triton attention and sdpa vision attention."""
+    managed = cfg.deployment.disaggregated.managed_local
+    image = cfg.model.input_modality != "text"
+    for index, server in enumerate(managed.capture_servers):
+        backend = server.attention_backend or cfg.model.sglang_attention_backend
+        if backend not in _GEMMA4_ATTENTION_BACKENDS:
+            raise ValueError(
+                f"managed_local capture server {index} would run the Gemma4 "
+                f"target on attention backend {backend!r}, but SGLang runs "
+                f"Gemma4 only on {' or '.join(_GEMMA4_ATTENTION_BACKENDS)} here; "
+                "set model.sglang_attention_backend (or the server's "
+                "attention_backend) to 'triton'"
+            )
+        if image and backend != "triton":
+            raise ValueError(
+                f"managed_local capture server {index} would run a Gemma4 image "
+                f"capture on attention backend {backend!r}, but the regen and "
+                "serving servers run triton, the only backend that applies the "
+                "per-image bidirectional attention of a target whose config "
+                "sets use_bidirectional_attention='vision' (on trtllm_mha, which "
+                "SGLang runs for prefill only on SM100 GPUs, its image tokens "
+                "fall back to causal attention); set "
+                "model.sglang_attention_backend (or the server's "
+                "attention_backend) to 'triton'"
+            )
+    mm_backend = cfg.model.sglang_mm_attention_backend
+    if image and mm_backend != "sdpa":
+        raise ValueError(
+            "a Gemma4 image capture needs model.sglang_mm_attention_backend "
+            f"'sdpa' (got {mm_backend!r}), as the regen and serving servers "
+            "use: SGLang's other vision attention backends, including fa3 "
+            "(the Hopper default) and triton_attn, ignore the vision tower's "
+            "padding-patch mask, so image features would differ from serving"
+        )
+
+
 def _managed_local_services(
     cfg: Config,
     *,
-    algorithm: "AlgorithmRegistration",
+    contract: "ServerCaptureContract",
 ) -> tuple[ServiceSpec, ...]:
-    from specforge.training.capture_contract import resolve_server_capture_contract
-
     deployment = cfg.deployment.disaggregated
     assert deployment is not None and deployment.managed_local is not None
     managed = deployment.managed_local
@@ -428,7 +510,8 @@ def _managed_local_services(
         phase=0,
     )
 
-    contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
+    if _is_gemma4_target(contract):
+        _check_gemma4_capture(cfg)
     capture_services = []
     for index, server in enumerate(managed.capture_servers):
         argv = [
@@ -805,11 +888,14 @@ def build_launch_plan(
         env=consumer_env,
     )
     if managed_local is not None:
+        from specforge.training.capture_contract import resolve_server_capture_contract
+
+        contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
         return LaunchPlan(
             "managed_supervisor",
             "both",
             commands=(producer, consumer),
-            services=_managed_local_services(cfg, algorithm=algorithm),
+            services=_managed_local_services(cfg, contract=contract),
             managed_root=deployment.control_dir,
             managed_ports=(
                 managed_local.mooncake.rpc_port,
@@ -818,6 +904,7 @@ def build_launch_plan(
                 *[server.port for server in managed_local.capture_servers],
             ),
             shutdown_grace_s=managed_local.shutdown_grace_s,
+            required_sglang_patches=_required_sglang_patches(contract),
         )
     return LaunchPlan(
         "supervisor",
@@ -890,24 +977,42 @@ def _terminate_processes(
                 pass
 
 
-def _sglang_has_split_storage_fix() -> Optional[bool]:
-    """Whether the installed SGLang's mm_utils.py has the spec-capture patch's
-    split-storage fix; None when that cannot be told without importing it.
+def _installed_sglang_source(relative_path: str) -> Optional[str]:
+    """Text of one file of the installed SGLang package (a path relative to the
+    package, ``/``-separated); None when it cannot be found without importing.
 
     The file is located through the top-level package's search path and read
-    as text: importing sglang.srt.managers here would pull in torch and half of
-    SGLang just to look for one function name.
+    as text: importing sglang.srt here would pull in torch and half of SGLang
+    just to look for a few strings.
     """
     try:
         spec = importlib.util.find_spec("sglang")
     except (ImportError, ValueError):
         return None
     for base in list(getattr(spec, "submodule_search_locations", None) or []):
-        path = os.path.join(base, "srt", "managers", "mm_utils.py")
+        path = os.path.join(base, *relative_path.split("/"))
         if os.path.isfile(path):
             with open(path, encoding="utf-8") as handle:
-                return "def _own_split_storage(" in handle.read()
+                return handle.read()
     return None
+
+
+def _sglang_has_split_storage_fix() -> Optional[bool]:
+    """Whether the installed SGLang's mm_utils.py has the spec-capture patch's
+    split-storage fix; None when that cannot be told without importing it."""
+    source = _installed_sglang_source("srt/managers/mm_utils.py")
+    return None if source is None else "def _own_split_storage(" in source
+
+
+def _missing_sglang_sentinels(sentinels: Sequence[tuple[str, str]]) -> list[str]:
+    """The files of ``sentinels`` whose text the installed SGLang lacks; a file
+    that cannot be located counts as lacking it."""
+    missing = []
+    for relative_path, text in sentinels:
+        source = _installed_sglang_source(relative_path)
+        if source is None or text not in source:
+            missing.append(relative_path)
+    return missing
 
 
 def _managed_preflight(plan: LaunchPlan) -> None:
@@ -943,6 +1048,21 @@ def _managed_preflight(plan: LaunchPlan) -> None:
             "request takes ~100 s and ~230 GB of host RAM instead of ~5 s; "
             "re-run scripts/apply_sglang_spec_capture_patch.sh"
         )
+    if _GEMMA4_SGLANG_PATCH in plan.required_sglang_patches:
+        missing = _missing_sglang_sentinels(_GEMMA4_SGLANG_SENTINELS)
+        if missing and os.environ.get(_ALLOW_UNPATCHED_GEMMA4_ENV) != "1":
+            raise RuntimeError(
+                f"a Gemma4 target needs the {_GEMMA4_SGLANG_PATCH} SGLang patch, "
+                f"which the installed SGLang lacks ({', '.join(missing)}): "
+                "without it each captured layer output is overwritten in place by "
+                "the next layer's fused add-norm, the image tokens of an E2B/E4B "
+                "target attend bidirectionally although the model is causal, "
+                "and a grayscale JPEG kills the capture server. Run "
+                "scripts/apply_sglang_gemma4_patch.sh (and "
+                "serve the draft from a patched SGLang too), or set "
+                f"{_ALLOW_UNPATCHED_GEMMA4_ENV}=1 to train on the unpatched "
+                "features"
+            )
 
     for port in plan.managed_ports:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:

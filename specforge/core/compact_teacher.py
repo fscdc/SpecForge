@@ -189,6 +189,21 @@ def compute_target_p_padded_from_hidden(
     )
 
 
+def reject_softcapped_target_head(target_model) -> None:
+    """Raise ValueError when ``target_model`` caps its logits (Gemma).
+
+    The compact teacher streams the raw ``fc.weight`` and never calls the head's
+    forward, so it would build the teacher from uncapped logits.
+    """
+    cap = getattr(target_model, "final_logit_softcapping", None)
+    if cap is not None:
+        raise ValueError(
+            "compact teacher streams the raw target lm_head weight and cannot "
+            f"apply this target's logit softcap (final_logit_softcapping={cap}); "
+            "disable training.compact_teacher"
+        )
+
+
 def build_offline_teacher_inputs(
     *,
     compact: bool,
@@ -200,10 +215,11 @@ def build_offline_teacher_inputs(
 
     ``compact=False`` returns ``(target_model(target_hidden), {})`` (full logits, legacy).
     ``compact=True`` returns ``(None, {...})`` from ``target_model.fc.weight`` without
-    calling ``target_model.forward``.
+    calling ``target_model.forward``, and so refuses a softcapped target head.
     """
     if not compact:
         return target_model(target_hidden), {}
+    reject_softcapped_target_head(target_model)
     chunk_size = (
         chunk_size_arg if chunk_size_arg is not None else DEFAULT_VOCAB_CHUNK_SIZE
     )

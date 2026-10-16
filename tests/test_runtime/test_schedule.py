@@ -96,6 +96,7 @@ class TestResolveTotalSteps(unittest.TestCase):
                 seed=17,
                 batch_size=2,
                 accumulation_steps=4,
+                online_epoch_range=None,
             ),
             deployment=SimpleNamespace(
                 trainer=SimpleNamespace(nnodes=2, nproc_per_node=2)
@@ -114,6 +115,16 @@ class TestResolveTotalSteps(unittest.TestCase):
             self.assertEqual(_read_online_total_steps(cfg, channel_path), 9)
 
             cfg.training.seed = 18
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                _read_online_total_steps(cfg, channel_path)
+
+            # a segment streams fewer epochs but keeps the whole-run horizon,
+            # and a consumer of another segment rejects its record
+            cfg.training.seed = 17
+            cfg.training.online_epoch_range = [1, 3]
+            segment = _online_schedule_payload(cfg, num_prompts=100)
+            self.assertEqual(segment["total_steps"], 9)
+            self.assertEqual(segment["prompt_epoch_range"], [1, 3])
             with self.assertRaisesRegex(ValueError, "does not match"):
                 _read_online_total_steps(cfg, channel_path)
 

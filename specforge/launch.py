@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.runtime.contracts import SampleRef
@@ -62,6 +62,7 @@ def _assemble_trainer(
     per_sample_transform=None,
     durable_ack: bool = True,
     resume_from: Optional[str] = None,
+    continue_new_stream: bool = False,
     resume_state: Optional[dict] = None,
     dataset_size: Optional[int] = None,
     checkpoint_extra: Optional[dict] = None,
@@ -136,6 +137,7 @@ def _assemble_trainer(
         per_sample_transform=per_sample_transform,
         durable_ack=durable_ack,
         resume_from=resume_from,
+        continue_new_stream=continue_new_stream,
         resume_state=resume_state,
         dataset_size=dataset_size,
         checkpoint_extra=checkpoint_extra,
@@ -790,6 +792,7 @@ def build_disagg_online_producer(
     sleep=None,
     prompt_epochs: int = 1,
     prompt_seed: int = 0,
+    prompt_epoch_range: Optional[Sequence[int]] = None,
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
@@ -812,6 +815,9 @@ def build_disagg_online_producer(
     epoch-tagged task/sample ids. Each pass uses the deterministic
     ``prompt_seed + epoch`` order, matching sampler-style epoch semantics while
     keeping a reconstructed plan stable across restarts.
+    ``prompt_epoch_range=(start, end)`` produces only those epochs of the
+    ``prompt_epochs`` plan, unchanged, so a run split into segments streams
+    exactly the epochs (order and sample ids) one uninterrupted run would.
 
     Failure semantics: a worker whose source raises (dead/unreachable server)
     has already failed its leases retryable — the surviving workers re-lease
@@ -888,6 +894,15 @@ def build_disagg_online_producer(
     worker_lease = flow_control.prompt_lease(lease)
     build_start = time.perf_counter()
     prompt_epochs = _normalize_prompt_epochs(prompt_epochs)
+    if prompt_epoch_range is None:
+        epoch_start, epoch_end = 0, prompt_epochs
+    else:
+        epoch_start, epoch_end = (int(e) for e in prompt_epoch_range)
+        if not 0 <= epoch_start < epoch_end <= prompt_epochs:
+            raise ValueError(
+                f"prompt_epoch_range must satisfy 0 <= start < end <= "
+                f"prompt_epochs={prompt_epochs}, got {list(prompt_epoch_range)}"
+            )
     if prompt_epochs > 1:
         prompts = list(prompts)
     base_prompt_count = len(prompts) if hasattr(prompts, "__len__") else "unknown"
@@ -895,7 +910,7 @@ def build_disagg_online_producer(
         "build_disagg_online_producer enter "
         f"algorithm={algorithm.name} modality={modality} "
         f"base_prompts={base_prompt_count} "
-        f"prompt_epochs={prompt_epochs} "
+        f"prompt_epochs={prompt_epochs} epochs=[{epoch_start}, {epoch_end}) "
         f"lease={worker_lease} workers={num_rollout_workers} "
         f"watermarks={in_flight_high_watermark}/"
         f"{flow_control.limits.resolved_low_watermark_refs}"
@@ -1237,7 +1252,7 @@ def build_disagg_online_producer(
 
         try:
             live_workers = list(workers)
-            for epoch in range(prompt_epochs):
+            for epoch in range(epoch_start, epoch_end):
                 if should_stop is not None and should_stop():
                     break
                 ingest_epoch(epoch)
@@ -1341,6 +1356,7 @@ def build_disagg_online_consumer(
     dp_size: Optional[int] = None,
     inbox_dir: Optional[str] = None,
     resume_from: Optional[str] = None,
+    continue_from: Optional[str] = None,
     dataloader_num_workers: int = 0,
     profiling_options=None,
 ):
@@ -1356,6 +1372,11 @@ def build_disagg_online_consumer(
     ledger, skips optimizer-durable refs, requeues the unacked tail, and requires
     the durable marker to match the checkpoint step. The producer and original
     data plane must still be available; this does not restart a producer.
+
+    ``continue_from`` is the next segment of a run split by
+    ``training.online_epoch_range``: the trainer restores the previous
+    segment's final checkpoint (weights, optimizer, RNG, global_step) while the
+    ledger and stream start fresh, because the producer streams new epochs.
     """
     import torch.distributed as dist
 
@@ -1630,7 +1651,8 @@ def build_disagg_online_consumer(
             tp_size=tp_size,
             sp_ulysses_size=sp_ulysses_size,
             sp_ring_size=sp_ring_size,
-            resume_from=resume_from,
+            resume_from=resume_from if continue_from is None else continue_from,
+            continue_new_stream=continue_from is not None,
             dataloader_num_workers=dataloader_num_workers,
             profiling_options=profiling_options,
             on_fit_success=mark_consumer_done,

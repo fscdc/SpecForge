@@ -486,6 +486,10 @@ class TrainerController:
         self._data_prepositioned = bool(data_prepositioned)
         self.last_metrics: Dict[str, Any] = {}
         self.last_checkpoint_step: Optional[int] = None
+        # (epoch, epoch_batch, epoch_samples) that checkpoint recorded: an
+        # interval save on the stream's last step still says "mid-stream", so
+        # the end of fit() saves that step again once the stream has closed.
+        self.last_checkpoint_position: Optional[tuple] = None
         from specforge.training.profiling import ProfilingOptions, StepProfiler
 
         options = profiling_options or ProfilingOptions()
@@ -708,6 +712,10 @@ class TrainerController:
             self._checkpoint_mgr = CheckpointManager(self.output_dir, self.run_id)
         return self._checkpoint_mgr
 
+    def position(self) -> tuple:
+        """The data position a checkpoint taken now would record."""
+        return (self.epoch, self._epoch_batch, self._epoch_samples)
+
     def save_checkpoint(self, step: int) -> Checkpoint:
         # Every rank participates: FSDP model gathering is collective and every
         # rank persists its RNG. Sharded optimizer state stays rank-local; the
@@ -750,6 +758,7 @@ class TrainerController:
             },
         )
         self.last_checkpoint_step = step
+        self.last_checkpoint_position = self.position()
         return Checkpoint(
             checkpoint_uri=f"file://{os.path.abspath(ckpt_dir)}",
             global_step=step,

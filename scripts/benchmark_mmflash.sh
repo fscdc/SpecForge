@@ -32,7 +32,7 @@ export SGLANG_NUMA_BIND_V2=0
 # /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-dflash-baseline-llava-ov15-1M-prompted-final
 
 
-BLOCK_SIZE=24
+BLOCK_SIZE=16
 
 
 VIDEO_BENCHES="${VIDEO_BENCHES:-longvideobench:20 moviechat:20 mvbench:20}"
@@ -100,7 +100,7 @@ for idx in "${!GPU_IDS[@]}"; do
     CUDA_VISIBLE_DEVICES=${gpu_id} python3 -m sglang.launch_server \
         --model Qwen/Qwen3.5-9B \
         --speculative-algorithm DFLASH \
-        --speculative-draft-model-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-mmflash-llava-ov15-1M-prompted-final \
+        --speculative-draft-model-path /scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-dflash-baseline-llava-ov15-1M-final \
         --speculative-dflash-block-size ${BLOCK_SIZE} \
         ${DRAFT_WINDOW:+--speculative-draft-window-size ${DRAFT_WINDOW}} \
         --mem-fraction-static 0.7 \
@@ -177,22 +177,21 @@ python benchmarks/bench_mm.py \
     --top-p 0.95 \
     --top-k 20 \
     --max-tokens 4096 \
-    --name mmflash_qwen35-9B_concurrency1_temp0_4096_bs24
+    --name dflash_baseline_llava_ov_1M_final_qwen35-9B_concurrency1_temp0_4096
 
 
-# python benchmarks/bench_mm.py \
-#     --model Qwen/Qwen3.5-9B \
-#     --base-url "${BASE_URLS[@]}" \
-#     --concurrency 1 \
-#     --block-size ${BLOCK_SIZE} \
-#     --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench-origin:200 dynamath:200 mathvista:200 mathverse:200 mmbench:200 \
-#     --reasoning off \
-#     --temperature 1.0 \
-#     --top-p 0.95 \
-#     --top-k 20 \
-#     --max-tokens 4096 \
-#     --name mmflash_qwen35-9B_concurrency1_temp1_4096
-
+python benchmarks/bench_mm.py \
+    --model Qwen/Qwen3.5-9B \
+    --base-url "${BASE_URLS[@]}" \
+    --concurrency 1 \
+    --block-size ${BLOCK_SIZE} \
+    --benchmark-list chartqa:200 charxiv:200 mmstar:200 mmbench:200 dynamath:200 mathvista:200 mathverse:200 \
+    --reasoning off \
+    --temperature 1.0 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --max-tokens 4096 \
+    --name dflash_baseline_llava_ov_1M_final_qwen35-9B_concurrency1_temp1_4096
 
 # python benchmarks/bench_mm.py \
 #     --model Qwen/Qwen3.5-9B \

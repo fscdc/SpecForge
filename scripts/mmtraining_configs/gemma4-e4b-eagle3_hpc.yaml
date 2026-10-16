@@ -1,0 +1,98 @@
+# EAGLE3 draft for google/gemma-4-E4B-it on the prompted Gemma regen of
+# llava-ov15-1M; qwen3.5-4b-eagle3_hpc.yaml with the Gemma target swapped in.
+#   specforge train --config scripts/mmtraining_configs/gemma4-e4b-eagle3_hpc.yaml
+# or as a PBS job (capture on the first GPU, the rest train), with more than the
+# launcher's own 36 h walltime:
+#   qsub -l select=1:ngpus=4 -l walltime=96:00:00 -v CONFIG=scripts/mmtraining_configs/gemma4-e4b-eagle3_hpc.yaml scripts/train_mmflash_video_hpc.sh
+# Even 96 h may not be enough: 6 epochs are about 1.97M optimizer steps on 3
+# trainers, about 116 h at the 1-GPU smoke's 0.21 s per step. managed_local
+# cannot resume (model.draft_checkpoint_path restarts from the weights only), so
+# set training.num_epochs or training.max_steps to fit the walltime.
+# Before the first run: the SGLang gemma4-spec patch (bash scripts/apply_sglang_gemma4_patch.sh)
+# and the vocab mapping (python scripts/prepare_vocab_mapping.py --config <this yaml>).
+
+model:
+  # The pinned snapshot keeps the chat template and weights identical to the
+  # regen's and to serving (scripts/eval_gemma4_spec_hpc.sh serves this path).
+  target_model_path: "/scratch/fengsicheng/.cache/huggingface/hub/models--google--gemma-4-E4B-it/snapshots/ee0ef6023621cff504d758262d4e04895a5af4a2"
+  draft_model_config: "configs/gemma4-e4b-eagle3.json"
+  target_backend: sglang
+  # image+text capture: routes prompt building and server requests through the
+  # multimodal ServerInputAdapter. Requires a vision-language target model.
+  input_modality: image
+  trust_remote_code: true
+  # Gemma4ForConditionalGeneration nests the text stack under
+  # model.language_model.*, so the text-only key does not exist. lm_head_key is
+  # unused here because the model ties word embeddings.
+  embedding_key: "model.language_model.embed_tokens.weight"
+  # Both REQUIRED, and at model level so they survive the launcher's
+  # capture_servers override: SGLang runs Gemma4 on triton (or trtllm_mha) only,
+  # and the vision tower's default fa3 ignores its padding-patch mask, while the
+  # regen and serving use sdpa.
+  sglang_attention_backend: "triton"
+  sglang_mm_attention_backend: "sdpa"
+  # REQUIRED for EAGLE3 disaggregated (planning.py:172): producer and consumer
+  # cannot each derive their own mapping, so they must share this file.
+  vocab_mapping_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/vocab_mapping/gemma4-e4b-eagle3.pt"
+  torch_dtype: "bfloat16"
+data:
+  # Smoke runs: the strided .smoke_every500.jsonl next to it (EXTRA_OVERRIDES);
+  # max_prompts takes the head of the file, which is all wikipedia_2m.
+  train_data_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/gemma4-E4B-it_llava-ov15-1M-prompted_regen_first_turn.jsonl"
+  max_length: 4096
+  chat_template: "gemma4"
+  build_dataset_num_proc: 32
+  cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
+  # image_root stays empty: the regen records already carry absolute paths under
+  # .../specforge/data/llava-ov15-1M/.
+  # image_max_tokens stays 0 on purpose -- the capture server expands image_data
+  # with the checkpoint's own resolution, so a client-side cap desyncs the prompt.
+training:
+  strategy: "eagle3"
+  num_epochs: 6
+  # max_steps: 1000 # set for testing, comment out for full training
+  batch_size: 1
+  learning_rate: 0.0001
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "flex_attention"
+  save_interval: 10000
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: "tensorboard"
+run_id: "gemma4-e4b-eagle3-llava-ov15-1M-prompted"
+output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/gemma4-e4b-eagle3-llava-ov15-1M-prompted"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 3 # trainer GPUs only; the capture GPU is separate
+  disaggregated:
+    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/gemma4-e4b-eagle3-llava-ov15-1M-prompted/control"
+    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/gemma4-e4b-eagle3-llava-ov15-1M-prompted/consumer-state"
+    backend: mooncake
+
+    # managed_local: the CLI supervises Mooncake and the SGLang capture server
+    # itself, so nothing has to be started by hand. It derives the server URLs
+    # and Mooncake endpoints, which is why none of them may be set here.
+    # scripts/train_mmflash_video_hpc.sh replaces both GPU lists with the job's.
+    managed_local:
+      # trainer (consumer) GPUs — must stay disjoint from the capture server's
+      trainer_cuda_visible_devices:
+        - "1"
+        - "2"
+        - "3"
+      mooncake:
+        protocol: tcp
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices:
+            - "0"
+          tp_size: 1
+          # GPU 0 is shared with other jobs, so size the static pool to the free
+          # memory rather than to the whole card.
+          mem_fraction_static: 0.80

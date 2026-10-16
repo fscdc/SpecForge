@@ -92,7 +92,8 @@ class DominoDraftModel(DFlashDraftModel):
         hidden_states4d = draft_hidden.unsqueeze(1)
 
         for token_position in range(1, completed_ids.shape[1]):
-            previous_embeddings = target.model.embed_tokens(completed_ids).unsqueeze(1)
+            previous_embeddings = target.get_input_embeddings()(completed_ids)
+            previous_embeddings = previous_embeddings.unsqueeze(1)
             final_logits = self.apply_logits_head(
                 base_logits4d,
                 prev_token_embeddings=previous_embeddings,

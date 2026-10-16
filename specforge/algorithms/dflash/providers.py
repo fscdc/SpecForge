@@ -47,10 +47,19 @@ def build_step(wrapped_model, *, target_head=None, **_options):
     return DFlashTrainStrategy(wrapped_model)
 
 
-def resume_contract(_config, draft_model, training_model):
-    """Persist resolved DFlash architecture, sampling, and loss semantics."""
+def resume_contract(config, draft_model, training_model):
+    """Persist resolved DFlash architecture, sampling, and loss semantics.
 
-    return {
+    ``dflash_target_embed_scale`` -- the factor on target embedding lookups
+    (Gemma 3/3n/4) -- is recorded only for a scaled run or an explicit
+    ``model.target_embedding_scale``: the trainer requires every current key in
+    the checkpoint, so an unconditional key would make every existing DFlash
+    checkpoint unresumable. The explicit case keeps an override of 1.0 from
+    resuming a scaled checkpoint unscaled, since the trainer compares only the
+    current run's keys.
+    """
+
+    contract = {
         "dflash_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dflash_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -63,6 +72,13 @@ def resume_contract(_config, draft_model, training_model):
         "dflash_loss_type": str(training_model.loss_type),
         "dflash_dpace_alpha": float(training_model.dpace_alpha),
     }
+    embed_scale = float(
+        getattr(getattr(training_model, "embed_tokens", None), "embed_scale", 1.0)
+    )
+    explicit = getattr(getattr(config, "model", None), "target_embedding_scale", None)
+    if embed_scale != 1.0 or explicit is not None:
+        contract["dflash_target_embed_scale"] = embed_scale
+    return contract
 
 
 def resolve_dflash_kernels(config):

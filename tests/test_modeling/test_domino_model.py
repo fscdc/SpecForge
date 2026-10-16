@@ -52,6 +52,9 @@ class _TinyTarget(nn.Module):
         self.model = _TargetBody(vocab_size, hidden_size)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.embed_tokens
+
 
 class TestDominoDraftModel(unittest.TestCase):
     def test_training_loss_updates_gru_and_projection(self):

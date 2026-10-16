@@ -9,8 +9,15 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
-from specforge.modeling.target.target_utils import target_text_config
+from specforge.modeling.target.target_utils import (
+    target_logit_softcap,
+    target_text_config,
+)
 from specforge.utils import get_local_device, padding
+
+# Everything a head load reads; a hub snapshot holding only these files
+# resolves offline even when the repo's README or .gitattributes is not cached.
+_WEIGHT_FILE_PATTERNS = ["*.json", "*.safetensors", "*.bin"]
 
 
 class TargetHead(nn.Module):
@@ -31,6 +38,9 @@ class TargetHead(nn.Module):
         text_config = target_text_config(self.config)
         self.hidden_size = text_config.hidden_size
         self.vocab_size = text_config.vocab_size
+        # Gemma serves cap * tanh(logits / cap); the EAGLE3 soft labels must
+        # follow that distribution, not the raw projection.
+        self.final_logit_softcapping = target_logit_softcap(self.config)
 
         self.fc = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
 
@@ -82,32 +92,57 @@ class TargetHead(nn.Module):
         ``embedding_key`` when the caller knows it (the run config's
         ``model.embedding_key``), otherwise the checkpoint's single
         ``*embed_tokens.weight`` entry.
+
+        A checkpoint without ``*.index.json`` must hold exactly one
+        ``*.safetensors`` (or else one ``*.bin``) file, as Gemma 4 E4B does.
         """
         if os.path.exists(model_path):
             self.model_path = model_path
         else:
-            self.model_path = snapshot_download(repo_id=model_path, cache_dir=cache_dir)
+            self.model_path = snapshot_download(
+                repo_id=model_path,
+                cache_dir=cache_dir,
+                allow_patterns=_WEIGHT_FILE_PATTERNS,
+            )
 
         # model_path is a local directory
         # check if there is file ending with index.json
         glob_path = os.path.join(self.model_path, "*.index.json")
         index_json_path = glob.glob(glob_path)
 
-        if len(index_json_path) == 0:
-            raise FileNotFoundError(f"No index.json file found in {self.model_path}")
         if len(index_json_path) > 1:
             raise FileNotFoundError(
                 f"Multiple index.json files found in {self.model_path}"
             )
-        index_json_path = index_json_path[0]
-
-        with open(index_json_path, "r") as f:
-            index_json = json.load(f)
-        weight_map = index_json["weight_map"]
+        state_dict = None
+        if index_json_path:
+            weight_source = index_json_path[0]
+            with open(weight_source, "r") as f:
+                index_json = json.load(f)
+            weight_map = index_json["weight_map"]
+        else:
+            # Unsharded checkpoint: every tensor lives in its one weight file.
+            weight_files = glob.glob(os.path.join(self.model_path, "*.safetensors"))
+            if not weight_files:
+                weight_files = glob.glob(os.path.join(self.model_path, "*.bin"))
+            if len(weight_files) != 1:
+                raise FileNotFoundError(
+                    f"No index.json file found in {self.model_path}, and it does "
+                    "not hold exactly one *.safetensors or *.bin weight file: "
+                    f"{sorted(os.path.basename(path) for path in weight_files)}"
+                )
+            weight_source = weight_files[0]
+            if weight_source.endswith(".safetensors"):
+                with safe_open(weight_source, framework="pt") as f:
+                    keys = list(f.keys())
+            else:
+                state_dict = torch.load(weight_source, map_location="cpu")
+                keys = list(state_dict)
+            weight_map = dict.fromkeys(keys, os.path.basename(weight_source))
         if lm_head_key not in weight_map:
             if not self._ties_word_embeddings():
                 raise KeyError(
-                    f"{lm_head_key!r} is not in {index_json_path} and the model "
+                    f"{lm_head_key!r} is not in {weight_source} and the model "
                     "does not tie word embeddings; set model.lm_head_key to the "
                     "checkpoint's output projection"
                 )
@@ -118,7 +153,7 @@ class TargetHead(nn.Module):
             )
             if len(candidates) != 1 or candidates[0] not in weight_map:
                 raise KeyError(
-                    f"{lm_head_key!r} is not in {index_json_path}; the model ties "
+                    f"{lm_head_key!r} is not in {weight_source}; the model ties "
                     "word embeddings but the embedding tensor could not be "
                     f"identified (candidates: {candidates!r}) -- set "
                     "model.embedding_key"
@@ -132,7 +167,8 @@ class TargetHead(nn.Module):
             ) as f:
                 lm_head = f.get_tensor(lm_head_key)
         else:
-            state_dict = torch.load(os.path.join(self.model_path, ckpt_file))
+            if state_dict is None:
+                state_dict = torch.load(os.path.join(self.model_path, ckpt_file))
             lm_head = state_dict[lm_head_key]
         self.fc.weight.copy_(lm_head)
 
@@ -141,7 +177,17 @@ class TargetHead(nn.Module):
             param.requires_grad = False
 
     def forward(self, hidden_states):
-        return self.fc(hidden_states)
+        logits = self.fc(hidden_states)
+        cap = self.final_logit_softcapping
+        if cap is None:
+            return logits
+        # fp32 math, stored in place in fc's own dtype (bf16): [4096, 262144]
+        # logits are ~2.15 GB in bf16. A full fp32 copy would add ~4.3 GB, and
+        # the FSDP root rounds `target` to bf16 before the loss reads it anyway.
+        rows = logits.view(-1, logits.shape[-1])
+        for chunk in rows.split(256):  # 256 x 262144 fp32 temp = 268 MB
+            chunk.copy_(chunk.float().div_(cap).tanh_().mul_(cap))
+        return logits
 
     def preprocess(self, input_ids, target, loss_mask):
         # apply pading

@@ -79,25 +79,37 @@ def _limit_image_tokens(processor, max_tokens: int) -> None:
     Without this an image is resized only by the checkpoint's native limits, so a
     high-resolution photo can occupy more positions than ``data.max_length`` and
     crowd out the assistant reply the draft is supposed to learn.
+
+    Raises for an image processor with no pixel budget to cap (Gemma 4 bounds an
+    image by ``max_soft_tokens`` instead), where the cap would silently do
+    nothing.
     """
     image_processor = getattr(processor, "image_processor", None)
     if image_processor is None or max_tokens <= 0:
         return
-    max_pixels = max_tokens * pixels_per_visual_token(processor)
 
     # Newer processors carry a SizeDict; older ones expose max_pixels directly.
     size = getattr(image_processor, "size", None)
+    longest = None
     if size is not None:
         longest = (
             size.get("longest_edge")
             if isinstance(size, dict)
             else getattr(size, "longest_edge", None)
         )
-        if longest is not None and max_pixels < int(longest):
-            if isinstance(size, dict):
-                size["longest_edge"] = max_pixels
-            else:
-                size.longest_edge = max_pixels
+    if longest is None and getattr(image_processor, "max_pixels", None) is None:
+        raise ValueError(
+            f"data.image_max_tokens={max_tokens} cannot be applied to "
+            f"{type(image_processor).__name__}: it has neither a "
+            "size.longest_edge nor a max_pixels pixel budget to cap. Set "
+            "data.image_max_tokens to 0 to keep the checkpoint's own limit."
+        )
+    max_pixels = max_tokens * pixels_per_visual_token(processor)
+    if longest is not None and max_pixels < int(longest):
+        if isinstance(size, dict):
+            size["longest_edge"] = max_pixels
+        else:
+            size.longest_edge = max_pixels
     if getattr(image_processor, "max_pixels", None) is not None:
         image_processor.max_pixels = min(image_processor.max_pixels, max_pixels)
 
@@ -193,8 +205,47 @@ def _assistant_header_ids(processor) -> list[int]:
     return list(header_ids)
 
 
+def _template_end_of_turn_id(processor) -> int | None:
+    """The control token the chat template closes an assistant reply with.
+
+    Read off the same probe conversation as ``_assistant_header_ids``: the first
+    token after the probe reply (``<|im_end|>`` for Qwen, ``<turn|>`` for Gemma
+    4). ``None`` when the template closes a reply with ordinary text instead,
+    e.g. a newline, which would end the mask at the reply's first line break.
+    """
+    probe = [
+        {"role": "user", "content": "x"},
+        {"role": "assistant", "content": _ASSISTANT_PROBE_MARKER},
+    ]
+    text = processor.apply_chat_template(
+        probe, tokenize=False, add_generation_prompt=False
+    )
+    marker_index = text.find(_ASSISTANT_PROBE_MARKER)
+    if marker_index < 0:
+        return None
+    tail = text[marker_index + len(_ASSISTANT_PROBE_MARKER) :]
+    if not tail:
+        return None
+    tokenizer = processor.tokenizer
+    tail_ids = tokenizer(tail, add_special_tokens=False)["input_ids"]
+    if not tail_ids:
+        return None
+    token_id = int(tail_ids[0])
+    if token_id not in (getattr(tokenizer, "added_tokens_decoder", None) or {}):
+        return None
+    return token_id
+
+
 def _end_token_ids(processor) -> set[int]:
-    """Token ids that terminate an assistant reply."""
+    """Token ids that terminate an assistant reply.
+
+    EOS alone is not enough: Gemma 4 closes a turn with ``<turn|>`` and never
+    with its EOS ``<eos>``, so the mask would run on through the next user turn.
+    The template's own end-of-turn token and the tokenizer's ``eot_token`` are
+    added as well. A marker missing from the vocabulary can resolve to the
+    unknown token (Gemma 4 maps ``<|im_end|>`` to ``<unk>``), so that id is
+    skipped.
+    """
     tokenizer = processor.tokenizer
     ids: set[int] = set()
     eos = tokenizer.eos_token_id
@@ -202,12 +253,18 @@ def _end_token_ids(processor) -> set[int]:
         ids.update(int(value) for value in eos if value is not None)
     elif eos is not None:
         ids.add(int(eos))
-    for token in ("<|im_end|>", "<|eot_id|>"):
+    unk = tokenizer.unk_token_id
+    template_end = _template_end_of_turn_id(processor)
+    if template_end is not None and template_end != unk:
+        ids.add(template_end)
+    for token in (getattr(tokenizer, "eot_token", None), "<|im_end|>", "<|eot_id|>"):
+        if not token:
+            continue
         try:
             token_id = tokenizer.convert_tokens_to_ids(token)
         except Exception:  # pragma: no cover - tokenizer without this token
             continue
-        if isinstance(token_id, int) and token_id >= 0:
+        if isinstance(token_id, int) and token_id >= 0 and token_id != unk:
             ids.add(token_id)
     return ids
 

@@ -658,7 +658,7 @@ class MooncakeFeatureStore(FeatureStore):
     def drain_pending_removals(
         self,
         *,
-        max_attempts: int = 8,
+        max_attempts: int = 48,
         retry_interval_s: float = 0.25,
         sleep: Callable[[float], None] = time.sleep,
     ) -> Dict[str, int]:

@@ -556,6 +556,10 @@ SUPPORTED_MM_MODELS = (
     "Qwen/Qwen3.5-397B-A17B",
     "Qwen/Qwen3.5-397B-A17B-FP8",
     "Qwen/Qwen3.5-397B-A17B-GPTQ-Int4",
+    # Qwen3_5ForConditionalGeneration again (model_type qwen3_5). Its template
+    # adds a reasoning-effort system turn only while thinking is on; with
+    # enable_thinking=False it renders exactly like Qwen3.5's.
+    "Qwen/Qwen3.8-27B",
 )
 
 

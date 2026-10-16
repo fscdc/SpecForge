@@ -31,7 +31,16 @@ from specforge.export.checkpoint_io import materialize_draft, resolve_training_s
 
 def _load_embedding_tensor(source: str, key: str) -> torch.Tensor:
     """Read one target embedding without materializing the target lm_head."""
-    root = source if os.path.exists(source) else snapshot_download(repo_id=source)
+    # Only the weight files are read; asking for them alone keeps an offline
+    # cache that lacks the repo's README or .gitattributes resolvable.
+    root = (
+        source
+        if os.path.exists(source)
+        else snapshot_download(
+            repo_id=source,
+            allow_patterns=["*.json", "*.safetensors", "*.bin"],
+        )
+    )
     index_paths = glob.glob(os.path.join(root, "*.index.json"))
     if len(index_paths) > 1:
         raise FileNotFoundError(f"multiple index files found under {root}")

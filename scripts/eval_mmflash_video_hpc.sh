@@ -11,10 +11,28 @@
 #
 # Server flags, frame settings and result naming match the earlier video runs,
 # so the results file sits next to its baselines in results/:
-#   video_mmflash_qwen35-4B_concurrency1_temp0_4096_f16-48-48[_win<W>_sparse-<pattern>]_<export name>
+#   video_mmflash_<qwen35-4B|qwen35-9B>_concurrency1_temp0_4096_f16-48-48[_win<W>_sparse-<pattern>]_<export name>
+#   (-v MODEL=Qwen/Qwen3.5-9B for the 9B target; the name follows it)
 # (the same pattern on the warm-start draft is the file without _<export name>).
 # bench_mm skips a benchmark its results file already holds, so a rerun finishes
 # a partial one. ~5 min server start + ~25 min for 60 questions on an H200.
+#
+# Optional (-v NAME=value):
+#   SPARSE_OVERRIDE  a training-free pattern for a DENSE export, e.g.
+#                    "sink=4:text=1:stride=32:window=2048" (colons: qsub -v splits on
+#                    commas); refused for an export trained with its own pattern
+#   RUN_TAG          appended to the results name, e.g. _n200 for a larger run
+#   NO_DOWNLOAD=1    benchmarks must not download (caches filled beforehand by
+#                    scripts/prefetch_video_benches.py), so parallel jobs read one
+#                    question set and never write the same frame cache
+#   WAIT_FOR_FILE    wait (up to WAIT_TIMEOUT s, default 21600) for this file, e.g.
+#                    the prefetch's done file, before starting the server
+#   ORIGIN=1         the target alone, no draft (the speedup baseline): same server
+#                    flags minus the speculative ones, bench_mm --block-size 0,
+#                    results named video_origin_qwen35-4B_concurrency1_temp0_4096...
+#   MTP_STEPS=15     Qwen3.5's native MTP (NEXTN) instead of a draft: N steps, top-1,
+#                    N+1 draft tokens, overlap schedule off, as in
+#                    scripts/benchmark_baselines.sh; results video_mtp-<N>step_...
 #PBS -P CFP04-CF-054
 #PBS -j oe
 #PBS -k oed
@@ -57,10 +75,24 @@ mkdir -p "${TRITON_CACHE_DIR}"
 
 # ------------------------------------------------------------- settings
 MODEL="${MODEL:-Qwen/Qwen3.5-4B}"
+# results are named after the target: Qwen/Qwen3.5-9B -> qwen35-9B
+MODEL_TAG="${MODEL_TAG:-$(basename "${MODEL}" | sed 's/^Qwen3\.5-/qwen35-/')}"
 DRAFT="${DRAFT:-/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-4b-mmflash-video-sparse-final}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 VIDEO_BENCHES="${VIDEO_BENCHES:-longvideobench:20 moviechat:20 mvbench:20}"
-RUN_NAME="${RUN_NAME:-video_mmflash_qwen35-4B_concurrency1_temp0_4096}"
+ORIGIN="${ORIGIN:-0}"
+MTP_STEPS="${MTP_STEPS:-}"
+case "${MTP_STEPS}" in ''|*[!0-9]*) [ -n "${MTP_STEPS}" ] && { echo "[eval] ERROR: MTP_STEPS must be a number" >&2; exit 1; } ;; esac
+if [ "${ORIGIN}" = "1" ] && [ -n "${MTP_STEPS}" ]; then
+    echo "[eval] ERROR: ORIGIN=1 and MTP_STEPS are exclusive" >&2; exit 1
+fi
+if [ "${ORIGIN}" = "1" ]; then
+    RUN_NAME="${RUN_NAME:-video_origin_${MODEL_TAG}_concurrency1_temp0_4096}"
+elif [ -n "${MTP_STEPS}" ]; then
+    RUN_NAME="${RUN_NAME:-video_mtp-${MTP_STEPS}step_${MODEL_TAG}_concurrency1_temp0_4096}"
+else
+    RUN_NAME="${RUN_NAME:-video_mmflash_${MODEL_TAG}_concurrency1_temp0_4096}"
+fi
 SERVER_TIMEOUT="${SERVER_TIMEOUT:-1800}"
 
 # the frame settings behind the existing video results (_f16-48-48)
@@ -70,8 +102,23 @@ FRAMES_SUFFIX="_f16-48-48"
 
 # serving flags from the export itself
 unset SGLANG_DFLASH_DRAFT_SPARSE
-flags=$(python3 scripts/draft_sparse_env.py "${DRAFT}") || { echo "[eval] ERROR: cannot derive serving flags for ${DRAFT}" >&2; exit 1; }
-eval "${flags}"
+if [ "${ORIGIN}" = "1" ] || [ -n "${MTP_STEPS}" ]; then
+    [ -n "${SPARSE_OVERRIDE:-}" ] && { echo "[eval] ERROR: SPARSE_OVERRIDE needs a DFlash draft" >&2; exit 1; }
+    DRAFT_MODEL="" DRAFT_SPARSE="" DRAFT_WINDOW="" NAME_SUFFIX=""
+else
+    flags=$(python3 scripts/draft_sparse_env.py "${DRAFT}") || { echo "[eval] ERROR: cannot derive serving flags for ${DRAFT}" >&2; exit 1; }
+    eval "${flags}"
+fi
+if [ -n "${SPARSE_OVERRIDE:-}" ]; then
+    if [ -n "${DRAFT_SPARSE}" ]; then
+        echo "[eval] ERROR: ${DRAFT} was trained with ${DRAFT_SPARSE}; SPARSE_OVERRIDE is for dense exports only" >&2
+        exit 1
+    fi
+    DRAFT_SPARSE="${SPARSE_OVERRIDE//:/,}"
+    DRAFT_WINDOW=$(printf '%s' "${DRAFT_SPARSE}" | tr ',' '\n' | sed -n 's/^window=//p')
+    case "${DRAFT_WINDOW}" in ''|*[!0-9]*) echo "[eval] ERROR: SPARSE_OVERRIDE needs window=<n>" >&2; exit 1 ;; esac
+    [ "${DRAFT_WINDOW}" -lt "${BLOCK_SIZE}" ] && DRAFT_WINDOW="${BLOCK_SIZE}"
+fi
 window_args=()
 SPARSE_SUFFIX=""
 if [ -n "${DRAFT_SPARSE}" ]; then
@@ -79,7 +126,22 @@ if [ -n "${DRAFT_SPARSE}" ]; then
     window_args=(--speculative-draft-window-size "${DRAFT_WINDOW}")
     SPARSE_SUFFIX="_sparse-$(printf '%s' "${DRAFT_SPARSE}" | tr -d ' ' | sed -e 's/=//g' -e 's/,/-/g')"
 fi
-NAME="${RUN_NAME}${FRAMES_SUFFIX}${DRAFT_WINDOW:+_win${DRAFT_WINDOW}}${SPARSE_SUFFIX}${NAME_SUFFIX}"
+NAME="${RUN_NAME}${FRAMES_SUFFIX}${DRAFT_WINDOW:+_win${DRAFT_WINDOW}}${SPARSE_SUFFIX}${NAME_SUFFIX}${RUN_TAG:-}"
+if [ "${NO_DOWNLOAD:-0}" = "1" ]; then
+    export LVB_AUTO_DOWNLOAD=0 VIDEOMME_AUTO_DOWNLOAD=0 MVBENCH_AUTO_DOWNLOAD=0 MOVIECHAT_AUTO_DOWNLOAD=0 VDC_AUTO_DOWNLOAD=0
+fi
+if [ -n "${WAIT_FOR_FILE:-}" ]; then
+    waited=0
+    until [ -f "${WAIT_FOR_FILE}" ]; do
+        if [ "${waited}" -ge "${WAIT_TIMEOUT:-21600}" ]; then
+            echo "[eval] ERROR: ${WAIT_FOR_FILE} did not appear within ${waited}s" >&2
+            exit 1
+        fi
+        [ $((waited % 600)) -eq 0 ] && echo "[eval] $(date '+%T') waiting for ${WAIT_FOR_FILE}"
+        sleep 30; waited=$((waited + 30))
+    done
+    echo "[eval] $(date '+%T') found ${WAIT_FOR_FILE} after ${waited}s"
+fi
 
 IFS=',' read -ra VISIBLE <<< "${CUDA_VISIBLE_DEVICES:-0}"
 GPU_ID="${VISIBLE[0]}"
@@ -91,7 +153,7 @@ mkdir -p "${LOG_DIR}" results
 SERVER_LOG="${LOG_DIR}/server.log"
 
 bash scripts/benchmark_helper.sh || exit 1
-echo "[eval] draft=${DRAFT_MODEL}"
+echo "[eval] draft=${DRAFT_MODEL:-<none: target alone>}"
 echo "[eval] SGLANG_DFLASH_DRAFT_SPARSE=${DRAFT_SPARSE:-<dense>} window=${DRAFT_WINDOW:-<none>}"
 echo "[eval] benches=${VIDEO_BENCHES} -> results/${NAME}_results.jsonl"
 echo "[eval] gpu=${GPU_ID} port=${PORT} server log ${SERVER_LOG}"
@@ -108,11 +170,21 @@ stop_server() {
 }
 trap stop_server EXIT
 
+spec_args=()
+bench_block_args=(--block-size 0)
+if [ -n "${MTP_STEPS}" ]; then
+    spec_args=(--speculative-algorithm NEXTN --speculative-num-steps "${MTP_STEPS}"
+               --speculative-eagle-topk 1 --speculative-num-draft-tokens "$((MTP_STEPS + 1))"
+               --disable-overlap-schedule)
+    bench_block_args=()   # as the image MTP runs: bench_mm's default
+elif [ "${ORIGIN}" != "1" ]; then
+    spec_args=(--speculative-algorithm DFLASH --speculative-draft-model-path "${DRAFT_MODEL}"
+               --speculative-dflash-block-size "${BLOCK_SIZE}")
+    bench_block_args=(--block-size "${BLOCK_SIZE}")
+fi
 CUDA_VISIBLE_DEVICES="${GPU_ID}" python3 -m sglang.launch_server \
     --model "${MODEL}" \
-    --speculative-algorithm DFLASH \
-    --speculative-draft-model-path "${DRAFT_MODEL}" \
-    --speculative-dflash-block-size "${BLOCK_SIZE}" \
+    "${spec_args[@]}" \
     "${window_args[@]}" \
     --mem-fraction-static 0.7 \
     --tp 1 \
@@ -158,7 +230,7 @@ CUDA_VISIBLE_DEVICES=0 python3 benchmarks/bench_mm.py \
     --model "${MODEL}" \
     --base-url "http://localhost:${PORT}" \
     --concurrency 1 \
-    --block-size "${BLOCK_SIZE}" \
+    "${bench_block_args[@]}" \
     --benchmark-list ${VIDEO_BENCHES} \
     --reasoning off \
     --temperature 0.0 \

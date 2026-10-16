@@ -63,6 +63,11 @@ class ModelConfig(StrictConfigModel):
     use_liger_kernel: bool = False
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
+    #: DFlash-family factor on target embedding lookups (never on the weight
+    #: the tied LM head shares). None: the target's own, i.e. what SGLang's
+    #: embedding module applies at serving (sqrt(hidden_size) for Gemma 3/3n/4,
+    #: else none); 1.0: off.
+    target_embedding_scale: Optional[float] = Field(default=None, gt=0.0)
     #: t2d/d2t vocab-mapping tensor file for the draft ("" = model has none).
     vocab_mapping_path: str = ""
     #: copy the frozen target embedding into the draft before training.
@@ -79,6 +84,10 @@ class ModelConfig(StrictConfigModel):
     tokenizer_pad_token_id: Optional[int] = Field(default=None, ge=0)
     #: SGLang target-engine tuning. Ignored by hf/custom backends.
     sglang_attention_backend: str = "flashinfer"
+    #: Vision-tower attention (--mm-attention-backend); None keeps SGLang's
+    #: per-model default. Gemma 4 image runs need "sdpa": the Hopper default,
+    #: fa3, ignores the vision tower's padding-patch mask.
+    sglang_mm_attention_backend: Optional[str] = None
     sglang_mem_fraction_static: float = Field(default=0.4, gt=0.0, le=1.0)
     sglang_context_length: Optional[int] = Field(default=None, gt=0)
     sglang_enable_nccl_nvls: bool = False
@@ -360,6 +369,10 @@ class ManagedLocalStackConfig(StrictConfigModel):
     )
     capture_servers: List[ManagedLocalCaptureServerConfig] = Field(min_length=1)
     shutdown_grace_s: float = Field(default=30.0, gt=0)
+    # One-GPU runs: the capture server and the trainer share a card, and the
+    # capture server's mem_fraction_static has to leave the trainer room. Off by
+    # default, so an accidental overlap still fails below.
+    share_trainer_gpu: bool = False
 
     @model_validator(mode="after")
     def _validate_local_resources(self):
@@ -394,9 +407,10 @@ class ManagedLocalStackConfig(StrictConfigModel):
         overlap_devices = set(server_devices).intersection(
             self.trainer_cuda_visible_devices
         )
-        if overlap_devices:
+        if overlap_devices and not self.share_trainer_gpu:
             raise ValueError(
-                "managed_local capture and trainer CUDA devices must be disjoint: "
+                "managed_local capture and trainer CUDA devices must be disjoint "
+                "(or set managed_local.share_trainer_gpu): "
                 f"{sorted(overlap_devices)}"
             )
         return self
@@ -606,6 +620,17 @@ class TrainingConfig(StrictConfigModel):
     compact_teacher_chunk_size: Optional[int] = Field(default=None, gt=0)
     #: resume target: a checkpoint dir / file:// URI / run root.
     resume_from: Optional[str] = None
+    #: Segmented online run, one walltime-bounded job per segment: produce and
+    #: train only prompt epochs [start, end) of num_epochs. Each epoch keeps its
+    #: seed+epoch order and epoch-tagged sample ids, and the optimizer/loss
+    #: horizon still spans all num_epochs, so segments chained with
+    #: continue_from make one schedule. null = every epoch in this run.
+    online_epoch_range: Optional[List[int]] = None
+    #: The previous segment's final checkpoint. Restores draft weights,
+    #: optimizer/scheduler, RNG and global_step, but not a data position: this
+    #: segment streams new epochs through a fresh ledger. Unlike resume_from it
+    #: needs nothing of the earlier data plane, so managed_local supports it.
+    continue_from: Optional[str] = None
     #: ``all`` is an offline colocated run. Online runs launch producer and
     #: consumer as separate ``specforge train`` processes with the same config
     #: and different roles.
@@ -616,6 +641,29 @@ class TrainingConfig(StrictConfigModel):
     def _validate_training_shape(self):
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
+        if self.online_epoch_range is not None:
+            epoch_range = self.online_epoch_range
+            if (
+                len(epoch_range) != 2
+                or not 0 <= epoch_range[0] < epoch_range[1] <= self.num_epochs
+            ):
+                raise ValueError(
+                    "training.online_epoch_range must be [start, end) with "
+                    f"0 <= start < end <= num_epochs={self.num_epochs}, "
+                    f"got {epoch_range}"
+                )
+        if self.continue_from is not None:
+            if self.resume_from is not None:
+                raise ValueError(
+                    "training.continue_from (next segment) and "
+                    "training.resume_from (same attempt) are mutually exclusive"
+                )
+            if self.online_epoch_range is None or self.online_epoch_range[0] == 0:
+                raise ValueError(
+                    "training.continue_from continues a segmented run: set "
+                    "training.online_epoch_range to the epochs after the "
+                    "checkpoint's segment"
+                )
         if not 0.0 < self.down_sample_ratio <= 1.0:
             raise ValueError("training.down_sample_ratio must be in (0, 1]")
         if not 0.0 < self.down_sample_ratio_min <= self.down_sample_ratio:
@@ -781,6 +829,21 @@ class Config(StrictConfigModel):
             raise ValueError(
                 "model.draft_checkpoint_path (weights-only warm start) and "
                 "training.resume_from (full resume) are mutually exclusive"
+            )
+        if (
+            self.model.draft_checkpoint_path is not None
+            and self.training.continue_from is not None
+        ):
+            raise ValueError(
+                "model.draft_checkpoint_path (weights-only warm start) and "
+                "training.continue_from (next segment) are mutually exclusive"
+            )
+        if self.training.online_epoch_range is not None and not (
+            mode == "online" and deployment == "disaggregated"
+        ):
+            raise ValueError(
+                "training.online_epoch_range segments an online disaggregated "
+                "run; offline and colocated runs resume with training.resume_from"
             )
         if self.training.role == "producer" and self.profiling.enabled:
             raise ValueError(
@@ -985,7 +1048,11 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
         if keys[-1] not in node:
             raise ValueError(f"override path {path!r} does not exist")
         current = node[keys[-1]]
-        if isinstance(current, (dict, list)) and value.lstrip().startswith(("[", "{")):
+        # a structured literal for a structured field -- or for an optional one
+        # still at None (e.g. training.online_epoch_range=[0,3])
+        if (current is None or isinstance(current, (dict, list))) and value.lstrip().startswith(
+            ("[", "{")
+        ):
             import yaml
 
             try:

@@ -38,6 +38,7 @@ chat template and the selected reasoning mode:
 | --- | --- | --- | --- |
 | Qwen3-8B | Non-reasoning responses | `qwen` | `REASONING_POLICY=forbidden`, `ENABLE_THINKING=false` |
 | Qwen3.6-27B | Structured reasoning responses | `qwen3.5` | `REASONING_POLICY=required`, `ENABLE_THINKING=true` |
+| Gemma 4 E4B-it | Non-reasoning responses | `gemma4` | `REASONING_POLICY=forbidden`, `ENABLE_THINKING=false` |
 
 For example, the Qwen3.6 reasoning gate still uses the same canonical training
 entry; the selected YAML supplies the disaggregated topology while the gate
@@ -56,12 +57,42 @@ CONSUMER_GPUS=1,2,3,4,5,6,7 NPROC_PER_NODE=7 \
 bash scripts/gates/run_disaggregated_overfit_gate.sh
 ```
 
+A Gemma 4 DFlash or MMFlash draft goes through the same gate (for MMFlash use
+`CONFIG=examples/configs/qwen3-8b-mmflash-online.yaml` and
+`configs/gemma4-e4b-mmflash.json`). Its text-only rows can come straight from
+the Gemma regen, because the selector skips rows that carry an image:
+
+```bash
+CONFIG=examples/configs/qwen3-8b-dflash-disaggregated.yaml \
+TARGET_MODEL_PATH=/path/to/models--google--gemma-4-E4B-it/snapshots/<rev> \
+DRAFT_CONFIG_PATH=configs/gemma4-e4b-dflash.json \
+SOURCE_DATA_PATH=/path/to/gemma4-E4B-it_llava-ov15-1M-prompted_regen_first_turn.jsonl \
+EXPECTED_PROJECTOR_TYPE=dflash CHAT_TEMPLATE=gemma4 \
+EMBEDDING_KEY=model.language_model.embed_tokens.weight \
+CAPTURE_ATTENTION_BACKEND=triton \
+REASONING_POLICY=forbidden ENABLE_THINKING=false \
+bash scripts/gates/run_disaggregated_overfit_gate.sh
+```
+
+SGLang runs Gemma 4 only on `triton` (or `trtllm_mha`) attention, which is the
+serving default here. Both gates refuse a Gemma 4 target when the installed
+SGLang lacks the gemma4-spec patch (`scripts/apply_sglang_gemma4_patch.sh`),
+because drafts are trained on and served with it;
+`SPECFORGE_ALLOW_UNPATCHED_GEMMA4=1` gates the stock tree instead. The serving
+gate sets `SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION=1` unless the variable is
+already set: its verify runs eagerly, where Gemma 4's in-place position shift
+would otherwise move the committed draft K/V. The gate is text-only, so the
+vision attention backend does not matter; pass `--mm-attention-backend sdpa`
+through `CAPTURE_SERVER_EXTRA_ARGS` / `SERVING_SERVER_EXTRA_ARGS` to match the
+training servers anyway.
+
 Mask token, block size, and auxiliary capture layers are read from the draft
 config. The selector rejects rows that violate the requested reasoning policy,
-would be truncated, or have fewer than `2 * block_size` trainable tokens after
-the real tokenizer and preprocessing path. It writes a prompt artifact with the
-exact rendered target suffix; the serving check consumes that artifact rather
-than trying to reconstruct structured reasoning from visible content.
+carry an image, would be truncated, or have fewer than `2 * block_size`
+trainable tokens after the real tokenizer and preprocessing path. It writes a
+prompt artifact with the exact rendered target suffix; the serving check
+consumes that artifact rather than trying to reconstruct structured reasoning
+from visible content.
 
 The training stage repeats exactly one selected row for the bounded optimizer
 run and succeeds only when all of these conditions hold:
@@ -140,3 +171,20 @@ effects.
 `run_dflash_chat_serving_gate.py` remain dependency-light leaf helpers for
 targeted debugging. The chat checker itself does not manage services; the two
 shell orchestrators above own service launch, health checks, and cleanup.
+
+## Gemma 4 target probes
+
+Two one-off probes check, on the real `google/gemma-4-E4B-it` checkpoint, what
+training cannot see from its own loss. `qsub scripts/gates/gemma4_probe_hpc.sh`
+runs both in one 1-GPU job and writes `results/gemma4_probe/<jobid>/`.
+
+- `gemma4_capture_parity.py` (G1) captures regen rows through the real capture
+  path with stock SGLang, with the gemma4-spec patch, and with the vision tower
+  on fa3, and compares every tap, the last hidden state and the softcapped
+  logits with HF. `--dry-run` and `--self-check` run on a CPU.
+- `gemma4_serving_probe.py` (G2) sends the regen's grayscale JPEGs to a serving
+  server and counts crashes, then counts answers that open an empty thought
+  channel with thinking off.
+
+The opt-in GPU test `tests/test_runtime/test_server_capture_gate_gemma4.py`
+pins the same capture contract on a tiny random Gemma 4.

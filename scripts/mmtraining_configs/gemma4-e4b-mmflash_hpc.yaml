@@ -1,0 +1,119 @@
+# MMFlash draft for google/gemma-4-E4B-it on the prompted Gemma regen of
+# llava-ov15-1M; qwen3.5-4b-mmflash_hpc.yaml with the Gemma target swapped in.
+#   specforge train --config scripts/mmtraining_configs/gemma4-e4b-mmflash_hpc.yaml
+# or as a PBS job (capture on the first GPU, the rest train), with more than the
+# launcher's own 36 h walltime:
+#   qsub -l select=1:ngpus=4 -l walltime=96:00:00 -v CONFIG=scripts/mmtraining_configs/gemma4-e4b-mmflash_hpc.yaml scripts/train_mmflash_video_hpc.sh
+# 4 GPUs train on 3 (24 rows per optimizer step, as DFlash); a 2-GPU job keeps
+# this yaml's single trainer (8 rows per step, as the Qwen recipe). Even 96 h may
+# not be enough: 6 epochs are about 0.24M optimizer steps on 3 trainers (0.71M
+# on 1), about 97 h at the 1-GPU smoke's 1.48 s per step. managed_local cannot
+# resume (model.draft_checkpoint_path restarts from the weights only), so set
+# training.num_epochs or training.max_steps to fit the walltime.
+# Before the first run: the SGLang gemma4-spec patch (bash scripts/apply_sglang_gemma4_patch.sh)
+# and the Gemma visual-KL sidecar below (or data.visual_score_path= for g=0).
+
+model:
+  # The pinned snapshot keeps the chat template and weights identical to the
+  # regen's and to serving (scripts/eval_gemma4_spec_hpc.sh serves this path).
+  target_model_path: "/scratch/fengsicheng/.cache/huggingface/hub/models--google--gemma-4-E4B-it/snapshots/ee0ef6023621cff504d758262d4e04895a5af4a2"
+  draft_model_config: "configs/gemma4-e4b-mmflash.json"
+  target_backend: sglang
+  # image+text capture: routes prompt building and server requests through the
+  # multimodal ServerInputAdapter. Requires a vision-language target model.
+  input_modality: image
+  trust_remote_code: true
+  # Gemma4ForConditionalGeneration nests the text stack under
+  # model.language_model.*, so the text-only key does not exist. lm_head_key is
+  # unused here because the model ties word embeddings.
+  embedding_key: "model.language_model.embed_tokens.weight"
+  # Both REQUIRED, and at model level so they survive the launcher's
+  # capture_servers override: SGLang runs Gemma4 on triton (or trtllm_mha) only,
+  # and the vision tower's default fa3 ignores its padding-patch mask, while the
+  # regen and serving use sdpa.
+  sglang_attention_backend: "triton"
+  sglang_mm_attention_backend: "sdpa"
+  # Gemma's own <mask> (tokenizer.mask_token_id); the draft JSON and its export
+  # carry the same id, which SGLang's DFLASH worker reads.
+  mask_token_id: 4
+  torch_dtype: "bfloat16"
+data:
+  # Smoke runs: the strided .smoke_every500.jsonl next to it (EXTRA_OVERRIDES);
+  # max_prompts takes the head of the file, which is all wikipedia_2m.
+  train_data_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/gemma4-E4B-it_llava-ov15-1M-prompted_regen_first_turn.jsonl"
+  max_length: 4096
+  chat_template: "gemma4"
+  build_dataset_num_proc: 32
+  cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
+  # Per-token visual-grounding scores written by scripts/score_visual_kl_hpc.sh:
+  # KL(with image || without) per token, plus the target's entropy with the
+  # image. Leave empty for g=0 everywhere, i.e. the plain loss_type objective
+  # on every row (the no-visual-term ablation).
+  # Target-specific: score it with THIS yaml (Gemma's own logits, after the
+  # <turn|> end-of-turn loss-mask fix); the Qwen sidecar does not join, and a
+  # sidecar scored before that fix leaves every row at g=0 ("misaligned").
+  visual_score_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/visual_kl/gemma4-E4B-it-llava-ov15-1M-prompted"
+  visual_score_transform: "quantile"   # quantile | saturate | binary | identity
+  # g = transform(KL) * exp(-entropy): high only where the image both changes
+  # AND settles the target's prediction. false = raw KL rank (ablation).
+  visual_score_confidence_gate: true
+training:
+  strategy: "mmflash"
+  # One objective for every token of every row:
+  #   w = base * (1 + visual_alpha * g * (1 - p)),  loss = sum(w * ce) / bsz
+  # base = "mmflash": prefix confidence prod_{i<=k} ((1-s) p_i + s), the smoothed
+  # probability that verification reaches position k (s = mmflash_smoothing).
+  # Leave unset for dflash's fixed decay; "dpace" for D-PACE.
+  # g = visual grounding from the sidecar (0 on text rows), p = the draft's
+  # probability on the token. visual_alpha: 0 is exactly loss_type.
+  loss_type: "mmflash"
+  # mmflash_smoothing: 0.5
+  visual_alpha: 1.0
+  num_epochs: 6
+  # max_steps: 1000 # set for testing, comment out for full training
+  batch_size: 2
+  accumulation_steps: 4
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  attention_backend: "flex_attention"
+  num_anchors: 512
+  loss_decay_gamma: 7
+  save_interval: 10000
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: "tensorboard"
+run_id: "gemma4-e4b-mmflash-llava-ov15-1M-prompted"
+output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/gemma4-e4b-mmflash-llava-ov15-1M-prompted"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1 # trainer GPUs only; the capture GPU is separate
+  disaggregated:
+    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/gemma4-e4b-mmflash-llava-ov15-1M-prompted/control"
+    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/gemma4-e4b-mmflash-llava-ov15-1M-prompted/consumer-state"
+    backend: mooncake
+
+    # managed_local: the CLI supervises Mooncake and the SGLang capture server
+    # itself, so nothing has to be started by hand. It derives the server URLs
+    # and Mooncake endpoints, which is why none of them may be set here.
+    # scripts/train_mmflash_video_hpc.sh replaces both GPU lists with the job's.
+    managed_local:
+      # trainer (consumer) GPUs — must stay disjoint from the capture server's
+      trainer_cuda_visible_devices:
+        - "1"
+      mooncake:
+        protocol: tcp
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices:
+            - "0"
+          tp_size: 1
+          # GPU 0 is shared with other jobs, so size the static pool to the free
+          # memory rather than to the whole card.
+          mem_fraction_static: 0.80

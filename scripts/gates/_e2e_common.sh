@@ -86,6 +86,85 @@ PY
     gate_fail "$label is already in use at $host:$port"
 }
 
+# Gemma 4 drafts are trained on, and served with, the SGLang gemma4-spec patch
+# (patches/sglang/v0.5.14/gemma4-spec.patch): the stock tree hands back every
+# captured layer already overwritten by the next layer's fused add-RMSNorm, and
+# crashes on a grayscale JPEG. A gate run on an unpatched tree would pass while
+# validating features that training never sees. Other targets, and a target
+# whose config.json cannot be found locally, are not checked.
+# SPECFORGE_ALLOW_UNPATCHED_GEMMA4=1 skips the check, as in the managed preflight.
+gate_require_gemma4_spec_patch() {
+    local python=$1
+    local target=$2
+    local probe
+    local state
+
+    if [[ "${SPECFORGE_ALLOW_UNPATCHED_GEMMA4:-0}" == 1 ]]; then
+        return 0
+    fi
+    probe=$(
+        cat <<'PY'
+import importlib.util
+import json
+import os
+import sys
+
+target = sys.argv[1]
+config_path = None
+if os.path.isdir(target):
+    candidate = os.path.join(target, "config.json")
+    config_path = candidate if os.path.isfile(candidate) else None
+else:
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached = try_to_load_from_cache(target, "config.json")
+        config_path = cached if isinstance(cached, str) else None
+    except Exception:
+        config_path = None
+if config_path is None:
+    print("unknown")
+    raise SystemExit(0)
+with open(config_path, encoding="utf-8") as handle:
+    config = json.load(handle)
+architectures = config.get("architectures") or []
+model_type = str(config.get("model_type") or "")
+if not (
+    model_type.startswith("gemma4")
+    or any(str(name).startswith("Gemma4") for name in architectures)
+):
+    print("other")
+    raise SystemExit(0)
+spec = importlib.util.find_spec("sglang")
+if spec is None or spec.origin is None:
+    print("unpatched: sglang is not importable")
+    raise SystemExit(0)
+root = os.path.dirname(os.path.dirname(spec.origin))
+sentinels = {
+    "sglang/srt/models/gemma4_causal.py": "aux_hidden_states.append(hidden_states.clone())",
+    "sglang/srt/models/gemma4_mm.py": "and vision_bidirectional",
+    "sglang/srt/multimodal/processors/gemma4.py": "gpu_image_decode = False",
+}
+missing = []
+for relative, sentinel in sentinels.items():
+    try:
+        with open(os.path.join(root, relative), encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        text = ""
+    if sentinel not in text:
+        missing.append(relative)
+print("patched" if not missing else "unpatched: " + ", ".join(missing))
+PY
+    )
+    state=$("$python" -c "$probe" "$target") ||
+        gate_fail "could not inspect the target config or the installed sglang"
+    case "$state" in
+        patched | other | unknown) return 0 ;;
+    esac
+    gate_fail "$target is a Gemma 4 target but the sglang used by the gate lacks the gemma4-spec patch ($state); run scripts/apply_sglang_gemma4_patch.sh, or set SPECFORGE_ALLOW_UNPATCHED_GEMMA4=1 to gate the stock tree"
+}
+
 gate_dry_run() {
     gate_is_true "${GATE_DRY_RUN:-0}" GATE_DRY_RUN
 }

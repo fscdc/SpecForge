@@ -58,7 +58,7 @@ def build_step(wrapped_model, *, target_head=None, **_options):
     return MMFlashTrainStrategy(wrapped_model)
 
 
-def resume_contract(_config, draft_model, training_model):
+def resume_contract(config, draft_model, training_model):
     """Persist resolved MMFlash architecture, sampling, and loss semantics.
 
     A run with ``training.draft_sparse`` also records the sparse context it
@@ -70,9 +70,21 @@ def resume_contract(_config, draft_model, training_model):
     managed_local, which forbids resume). The key is absent for every dense
     run: an unconditional key would make all existing MMFlash checkpoints
     unresumable, since the check requires every current key in the checkpoint.
+
+    ``mmflash_target_embed_scale`` -- the factor on target embedding lookups
+    (Gemma 3/3n/4) -- is conditional for the same reason: only a scaled run or
+    one with an explicit ``model.target_embedding_scale`` records it. The
+    explicit case keeps an override of 1.0 from resuming a scaled checkpoint
+    unscaled, since only the current run's keys are compared.
     """
 
     contract = _dense_resume_contract(draft_model, training_model)
+    embed_scale = float(
+        getattr(getattr(training_model, "embed_tokens", None), "embed_scale", 1.0)
+    )
+    explicit = getattr(getattr(config, "model", None), "target_embedding_scale", None)
+    if embed_scale != 1.0 or explicit is not None:
+        contract["mmflash_target_embed_scale"] = embed_scale
     draft_sparse = getattr(training_model, "draft_sparse", None)
     if draft_sparse is not None:
         from specforge.algorithms.common.mmflash_sparse import CONTRACT_KEY

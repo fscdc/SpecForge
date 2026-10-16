@@ -1,0 +1,104 @@
+# MMFlash 9B, continued training on the ~2k LLaVA-Video rows with a SPARSE draft
+# context, served with the same sparse context at inference. The 9B twin of the
+# 4B run that produced draft_models/qwen3.5-4b-mmflash-video-sparse-final
+# (window 2048, 3 epochs); the rows are re-answered by the 9B target and scored
+# with the 9B's own visual KL, since both are target-specific.
+#
+#   qsub -v REGEN_MODEL=Qwen/Qwen3.5-9B,REGEN_OUTPUT=<train_data_path> scripts/mmflash_data-video.sh
+#   qsub -l select=1:ngpus=2 -v CONFIG=scripts/mmtraining_configs/qwen3.5-9b-mmflash-video-sparse_hpc.yaml scripts/score_visual_kl_hpc.sh
+#   qsub -v CONFIG=scripts/mmtraining_configs/qwen3.5-9b-mmflash-video-sparse_hpc.yaml scripts/train_mmflash_video_hpc.sh
+#
+# After training (the export stamps dflash_config.draft_sparse from the run):
+#   specforge export --to hf --checkpoint <output_dir>/<run_id>-step<N> \
+#       --draft-config configs/qwen3.5-9b-mmflash.json --output-dir <export>
+#   python scripts/gates/normalize_dflash_export.py --config <export>/config.json --block-size 16
+#   qsub -v MODEL=Qwen/Qwen3.5-9B,DRAFT=<export> scripts/eval_mmflash_video_hpc.sh
+model:
+  target_model_path: "Qwen/Qwen3.5-9B"
+  # The warm-start export is normalised for SGLang (DFlashDraftModel), so the
+  # MMFlash architecture has to come from here.
+  draft_model_config: "configs/qwen3.5-9b-mmflash.json"
+  # Weights-only warm start: fresh optimizer, LR schedule and step counter.
+  draft_checkpoint_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/draft_models/qwen3.5-9b-mmflash-llava-ov15-1M-prompted-final"
+  target_backend: sglang
+  input_modality: image
+  trust_remote_code: true
+  embedding_key: "model.language_model.embed_tokens.weight"
+  # Qwen3.5-9B does not tie word embeddings: the head is read from its own key.
+  lm_head_key: "lm_head.weight"
+  torch_dtype: "bfloat16"
+data:
+  # 48 frames (880 tokens each) + a benchmark-style question + the 9B target's answer.
+  train_data_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-9B_llava-video-2k_regen.jsonl"
+  # Rows are 42.4k-45.0k tokens; longer rows are dropped, never truncated.
+  max_length: 49152
+  chat_template: "qwen3.5"
+  build_dataset_num_proc: 16
+  dataloader_num_workers: 2
+  cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
+  # The 9B's own scores. Made by:
+  #   qsub -l select=1:ngpus=2 -v CONFIG=<this yaml> scripts/score_visual_kl_hpc.sh
+  visual_score_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/visual_kl/llava-video-2k-9B"
+  visual_score_transform: "quantile"
+  visual_score_confidence_gate: true
+training:
+  strategy: "mmflash"
+  loss_type: "mmflash"
+  mmflash_smoothing: 0.5
+  visual_alpha: 1.0
+  # The same four numbers become SGLANG_DFLASH_DRAFT_SPARSE at inference.
+  draft_sparse:
+    sink: 4         # first positions always visible
+    text: true      # all non-image tokens visible
+    stride: 32      # image tokens at offsets 16, 48, ... of every frame (27 of 880)
+    window: 2048    # plus the most recent 2048 positions before the anchor
+  num_epochs: 3
+  batch_size: 2
+  accumulation_steps: 4
+  learning_rate: 0.0001
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  attention_backend: "flex_attention"
+  num_anchors: 512
+  loss_decay_gamma: 7
+  save_interval: 100
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+runtime:
+  producer_lease: 1
+  in_flight_high_watermark: 16   # captured rows waiting for the trainer, ~1.8 GB each at 9B
+  in_flight_low_watermark: 8
+
+tracking:
+  report_to: "tensorboard"
+run_id: "qwen3.5-9b-mmflash-video-sparse"
+output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-9b-mmflash-video-sparse"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
+  disaggregated:
+    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-9b-mmflash-video-sparse/control"
+    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-9b-mmflash-video-sparse/consumer-state"
+    backend: mooncake
+    client_buffer_size: 4294967296   # above one row's ~1.8 GB of 9B hidden states
+    managed_local:
+      trainer_cuda_visible_devices:
+        - "1"
+      mooncake:
+        protocol: tcp
+        # offset from the 4B runs' defaults; the PBS job script derives its own anyway
+        rpc_port: 35751
+        metadata_port: 36080
+        metrics_port: 36103
+        global_segment_size_bytes: 51539607552   # 48 GiB: the in-flight rows with headroom
+        local_buffer_size_bytes: 4294967296
+      capture_servers:
+        - port: 30200
+          cuda_visible_devices:
+            - "0"
+          tp_size: 1
+          mem_fraction_static: 0.70

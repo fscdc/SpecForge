@@ -73,6 +73,11 @@ class ExampleDraftConfigWiringTest(unittest.TestCase):
             {
                 "qwen2-5-vl-7b-eagle3.json",
                 "qwen2.5-vl-32b-eagle3.json",
+                # wired by scripts/mmtraining_configs/gemma4-e4b-*_hpc.yaml, which
+                # tests/test_config/test_gemma4_configs.py checks
+                "gemma4-e4b-eagle3.json",
+                "gemma4-e4b-dflash.json",
+                "gemma4-e4b-mmflash.json",
             },
         )
 

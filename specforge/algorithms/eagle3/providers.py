@@ -60,9 +60,15 @@ def step_options(config):
 
 
 def resume_contract(config, draft_model, training_model):
-    """Persist every resolved EAGLE3 model/objective setting used by a step."""
+    """Persist every resolved EAGLE3 model/objective setting used by a step.
 
-    return {
+    ``eagle3_target_logit_softcap`` -- the cap the frozen target head puts on
+    the teacher logits (Gemma) -- is recorded only when there is one: the
+    trainer requires every current key in the checkpoint, so an unconditional
+    key would make every existing EAGLE3 checkpoint unresumable.
+    """
+
+    contract = {
         "eagle3_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "eagle3_ttt_length": int(training_model.length),
         "eagle3_attention_backend": str(training_model.attention_backend),
@@ -74,6 +80,10 @@ def resume_contract(config, draft_model, training_model):
             config.training.compact_teacher_chunk_size
         ),
     }
+    softcap = getattr(training_model, "target_logit_softcap", None)
+    if softcap is not None:
+        contract["eagle3_target_logit_softcap"] = float(softcap)
+    return contract
 
 
 def allowed_missing_checkpoint_keys(_config, draft_model, _training_model):

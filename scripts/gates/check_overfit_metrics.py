@@ -65,7 +65,14 @@ def check_overfit(
 ) -> Dict[str, object]:
     step, metrics = final_metrics(log_path)
     loss = float(metrics["loss"])
-    accuracy = float(metrics["accuracy"])
+    # The DFlash-family trainers log token accuracy as "acc"; older consumers
+    # logged "accuracy".
+    if "accuracy" in metrics:
+        accuracy = float(metrics["accuracy"])
+    elif "acc" in metrics:
+        accuracy = float(metrics["acc"])
+    else:
+        raise ValueError(f"no token accuracy (accuracy/acc) in the final metrics of {log_path}")
     checkpoints = checkpoint_paths(checkpoint_root)
     errors = []
     if step != expected_step:

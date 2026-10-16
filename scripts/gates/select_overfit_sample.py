@@ -30,6 +30,11 @@ def single_turn_candidate(
     row: Dict[str, Any],
     reasoning_policy: str = "allow",
 ) -> Optional[Dict[str, Any]]:
+    # The gate trains and serves text only. An image row's reply was generated
+    # from the picture, which neither the text path nor the chat request sends,
+    # so the target cannot reproduce it and the serving prefix check fails.
+    if row.get("image"):
+        return None
     conversations = row.get("conversations")
     if not isinstance(conversations, list) or len(conversations) != 2:
         return None
@@ -62,7 +67,10 @@ def load_processing_stack(model_path: str, chat_template: str):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # The checkout root: this file lives in <root>/scripts/gates/.
+    root_dir = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
     package_name = "_specforge_domino_overfit"
     root_package = types.ModuleType(package_name)
     root_package.__path__ = []

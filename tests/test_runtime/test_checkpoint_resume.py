@@ -171,6 +171,8 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         spec_name="eagle3",
         max_grad_norm=1.0,
         total_steps=100,
+        continue_new_stream=False,
+        save_interval=0,
     ):
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.control_plane import DataFlowController
@@ -207,12 +209,13 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 num_epochs=1,
                 max_steps=max_steps,
                 total_steps=total_steps,
-                save_interval=0,
+                save_interval=save_interval,
                 logger=None,
                 log_interval=50,
                 collate_fn=_x_collate,
                 per_sample_transform=_x_transform,
                 resume_from=resume_from,
+                continue_new_stream=continue_new_stream,
                 checkpoint_extra=checkpoint_extra,
                 strategy_kwargs=strategy_kwargs,
             )
@@ -288,6 +291,90 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         self.assertEqual(t3.fit(), 2)
         self.assertEqual(seen3, [])
         self.assertTrue(torch.equal(model3.draft_model.w.detach(), w_cut))
+
+    def test_continued_segments_reproduce_one_uninterrupted_run(self):
+        """training.continue_from: two segments, each its own stream (the online
+        producer's epochs [0, k) and [k, E)), chained through the first one's
+        final checkpoint, train exactly what one run over both streams trains:
+        weights, fp32 masters, scheduler and global_step carry over and the new
+        stream starts at its first batch."""
+        from specforge.training.checkpoint import CheckpointManager
+
+        workdir = tempfile.mkdtemp(prefix="trainer_segments_cpu_")
+        all_dir = _write_feature_files(os.path.join(workdir, "all"), n=16)
+        halves = []
+        for k in range(2):
+            d = os.path.join(workdir, f"half{k}")
+            os.makedirs(d)
+            for i in range(8 * k, 8 * k + 8):
+                name = f"{i:04d}.ckpt"
+                os.symlink(os.path.join(all_dir, name), os.path.join(d, name))
+            halves.append(d)
+
+        # Reference: one run over both streams, the 8-step horizon of the plan.
+        t_ref, model_ref, _ = self._make_trainer(
+            os.path.join(workdir, "ref"),
+            feat_dir=all_dir,
+            max_steps=None,
+            total_steps=8,
+            run_id="ref",
+        )
+        self.assertEqual(t_ref.fit(), 8)
+        w_ref = model_ref.draft_model.w.detach().clone()
+
+        # Segment 1 streams the first half. Its last step is also an interval
+        # save, which records a mid-stream position; fit() must save that
+        # step again once the stream has closed.
+        out = os.path.join(workdir, "out")
+        t1, _, _ = self._make_trainer(
+            out, feat_dir=halves[0], max_steps=None, total_steps=8, save_interval=4
+        )
+        self.assertEqual(t1.fit(), 4)
+        final_uri = f"file://{os.path.realpath(os.path.join(out, 'rz-latest'))}"
+        final = CheckpointManager.read_resume_state(final_uri)
+        self.assertEqual(
+            (final["global_step"], final["epoch"], final["epoch_samples"]), (4, 1, 0)
+        )
+
+        # Segment 2: a new stream continued from segment 1's final checkpoint.
+        t2, model2, seen2 = self._make_trainer(
+            out,
+            feat_dir=halves[1],
+            max_steps=None,
+            total_steps=8,
+            resume_from=final_uri,
+            continue_new_stream=True,
+        )
+        ctrl = t2._controller
+        self.assertEqual(
+            (ctrl.global_step, ctrl.epoch, ctrl._epoch_batch, ctrl._epoch_samples),
+            (4, 0, 0, 0),
+        )
+        self.assertEqual(t2.backend.optimizer.scheduler.after_scheduler.last_epoch, 4)
+        self.assertEqual(t2.fit(), 8)
+        self.assertEqual(len(seen2), 8)  # the whole new stream, nothing skipped
+        self.assertLess(
+            abs(float(model2.draft_model.w.detach() - w_ref)),
+            1e-9,
+            "chained segments diverged from the uninterrupted reference",
+        )
+
+        # A checkpoint from inside a stream cannot start the next segment: the
+        # rest of its stream would never be trained.
+        mid = os.path.join(workdir, "mid")
+        t_mid, _, _ = self._make_trainer(
+            mid, feat_dir=halves[0], max_steps=2, total_steps=8
+        )
+        self.assertEqual(t_mid.fit(), 2)
+        with self.assertRaisesRegex(ValueError, "stopped inside its stream"):
+            self._make_trainer(
+                os.path.join(workdir, "mid2"),
+                feat_dir=halves[1],
+                max_steps=None,
+                total_steps=8,
+                resume_from=f"file://{os.path.realpath(os.path.join(mid, 'rz-latest'))}",
+                continue_new_stream=True,
+            )
 
     def test_resume_validation_fails_fast(self):
         workdir = tempfile.mkdtemp(prefix="trainer_resume_bad_")

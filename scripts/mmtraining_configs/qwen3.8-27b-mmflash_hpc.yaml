@@ -34,6 +34,10 @@ data:
   # g = transform(KL) * exp(-entropy): high only where the image both changes
   # AND settles the target's prediction. false = raw KL rank (ablation).
   visual_score_confidence_gate: true
+  # Refuse to train if more than 0.2% of the kept image rows have no usable
+  # score (an unfinished scoring pass, another tokenisation) or no image row
+  # survives encoding (unreadable image paths).
+  visual_score_max_unscored_frac: 0.002
 training:
   strategy: "mmflash"
   # One objective for every token of every row:
@@ -57,6 +61,9 @@ training:
   num_anchors: 512
   loss_decay_gamma: 7
   save_interval: 10000
+  # 24 GB per checkpoint; keep the newest 3 (segment finals are hardlinked
+  # out of reach of the rotation by train_mmflash_video_hpc.sh)
+  max_checkpoints: 3
   log_interval: 50
   dist_timeout: 30
   seed: 42

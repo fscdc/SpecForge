@@ -475,6 +475,19 @@ class CaptureLayerRangeTest(unittest.TestCase):
             any("last decoder layer" in str(warning.message) for warning in caught)
         )
 
+    def test_the_last_layer_is_refused_outside_gemma4(self):
+        # Qwen3.5/Qwen3-VL in SGLang index self.layers[k + 1] at server start
+        qwen = SimpleNamespace(
+            architectures=["Qwen3_5ForConditionalGeneration"],
+            text_config=SimpleNamespace(
+                hidden_size=5120, vocab_size=248320, num_hidden_layers=64
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "last decoder layer"):
+            _resolve_contract(qwen, _dflash_payload([1, 16, 31, 46, 63]))
+        contract = _resolve_contract(qwen, _dflash_payload([1, 16, 31, 46, 61]))
+        self.assertEqual(contract.aux_layer_ids, (1, 16, 31, 46, 61))
+
     def test_a_target_without_a_layer_count_is_not_range_checked(self):
         target = SimpleNamespace(hidden_size=64, vocab_size=128)
         contract = _resolve_contract(target, _dflash_payload([3, 700]))

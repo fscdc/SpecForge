@@ -637,6 +637,42 @@ class DominoTrainStrategy(DraftTrainStrategy):
         }
 
 
+class MMDominoTrainStrategy(DominoTrainStrategy):
+    """Domino's ``lambda_base`` schedule over ``OnlineMMDominoModel``.
+
+    The model weights both of Domino's loss terms with the MMFlash objective,
+    which reads the per-token ``visual_score`` channel of image captures; the
+    channel is optional at the batch level exactly as for MMFlash (text and
+    offline batches lack it and train on the plain ``loss_type`` objective).
+    """
+
+    name = "mmdomino"
+
+    def forward_loss(
+        self, batch: TrainBatch, ctx: Optional[StepContext] = None
+    ) -> StepOutput:
+        self.validate_batch(batch)
+        t = batch.tensors
+        device = self._device()
+        lambda_base = self._lambda_base(ctx)
+        visual_score = t.get("visual_score")
+        loss, accuracy, model_metrics = self.domino_model(
+            input_ids=t["input_ids"].to(device),
+            hidden_states=t["hidden_states"].to(device),
+            loss_mask=t["loss_mask"].to(device),
+            visual_score=None if visual_score is None else visual_score.to(device),
+            lambda_base=lambda_base,
+        )
+        metrics = dict(model_metrics)
+        ratio_metrics = metrics.pop("ratio_metrics", {})
+        metrics["accuracy"] = accuracy.detach()
+        metrics.setdefault(
+            "lambda_base",
+            torch.tensor(float(lambda_base), device=loss.device),
+        )
+        return StepOutput(loss=loss, metrics=metrics, ratio_metrics=ratio_metrics)
+
+
 __all__ = [
     "DraftTrainStrategy",
     "Eagle3TrainStrategy",
@@ -645,6 +681,7 @@ __all__ = [
     "MMFlashTrainStrategy",
     "DSparkTrainStrategy",
     "DominoTrainStrategy",
+    "MMDominoTrainStrategy",
     "StepOutput",
     "StepContext",
     "linear_lambda_base",

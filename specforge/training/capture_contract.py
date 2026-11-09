@@ -61,7 +61,7 @@ def resolve_server_capture_contract(
         raise ValueError(
             f"resolved server capture layer ids must be unique, got {layers!r}"
         )
-    _check_layers_against_target(cfg, layers, target_cfg)
+    _check_layers_against_target(cfg, layers, target_cfg, architectures)
 
     return ServerCaptureContract(
         method=streaming.capture_method,
@@ -75,13 +75,19 @@ def resolve_server_capture_contract(
     )
 
 
-def _check_layers_against_target(cfg: Config, layers, target_cfg) -> None:
-    """Fail on layer ids past the target's depth; warn on its last layer.
+def _check_layers_against_target(
+    cfg: Config, layers, target_cfg, architectures: tuple[str, ...] = ()
+) -> None:
+    """Fail on layer ids past the target's depth or, outside Gemma 4, on its last layer.
 
     Capture id ``k`` is the output of decoder layer ``k``, so an id must be
     below ``num_hidden_layers``; otherwise the run would only fail later, per
-    row, on the captured feature width. The last layer is captured before the
-    final norm by SGLang but is HF's post-norm ``hidden_states[-1]``.
+    row, on the captured feature width. SGLang taps id ``k`` at the input of
+    layer ``k + 1``, which the last layer does not have: Qwen3.5/Qwen3-VL
+    targets then fail at capture-server start (``self.layers[k + 1]``) and the
+    dense Llama/Qwen ones never capture it. Only the Gemma 4 models read it
+    after the layer loop, before the final norm -- where HF's
+    ``hidden_states[-1]`` is after it, hence the warning there.
     """
     num_layers = getattr(target_cfg, "num_hidden_layers", None)
     if isinstance(num_layers, bool) or not isinstance(num_layers, int):
@@ -94,6 +100,17 @@ def _check_layers_against_target(cfg: Config, layers, target_cfg) -> None:
             f"are numbered 0..{num_layers - 1}"
         )
     if num_layers - 1 in layers:
+        model_type = str(getattr(target_cfg, "model_type", "") or "")
+        if not (
+            model_type.startswith("gemma4")
+            or any(str(name).startswith("Gemma4") for name in architectures)
+        ):
+            raise ValueError(
+                f"capture layer id {num_layers - 1} is the last decoder layer of "
+                f"{cfg.model.target_model_path!r}; SGLang captures id k at the input "
+                "of layer k + 1, which only its Gemma 4 models provide for the last "
+                f"layer. Use ids below {num_layers - 1}"
+            )
         warnings.warn(
             f"capture layer id {num_layers - 1} is the last decoder layer of "
             f"{cfg.model.target_model_path!r}: SGLang captures it before the "

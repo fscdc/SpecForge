@@ -1,0 +1,17 @@
+# Installed into the vLLM environment only (pip install -e benchmarks/vllm/phase_plugin);
+# vLLM loads every entry point of the vllm.general_plugins group in each of its processes.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "specforge-vllm-phase"
+version = "0.1.0"
+description = "Prefill/decode phase accounting for vLLM servers, read by benchmarks/vllm/bench_mm_vllm.py"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+specforge_phase_accounting = "specforge_vllm_phase:register"
+
+[tool.setuptools]
+py-modules = ["specforge_vllm_phase"]

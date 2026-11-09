@@ -411,6 +411,29 @@ def build_domino_model(
     )
 
 
+def build_mmdomino_model(
+    cfg: Config,
+    draft_model: Any,
+    _draft_config: Any,
+    _target_config: Any,
+    tokenizer: Any,
+) -> AlgorithmModelParts:
+    from specforge.algorithms.common.mmdomino_model import OnlineMMDominoModel
+
+    return _build_dflash_family_model(
+        cfg,
+        draft_model,
+        tokenizer,
+        lambda common: OnlineMMDominoModel(
+            **common,
+            shift_label=bool(getattr(draft_model, "shift_label", False)),
+            loss_type=cfg.training.loss_type,
+            visual_alpha=cfg.training.visual_alpha,
+            mmflash_smoothing=cfg.training.mmflash_smoothing,
+        ),
+    )
+
+
 def build_dspark_model(
     cfg: Config,
     draft_model: Any,
@@ -659,6 +682,7 @@ __all__ = [
     "resolve_mmflash_capture_layers",
     "build_dflash_model",
     "build_domino_model",
+    "build_mmdomino_model",
     "build_dspark_model",
     "build_eagle3_draft",
     "build_eagle3_model",

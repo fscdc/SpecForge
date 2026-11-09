@@ -6,6 +6,15 @@
 #   qsub -v ALGO=origin scripts/eval_gemma4_spec_hpc.sh                     # the target alone
 #   qsub -v ALGO=dflash,DRAFT=/path/to/export scripts/eval_gemma4_spec_hpc.sh
 #   qsub -v ALGO=eagle3,DRAFT=/path/to/export scripts/eval_gemma4_spec_hpc.sh
+#   qsub -v ALGO=mtp scripts/eval_gemma4_spec_hpc.sh                        # Google's own MTP drafter
+#
+# ALGO=mtp serves google/gemma-4-E4B-it-assistant, the drafter Google released
+# with the model (4 layers at width 256 reading the target's KV cache and its
+# last-layer hidden state; SGLang promotes NEXTN to FROZEN_KV_MTP for it), with
+# MTP_STEPS draft steps, top-1, MTP_STEPS + 1 draft tokens. The default 5 is
+# SGLang's Gemma 4 recipe; 15 matches the Qwen3.5 mtp-15step runs. DRAFT
+# defaults to the pinned assistant snapshot below (hf download
+# google/gemma-4-E4B-it-assistant).
 #
 # Exports (CPU, from a training checkpoint <ckpt>):
 #   EAGLE3          specforge export --to sglang --checkpoint <ckpt> --draft-config configs/gemma4-e4b-eagle3.json \
@@ -25,21 +34,27 @@
 # committed draft K/V.
 #
 # bench_mm.py runs image (and video) benchmarks only, text ones live in
-# bench_text.py, so the mixed set is two runs against the same server, greedy,
-# thinking off, at most MAX_TOKENS new tokens, generations saved next to the
-# results (an ALGO=origin run gives the reference outputs):
+# bench_text.py, so the mixed set is two runs against the same server, at
+# TEMPERATURE (default 0, greedy), thinking off, at most MAX_TOKENS new tokens,
+# generations saved next to the results (an ALGO=origin run gives the reference outputs):
 #   results/image_<name>_results.jsonl   IMAGE_BENCHES (default "chartqa:10 mmstar:10")
 #   results/text_<name>_results.jsonl    TEXT_BENCHES  (default "gsm8k:10 math500:10")
-# with <name> = gemma4-e4b_<algo>_concurrency1_temp0_<MAX_TOKENS>[_<export dir name>]<RUN_TAG>.
+# with <name> = gemma4-e4b_<algo>_concurrency1_temp<TEMPERATURE>_<MAX_TOKENS>[_<export dir name>]<RUN_TAG>.
 # Both skip a benchmark their results file already holds, so a rerun finishes a
 # partial one.
 #
 # Optional (-v NAME=value):
 #   MODEL              the target (default: the pinned snapshot below)
 #   MAX_TOKENS         default 512
+#   TEMPERATURE        default 0 (greedy); 1 samples with top-p 0.95 and top-k 20,
+#                      the Qwen3.5 temp1 runs' settings (Gemma's own generation
+#                      config says top-k 64); the results name says temp<T>
 #   BLOCK_SIZE         DFLASH block size, default 16 (the drafts' block_size)
 #   EAGLE3_STEPS       EAGLE3 draft steps, default 15 (16 draft tokens, top-1,
 #                      as the Qwen3.5 EAGLE3 runs)
+#   MTP_STEPS          ALGO=mtp draft steps, default 5 (the results name says
+#                      mtp-<MTP_STEPS>step)
+#   LOG_DIR            server log directory (default logs/gemma4-eval_<job>)
 #   IMAGE_BENCHES / TEXT_BENCHES   "" skips that half
 #   EXTRA_SERVER_ARGS  more server flags, e.g. --disable-cuda-graph
 #   RUN_TAG            appended to the results name
@@ -97,15 +112,24 @@ MODEL_TAG="${MODEL_TAG:-gemma4-e4b}"
 ALGO="${ALGO:-origin}"
 DRAFT="${DRAFT:-}"
 MAX_TOKENS="${MAX_TOKENS:-512}"
+TEMPERATURE="${TEMPERATURE:-0}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 EAGLE3_STEPS="${EAGLE3_STEPS:-15}"
+MTP_STEPS="${MTP_STEPS:-5}"
+MTP_ASSISTANT=/scratch/fengsicheng/.cache/huggingface/hub/models--google--gemma-4-E4B-it-assistant/snapshots/8d0031ea8c2109e2b1e86bb9368a4539b537f80a
 IMAGE_BENCHES="${IMAGE_BENCHES-chartqa:10 mmstar:10}"
 TEXT_BENCHES="${TEXT_BENCHES-gsm8k:10 math500:10}"
 read -r -a extra_server_args <<< "${EXTRA_SERVER_ARGS:-}"
 SERVER_TIMEOUT="${SERVER_TIMEOUT:-1800}"
-for value in "${MAX_TOKENS}" "${BLOCK_SIZE}" "${EAGLE3_STEPS}"; do
-    case "${value}" in ''|*[!0-9]*) echo "[eval] ERROR: MAX_TOKENS, BLOCK_SIZE and EAGLE3_STEPS must be numbers" >&2; exit 1 ;; esac
+for value in "${MAX_TOKENS}" "${BLOCK_SIZE}" "${EAGLE3_STEPS}" "${MTP_STEPS}"; do
+    case "${value}" in ''|*[!0-9]*) echo "[eval] ERROR: MAX_TOKENS, BLOCK_SIZE, EAGLE3_STEPS and MTP_STEPS must be numbers" >&2; exit 1 ;; esac
 done
+case "${TEMPERATURE}" in
+    ''|.*|*.|*[!0-9.]*|*.*.*) echo "[eval] ERROR: TEMPERATURE must be a number such as 0 or 1, got '${TEMPERATURE}'" >&2; exit 1 ;;
+esac
+# 1.0 -> temp1, as the Qwen3.5 result names
+TEMP_TAG="${TEMPERATURE%.0}"
+ALGO_TAG="${ALGO}"
 case "${ALGO}" in
     origin)
         [ -z "${DRAFT}" ] || { echo "[eval] ERROR: ALGO=origin serves the target alone; drop DRAFT" >&2; exit 1; }
@@ -116,12 +140,23 @@ case "${ALGO}" in
         DRAFT="$(cd "${DRAFT}" 2> /dev/null && pwd)" || { echo "[eval] ERROR: DRAFT is not a directory" >&2; exit 1; }
         NAME_SUFFIX="_$(basename "${DRAFT}")"
         ;;
+    mtp)
+        ALGO_TAG="mtp-${MTP_STEPS}step"
+        # Google's drafter needs no name in the results; another one does
+        if [ -z "${DRAFT}" ]; then
+            DRAFT="${MTP_ASSISTANT}"
+            NAME_SUFFIX=""
+        else
+            NAME_SUFFIX="_$(basename "${DRAFT}")"
+        fi
+        DRAFT="$(cd "${DRAFT}" 2> /dev/null && pwd)" || { echo "[eval] ERROR: DRAFT is not a directory (hf download google/gemma-4-E4B-it-assistant)" >&2; exit 1; }
+        ;;
     *)
-        echo "[eval] ERROR: ALGO must be origin, eagle3 or dflash (an MMFlash export is served as dflash), got '${ALGO}'" >&2
+        echo "[eval] ERROR: ALGO must be origin, eagle3, dflash (an MMFlash export is served as dflash) or mtp, got '${ALGO}'" >&2
         exit 1
         ;;
 esac
-NAME="${MODEL_TAG}_${ALGO}_concurrency1_temp0_${MAX_TOKENS}${NAME_SUFFIX}${RUN_TAG:-}"
+NAME="${MODEL_TAG}_${ALGO_TAG}_concurrency1_temp${TEMP_TAG}_${MAX_TOKENS}${NAME_SUFFIX}${RUN_TAG:-}"
 if [ -z "${IMAGE_BENCHES}" ] && [ -z "${TEXT_BENCHES}" ]; then
     echo "[eval] ERROR: IMAGE_BENCHES and TEXT_BENCHES are both empty" >&2
     exit 1
@@ -130,10 +165,10 @@ fi
 # an export SGLang would refuse, or serve as something else, fails here
 # instead of after the server's start-up
 if [ "${ALGO}" != origin ]; then
-    python3 - "${ALGO}" "${DRAFT}" "${BLOCK_SIZE}" <<'PY' || exit 1
+    python3 - "${ALGO}" "${DRAFT}" "${BLOCK_SIZE}" "${MODEL}" <<'PY' || exit 1
 import json, os, sys
 
-algo, export, block_size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+algo, export, block_size, target = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 path = os.path.join(export, "config.json")
 if not os.path.isfile(path):
     sys.exit(f"[eval] ERROR: {path} not found")
@@ -141,7 +176,18 @@ with open(path, encoding="utf-8") as handle:
     config = json.load(handle)
 arch = config.get("architectures")
 problems = []
-if algo == "eagle3":
+if algo == "mtp":
+    # SGLang only promotes NEXTN to FROZEN_KV_MTP for these; anything else
+    # would be served as a plain EAGLE draft
+    if arch not in (["Gemma4AssistantForCausalLM"], ["Gemma4UnifiedAssistantForCausalLM"]):
+        problems.append(f"architectures {arch}, not a Gemma 4 assistant drafter")
+    with open(os.path.join(target, "config.json"), encoding="utf-8") as handle:
+        target_config = json.load(handle)
+    width = (target_config.get("text_config") or target_config).get("hidden_size")
+    if config.get("backbone_hidden_size") != width:
+        problems.append(f"backbone_hidden_size {config.get('backbone_hidden_size')}, the target's is {width}")
+    layers = f"its KV from the target, width {(config.get('text_config') or {}).get('hidden_size')}"
+elif algo == "eagle3":
     layers = (config.get("eagle_config") or {}).get("eagle_aux_hidden_state_layer_ids")
     if arch != ["LlamaForCausalLMEagle3"]:
         problems.append(f"architectures {arch}, not an EAGLE3 export (specforge export --to sglang)")
@@ -174,7 +220,7 @@ JOBNUM="${PBS_JOBID:-0}"; JOBNUM="${JOBNUM%%.*}"
 case "${JOBNUM}" in ''|*[!0-9]*) JOBNUM=0 ;; esac
 # ends in 5: never one of train_mmflash_video_hpc.sh's capture ports (31000 + 10k)
 PORT="${PORT:-$((35005 + (10#${JOBNUM} % 400) * 10))}"
-LOG_DIR="logs/gemma4-eval_${PBS_JOBID:-local}"
+LOG_DIR="${LOG_DIR:-logs/gemma4-eval_${PBS_JOBID:-local}}"
 SERVER_LOG="${LOG_DIR}/server.log"
 
 bash scripts/benchmark_helper.sh || exit 1
@@ -213,7 +259,7 @@ PY
 mkdir -p "${LOG_DIR}" results
 echo "[eval] target=${MODEL} algo=${ALGO} draft=${DRAFT:-<none: target alone>}"
 echo "[eval] SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION=${SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION} extra server args: ${extra_server_args[*]:-<none>}"
-echo "[eval] image=${IMAGE_BENCHES:-<none>} text=${TEXT_BENCHES:-<none>} max_tokens=${MAX_TOKENS} -> results/{image,text}_${NAME}_results.jsonl"
+echo "[eval] image=${IMAGE_BENCHES:-<none>} text=${TEXT_BENCHES:-<none>} max_tokens=${MAX_TOKENS} temperature=${TEMPERATURE} -> results/{image,text}_${NAME}_results.jsonl"
 echo "[eval] gpu=${GPU_ID} port=${PORT} server log ${SERVER_LOG}"
 
 SERVER_PID=""
@@ -239,6 +285,12 @@ elif [ "${ALGO}" = dflash ]; then
     spec_args=(--speculative-algorithm DFLASH --speculative-draft-model-path "${DRAFT}"
                --speculative-dflash-block-size "${BLOCK_SIZE}")
     bench_block_args=(--block-size "${BLOCK_SIZE}")
+elif [ "${ALGO}" = mtp ]; then
+    # NEXTN with a Gemma 4 assistant draft is served as FROZEN_KV_MTP
+    spec_args=(--speculative-algorithm NEXTN --speculative-draft-model-path "${DRAFT}"
+               --speculative-num-steps "${MTP_STEPS}" --speculative-eagle-topk 1
+               --speculative-num-draft-tokens "$((MTP_STEPS + 1))")
+    bench_block_args=()   # as the Qwen3.5 MTP runs: bench's default
 fi
 CUDA_VISIBLE_DEVICES="${GPU_ID}" python3 -m sglang.launch_server \
     --model "${MODEL}" \
@@ -295,7 +347,7 @@ if [ -n "${IMAGE_BENCHES}" ]; then
         "${bench_block_args[@]}" \
         --benchmark-list ${IMAGE_BENCHES} \
         --reasoning off \
-        --temperature 0.0 \
+        --temperature "${TEMPERATURE}" \
         --top-p 0.95 \
         --top-k 20 \
         --max-tokens "${MAX_TOKENS}" \
@@ -311,7 +363,7 @@ if [ -n "${TEXT_BENCHES}" ]; then
         "${bench_block_args[@]}" \
         --benchmark-list ${TEXT_BENCHES} \
         --reasoning off \
-        --temperature 0.0 \
+        --temperature "${TEMPERATURE}" \
         --top-p 0.95 \
         --top-k 20 \
         --max-tokens "${MAX_TOKENS}" \

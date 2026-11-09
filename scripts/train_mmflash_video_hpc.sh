@@ -18,8 +18,10 @@
 # - STACK=1 stacks both on EVERY GPU of the job: one capture server
 #   tensor-parallel over all of them (tp_size = GPU count) and one trainer rank
 #   per GPU, the capture server again held to SHARED_CAPTURE_MEM per card. For
-#   a target too big to share one card with its trainer, e.g. the 27B:
-#     qsub -l select=1:ncpus=24:mem=450gb:ngpus=2:gpu_model=H200 -v STACK=1,CONFIG=scripts/mmtraining_configs/qwen3.8-27b-mmflash_hpc.yaml scripts/train_mmflash_video_hpc.sh
+#   a target too big to share one card with its trainer, e.g. the 27B (pass a
+#   walltime: the 36 h default below kills a 27B epoch, and a stream killed
+#   midway cannot be resumed):
+#     qsub -l select=1:ncpus=24:mem=450gb:ngpus=2:gpu_model=H200 -l walltime=144:00:00 -v STACK=1,CONFIG=scripts/mmtraining_configs/qwen3.8-27b-mmflash_hpc.yaml scripts/train_mmflash_video_hpc.sh
 #   CAPTURE_TP=k splits the cards into capture servers of k GPUs each instead;
 #   CAPTURE_TP=1 gives every card its own capture replica, which suits a target
 #   that fits on one card next to its trainer rank (Gemma 4 E4B, Qwen3.5-4B/9B):
@@ -33,12 +35,25 @@
 #   A segment that exits cleanly hardlinks its final checkpoint to
 #   <output_dir>/segments/segment<k>-final (safe from max_checkpoints rotation)
 #   and records it in <output_dir>/segments/segment<k>.json; the next segment
-#   refuses to start without it. Chain the jobs with afterok:
-#     s0=$(qsub -v SEGMENT_EPOCHS=3,SEGMENT=0,CONFIG=... scripts/train_mmflash_video_hpc.sh)
-#     qsub -W depend=afterok:${s0} -v SEGMENT_EPOCHS=3,SEGMENT=1,CONFIG=... scripts/train_mmflash_video_hpc.sh
+#   refuses to start without it. A segment whose stream closed and whose final
+#   checkpoint landed counts as finished even if the end-of-stream cleanup
+#   (draining Mooncake removals) then fails; the record notes it. Size each
+#   segment to fit its walltime with margin (+ ~1.5 h start-up for a ~1M-row
+#   corpus): a segment killed midway is lost whole. Chain the jobs with afterok:
+#     R='-l select=1:ncpus=24:mem=450gb:ngpus=2:gpu_model=H200 -l walltime=144:00:00'
+#     s0=$(qsub ${R} -v SEGMENT_EPOCHS=1,SEGMENT=0,CONFIG=... scripts/train_mmflash_video_hpc.sh)
+#     qsub ${R} -W depend=afterok:${s0} -v SEGMENT_EPOCHS=1,SEGMENT=1,CONFIG=... scripts/train_mmflash_video_hpc.sh
+#   Every segment needs the same GPUs, layout, batch_size, accumulation_steps,
+#   num_epochs and data (all are part of what continue_from checks).
+#   Segment runs default to HF_HUB_OFFLINE=1: the target's Hub revision is part
+#   of that check too, so an upstream push mid-chain would refuse the next one.
 # - The job runs from a copy of specforge/, configs/ and scripts/ taken when it
 #   starts (<output_dir>/code/<jobid>), so edits to the checkout during a long
-#   run cannot reach it; CODE_SNAPSHOT=0 runs the checkout itself.
+#   run cannot reach it; CODE_SNAPSHOT=0 runs the checkout itself. A segment
+#   chain shares ONE copy, <output_dir>/code/segments, taken by segment 0 (the
+#   checkpoint records the draft config's path and sha256, and a chain should
+#   not change code between segments); a fix meant for the rest of a chain goes
+#   into that copy.
 # - EXTRA_OVERRIDES: more dotted overrides, whitespace-separated on one line and
 #   applied last. output_dir, control_dir and consumer_state_dir are read after
 #   them, so a smoke run on a data subset logs to and clears its own directories:
@@ -90,7 +105,11 @@ fi
 cd "${PROJECT_DIR}" || exit 1
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
+# CONDA_PREFIX is unset when the env's python was already on PATH
+ENV_PREFIX="${CONDA_PREFIX:-$(python3 -c 'import sys; print(sys.prefix)')}"
+export LD_LIBRARY_PATH="${ENV_PREFIX}/lib:${ENV_PREFIX}/lib/python3.11/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
+# a segment chain must keep the target revision it started with (see above)
+[ -n "${SEGMENT_EPOCHS:-}" ] && export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export FLASHINFER_USE_CUDA_NORM=1
 export SGLANG_NUMA_BIND_V2=0
 export SGLANG_MM_SKIP_COMPUTE_HASH="${SGLANG_MM_SKIP_COMPUTE_HASH:-1}"
@@ -145,11 +164,13 @@ cfg = load_config(sys.argv[1], sys.argv[2:])
 dis = cfg.deployment.disaggregated
 mem = dis.managed_local.capture_servers[0].mem_fraction_static
 print(cfg.output_dir, dis.control_dir, dis.consumer_state_dir or "", 0.7 if mem is None else mem,
-      cfg.run_id, cfg.training.num_epochs, sep="\n")
+      cfg.run_id, cfg.training.num_epochs, cfg.data.train_data_path, cfg.data.visual_score_path or "",
+      sep="\n")
 PY
 )
 OUT="${RESOLVED[0]:-}" CONTROL="${RESOLVED[1]:-}" STATE="${RESOLVED[2]:-}" CAPTURE_MEM="${RESOLVED[3]:-}"
 RUN_ID="${RESOLVED[4]:-}" NUM_EPOCHS="${RESOLVED[5]:-}"
+DATA_PATH="${RESOLVED[6]:-}" SCORE_PATH="${RESOLVED[7]:-}"
 if [ -z "${OUT}" ] || [ -z "${CONTROL}" ] || [ -z "${CAPTURE_MEM}" ] || [ -z "${RUN_ID}" ] || [ -z "${NUM_EPOCHS}" ]; then
     echo "[train] ERROR: cannot resolve ${CONFIG}${EXTRA_OVERRIDES:+ with EXTRA_OVERRIDES}" >&2
     exit 1
@@ -252,14 +273,58 @@ if [ -e "${CONTROL}" ] || [ -e "${STATE}" ]; then
 fi
 LOG="${OUT}/logs/train_${JOBNUM}.log"
 if [ "${CODE_SNAPSHOT:-1}" = 1 ]; then
-    SNAP="${OUT}/code/${JOBNUM}"
-    rm -rf "${SNAP}"
-    mkdir -p "${SNAP}"
-    cp -a specforge configs scripts "${SNAP}/" || { echo "[train] ERROR: cannot copy the code to ${SNAP}" >&2; exit 1; }
+    if [ -n "${SEGMENT_EPOCHS:-}" ]; then
+        # one copy for the whole chain: segment 0 takes it (afresh on a retry,
+        # nothing has continued from it yet), later segments run it unchanged
+        SNAP="${OUT}/code/segments"
+        if [ "${SEGMENT}" = 0 ]; then
+            rm -rf "${SNAP}"
+        elif [ ! -f "${SNAP}/specforge/cli.py" ]; then
+            echo "[train] ERROR: segment ${SEGMENT} runs segment 0's code copy, but ${SNAP} is gone" >&2
+            exit 1
+        fi
+    else
+        SNAP="${OUT}/code/${JOBNUM}"
+        rm -rf "${SNAP}"
+    fi
+    if [ ! -d "${SNAP}" ]; then
+        mkdir -p "${SNAP}"
+        cp -a specforge configs scripts "${SNAP}/" || { echo "[train] ERROR: cannot copy the code to ${SNAP}" >&2; exit 1; }
+        { git log -1 --format='%H %cd' && git status --short; } > "${SNAP}/GIT_HEAD" 2> /dev/null
+    fi
     cd "${SNAP}" || exit 1
     export PYTHONPATH="${SNAP}${PYTHONPATH:+:${PYTHONPATH}}"
 fi
+python3 -m pip freeze > "${OUT}/logs/env_${JOBNUM}.txt" 2> /dev/null
 
+if [ -n "${SEGMENT_EPOCHS:-}" ]; then
+    # continue_from checks the model, batch and step horizon, not the data:
+    # every segment must train on the files segment 0 saw (path, size, mtime)
+    python3 - "${SEG_DIR}/data.json" "${SEGMENT}" "${DATA_PATH}" "${SCORE_PATH}" <<'PY' || exit 1
+import glob, json, os, sys
+record, seg, data, scores = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+files = [data]
+if os.path.isdir(scores):
+    files += sorted(f for f in glob.glob(os.path.join(scores, "*.jsonl")) if not os.path.basename(f).startswith("."))
+elif scores:
+    files.append(scores)
+now = [[f, os.stat(f).st_size, os.stat(f).st_mtime_ns] for f in files]
+if seg == 0:
+    os.makedirs(os.path.dirname(record), exist_ok=True)
+    with open(record, "w") as handle:
+        json.dump(now, handle, indent=1)
+    print(f"[train] segment 0 recorded the chain's {len(now)} data file(s) in {record}")
+    sys.exit(0)
+if not os.path.isfile(record):
+    sys.exit(f"[train] ERROR: no record of segment 0's data files ({record})")
+with open(record) as handle:
+    then = json.load(handle)
+if then != now:
+    changed = [f"{a} -> {b}" for a, b in zip(then, now) if a != b] or [f"{len(then)} -> {len(now)} file(s)"]
+    sys.exit("[train] ERROR: the data differs from segment 0's: " + "; ".join(map(str, changed[:4])))
+print(f"[train] data unchanged since segment 0 ({len(now)} file(s))")
+PY
+fi
 echo "[train] config=${CONFIG}; code $(pwd)"
 [ -n "${SEG_NOTE}" ] && echo "[train] ${SEG_NOTE}"
 [ "${#EXTRA[@]}" -gt 0 ] && echo "[train] extra overrides: ${EXTRA[*]}"
@@ -270,24 +335,32 @@ nvidia-smi --query-gpu=index,name,memory.total,compute_mode --format=csv,noheade
 GPU_LOG="${OUT}/logs/gpu_${JOBNUM}.log"
 (
     while true; do
-        echo "$(date '+%F %T') $(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader | tr '\n' ';') | $(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader | tr '\n' ';')"
+        # per process: the card's uuid (matching the per-GPU part) and the name
+        echo "$(date '+%F %T') $(nvidia-smi --query-gpu=index,uuid,memory.used,utilization.gpu --format=csv,noheader | tr '\n' ';') | $(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader | tr '\n' ';')"
         sleep 60
     done
 ) > "${GPU_LOG}" 2>&1 &
 GPU_LOG_PID=$!
 
 python3 -c "import specforge; print('[train] specforge from', specforge.__file__)"
+JOB_T0=$(date +%s)
 python3 -m specforge.cli train --config "${CONFIG}" "${OVERRIDES[@]}" > "${LOG}" 2>&1
 status=$?
 kill "${GPU_LOG_PID}" 2> /dev/null
 echo "[train] $(date '+%F %T') training exited ${status}"
-if [ "${status}" = 0 ] && [ -n "${SEGMENT_EPOCHS:-}" ]; then
+if [ -n "${SEGMENT_EPOCHS:-}" ]; then
     # keep this segment's final checkpoint out of reach of max_checkpoints
-    # rotation (hardlinks: no extra space) and record it for the next segment
-    python3 - "${OUT}" "${RUN_ID}" "${SEG_DIR}" "${SEGMENT}" "${SEG_START}" "${SEG_END}" "${PBS_JOBID:-local}" <<'PY' || status=1
+    # rotation (hardlinks: no extra space) and record it for the next segment.
+    # A non-zero exit still counts when this job closed the stream and saved
+    # its final checkpoint and only the end-of-stream cleanup failed
+    # (Mooncake could not drain pending removals): the checkpoint is complete,
+    # and failing here would make PBS drop the rest of an afterok chain.
+    if python3 - "${OUT}" "${RUN_ID}" "${SEG_DIR}" "${SEGMENT}" "${SEG_START}" "${SEG_END}" "${PBS_JOBID:-local}" \
+        "${status}" "${JOB_T0}" "${CONTROL}" <<'PY'
 import json, os, re, subprocess, sys, time
 import torch
-out, run_id, seg_dir, seg, start, end, job = sys.argv[1:]
+out, run_id, seg_dir, seg, start, end, job, status, t0, control = sys.argv[1:]
+status = int(status)
 latest = os.path.realpath(os.path.join(out, f"{run_id}-latest"))
 match = re.search(r"-step(\d+)$", latest)
 if not match or not os.path.isfile(os.path.join(latest, "training_state.pt")):
@@ -296,20 +369,49 @@ state = torch.load(os.path.join(latest, "training_state.pt"), map_location="cpu"
 if state.get("epoch") != 1 or state.get("epoch_samples"):
     sys.exit(f"[train] ERROR: {latest} records epoch={state.get('epoch')} "
              f"epoch_samples={state.get('epoch_samples')}, not a closed stream")
+step = int(match.group(1))
+note = None
+if status != 0:
+    if os.path.getmtime(os.path.join(latest, "training_state.pt")) < float(t0):
+        sys.exit(f"[train] ERROR: training exited {status} and {latest} predates this job")
+    prev = os.path.join(seg_dir, f"segment{int(seg) - 1}.json")
+    if int(seg) > 0 and os.path.isfile(prev):
+        with open(prev) as handle:
+            if step <= int(json.load(handle)["global_step"]):
+                sys.exit(f"[train] ERROR: training exited {status}; {latest} is not past segment {int(seg) - 1}")
+    sentinel = os.path.join(control, "refs.jsonl.")
+    failed = ""
+    if os.path.isfile(sentinel + "consumer_failed"):
+        with open(sentinel + "consumer_failed", errors="replace") as handle:
+            failed = handle.read(400).strip()
+    if failed and not failed.startswith("RuntimeError: online consumer could not drain"):
+        sys.exit(f"[train] ERROR: training exited {status}; the consumer failed: {failed}")
+    if not failed and not os.path.isfile(sentinel + "consumer_done"):
+        sys.exit(f"[train] ERROR: training exited {status} and the consumer never reported done")
+    note = (f"training exited {status} after the final checkpoint; tolerated the end-of-stream cleanup failure: "
+            + (failed or "consumer_done published, the producer's cleanup failed"))
+    print(f"[train] WARNING: {note}")
 final = os.path.join(seg_dir, f"segment{seg}-final")
 os.makedirs(seg_dir, exist_ok=True)
 if os.path.exists(final):
     subprocess.run(["rm", "-rf", final], check=True)
 subprocess.run(["cp", "-al", latest, final], check=True)
-record = {"checkpoint": final, "source": latest, "global_step": int(match.group(1)),
+record = {"checkpoint": final, "source": latest, "global_step": step,
           "epochs": [int(start), int(end)], "job": job,
           "finished_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+if note:
+    record["note"] = note
 tmp = os.path.join(seg_dir, f"segment{seg}.json.tmp")
 with open(tmp, "w") as handle:
     json.dump(record, handle, indent=2)
 os.replace(tmp, os.path.join(seg_dir, f"segment{seg}.json"))
 print(f"[train] segment {seg} done at global_step {record['global_step']}: {final}")
 PY
+    then
+        status=0
+    elif [ "${status}" = 0 ]; then
+        status=1
+    fi
 fi
 tail -n 40 "${LOG}"
 exit "${status}"

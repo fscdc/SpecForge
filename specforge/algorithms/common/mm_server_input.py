@@ -54,12 +54,14 @@ VISUAL_SCORE_RECORD_KEY = "_visual_score"
 def _wants_visual_score(config: Any) -> bool:
     """Whether the run's strategy consumes the ``visual_score`` channel.
 
-    Only MMFlash lists it in its capture layout, and the capture adapter
-    refuses a payload that lacks a listed key, so an MMFlash run must always
-    carry the channel -- with or without a sidecar. Other image strategies do
-    not list it and should not pay for a third per-token array in memory.
+    Only MMFlash and MMDomino (Domino's drafter on the MMFlash objective)
+    list it in their capture layout, and the capture adapter refuses a payload
+    that lacks a listed key, so such a run must always carry the channel --
+    with or without a sidecar. Other image strategies do not list it and should
+    not pay for a third per-token array in memory.
     """
-    return getattr(getattr(config, "training", None), "strategy", None) == "mmflash"
+    strategy = getattr(getattr(config, "training", None), "strategy", None)
+    return strategy in ("mmflash", "mmdomino")
 
 
 def _encode_worker(record: Mapping[str, Any]):
@@ -305,6 +307,23 @@ class ImageServerInputAdapter:
                 ),
                 flush=True,
             )
+        limit = getattr(config.data, "visual_score_max_unscored_frac", None)
+        if limit is not None and getattr(config.data, "visual_score_path", ""):
+            raw_image_rows = join_counts.get("image_scored", 0) + join_counts.get("image_missing", 0)
+            if raw_image_rows and not image_rows:
+                raise ValueError(
+                    f"[visual-score] none of the {raw_image_rows} image rows survived "
+                    "encoding: are the image paths readable on this machine? (rows whose "
+                    "image cannot be opened are dropped)"
+                )
+            unscored = visual_counts.get("missing", 0) + visual_counts.get("misaligned", 0)
+            if unscored > limit * image_rows:
+                raise ValueError(
+                    f"[visual-score] {unscored} of the {image_rows} kept image rows "
+                    f"({unscored / max(image_rows, 1):.2%}) have no usable sidecar entry, "
+                    f"more than data.visual_score_max_unscored_frac={limit}: finish the "
+                    "scoring pass (or re-score with this run's tokenisation) first"
+                )
 
     # -- request construction -------------------------------------------------
     def build_request_inputs(

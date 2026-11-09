@@ -1,0 +1,100 @@
+# Domino drafter (DFlash backbone + GRU logits correction) for Qwen3.5-4B,
+# trained with the MMFlash objective on the MMFlash data: same regen corpus,
+# visual-KL sidecar and training recipe as qwen3.5-4b-mmflash_hpc.yaml, with
+# Domino's draft config and lambda_base schedule. Launch (repo root):
+#
+#   qsub -l select=1:ncpus=24:mem=200gb:ngpus=2 -l walltime=144:00:00 \
+#        -v CONFIG=scripts/mmtraining_configs/qwen3.5-4b-mmdomino_hpc.yaml \
+#        scripts/train_mmflash_video_hpc.sh
+#
+# Domino baseline on the same data (the plain Domino objective, bit for bit):
+#   -v CONFIG=...,EXTRA_OVERRIDES="training.loss_type=dflash training.visual_alpha=0 run_id=qwen3.5-4b-domino-llava-ov15-1M output_dir=<dir> deployment.disaggregated.control_dir=<dir>/control deployment.disaggregated.consumer_state_dir=<dir>/consumer-state"
+model:
+  target_model_path: "Qwen/Qwen3.5-4B"
+  # DominoDraftModel on the MMFlash backbone (5 layers, target layers
+  # [1, 8, 15, 22, 29], block 16, as configs/qwen3.5-4b-mmflash.json) with
+  # Domino's head from configs/qwen3.5-4b-domino.json (whose layer 31 SGLang
+  # cannot capture for Qwen3.5): GRU 1024 + 256-d projection, pure prefix 1,
+  # shift_label (all 16 slots predict)
+  draft_model_config: "configs/qwen3.5-4b-mmdomino.json"
+  target_backend: sglang
+  # image+text capture: routes prompt building and server requests through the
+  # multimodal ServerInputAdapter. Requires a vision-language target model.
+  input_modality: image
+  trust_remote_code: true
+  # A VL checkpoint nests the text stack under model.language_model.* (the
+  # vision tower lives in model.visual.*), so the text-only key does not exist.
+  # lm_head_key is unused here because the model ties word embeddings.
+  embedding_key: "model.language_model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+data:
+  train_data_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/regen_data/qwen35-4B_llava-ov15-1M-prompted_regen_first_turn.jsonl"
+  max_length: 4096
+  chat_template: "qwen3.5"
+  build_dataset_num_proc: 32
+  cache_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/.cache"
+  # Per-token visual-grounding scores written by scripts/score_visual_kl_hpc.sh
+  # for THIS train_data_path (shared with the MMFlash run). Empty: g=0
+  # everywhere, i.e. the plain loss_type objective on every row.
+  visual_score_path: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/visual_kl/llava-ov15-1M-prompted"
+  visual_score_transform: "quantile"   # quantile | saturate | binary | identity
+  visual_score_confidence_gate: true
+training:
+  strategy: "mmdomino"
+  # Domino's loss, (1 - lambda_base) * L_final + lambda_base * L_base, with
+  # every term weighted per token as in MMFlash:
+  #   w = base * (1 + visual_alpha * g * (1 - p)),  L = sum(w * ce) / bsz
+  # p is the probability of the head the term trains (final = GRU-corrected
+  # logits that draft at inference, base = backbone logits); base = "mmflash"
+  # is the prefix confidence prod_{i<=k} ((1-s) p_i + s), s = mmflash_smoothing.
+  # loss_type "dflash" + visual_alpha 0 is the original Domino objective.
+  loss_type: "mmflash"
+  # mmflash_smoothing: 0.5
+  visual_alpha: 1.0
+  # lambda_base: 1 -> 0 linearly over decay_ratio of all steps (Domino recipe)
+  lambda_base_start: 1.0
+  lambda_base_decay_ratio: 1.0
+  num_epochs: 6
+  # max_steps: 1000 # set for testing, comment out for full training
+  batch_size: 2
+  accumulation_steps: 4
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  attention_backend: "flex_attention"
+  num_anchors: 512
+  loss_decay_gamma: 7
+  save_interval: 10000
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: "tensorboard"
+run_id: "qwen3.5-4b-mmdomino-llava-ov15-1M"
+output_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmdomino-llava-ov15-1M"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1 # @sicheng: same as gpu count
+  disaggregated:
+    control_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmdomino-llava-ov15-1M/control"
+    consumer_state_dir: "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/outputs/qwen3.5-4b-mmdomino-llava-ov15-1M/consumer-state"
+    backend: mooncake
+    # managed_local: the CLI supervises Mooncake and the SGLang capture server
+    # itself, so nothing has to be started by hand. It derives the server URLs
+    # and Mooncake endpoints, which is why none of them may be set here.
+    managed_local:
+      # trainer (consumer) GPUs — must stay disjoint from the capture server's
+      trainer_cuda_visible_devices:
+        - "1"
+      mooncake:
+        protocol: tcp
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices:
+            - "0"
+          tp_size: 1
+          mem_fraction_static: 0.80

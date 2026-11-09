@@ -110,6 +110,25 @@ class TestEncodeWorkerVisualChannel(unittest.TestCase):
         self.assertIs(untouched, records)
         self.assertEqual(counts, {})
 
+    def test_unscored_share_gate_refuses_only_when_set(self):
+        report = mm_server_input.ImageServerInputAdapter._report_visual_scores
+        cfg = _config()
+        cfg.data.visual_score_path = "/sidecar"
+        join = {"image_scored": 998, "image_missing": 2, "text_only": 500}
+        two_missing = {"scored": 998, "missing": 2, "text_only": 500}
+        report(cfg, join, two_missing, 1500)  # no limit configured: report only
+        cfg.data.visual_score_max_unscored_frac = 0.002
+        report(cfg, join, two_missing, 1500)  # 2 of 1000 is within 0.2%
+        three_bad = {"scored": 997, "missing": 2, "misaligned": 1, "text_only": 500}
+        with self.assertRaisesRegex(ValueError, "no usable sidecar entry"):
+            report(cfg, join, three_bad, 1500)
+        # every image row dropped at encode time (unreadable image paths)
+        with self.assertRaisesRegex(ValueError, "survived"):
+            report(cfg, join, {"text_only": 500}, 500)
+        # without a sidecar the plain objective is deliberate: nothing to gate
+        cfg.data.visual_score_path = ""
+        report(cfg, join, {"missing": 1000, "text_only": 500}, 1500)
+
 
 if __name__ == "__main__":
     unittest.main()

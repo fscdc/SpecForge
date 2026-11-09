@@ -1,0 +1,1069 @@
+diff --git a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+index 19eded7..d2236e2 100644
+--- a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+@@ -802,12 +802,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
+                 ):
+                     kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
+ 
+-                return forward(
++                out = forward(
+                     forward_batch.input_ids,
+                     forward_batch.positions,
+                     forward_batch,
+                     **kwargs,
+                 )
++                # Draft heads folded into the captured graph (DFLASH Domino rollout).
++                for capture_hook in getattr(
++                    self.model_runner, "capture_tail_hooks", ()
++                ):
++                    capture_hook(self, out, forward_batch, num_tokens)
++                return out
+ 
+             self.deepep_adapter.capture(is_extend_in_batch=False)
+             canary_ctx = (
+diff --git a/python/sglang/srt/models/dflash.py b/python/sglang/srt/models/dflash.py
+index a8b2aee..0c99ff4 100644
+--- a/python/sglang/srt/models/dflash.py
++++ b/python/sglang/srt/models/dflash.py
+@@ -348,6 +348,31 @@ class DFlashDraftModel(nn.Module):
+         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+ 
+         self.block_size = draft_config.resolve_block_size(default=16)
++        self.projector_type = draft_config.projector_type
++        self.shift_label = draft_config.shift_label
++        self.prefix_gru: Optional[nn.GRU] = None
++        self.embed_proj: Optional[nn.Sequential] = None
++        if draft_config.is_domino:
++            assert draft_config.gru_hidden_dim is not None
++            assert draft_config.emb_dim is not None
++            self.prefix_gru = nn.GRU(
++                input_size=hidden_size,
++                hidden_size=int(draft_config.gru_hidden_dim),
++                num_layers=1,
++                batch_first=True,
++                bias=False,
++            )
++            self.embed_proj = nn.Sequential(
++                nn.Linear(
++                    hidden_size + int(draft_config.gru_hidden_dim),
++                    int(draft_config.emb_dim),
++                    bias=False,
++                ),
++                nn.SiLU(),
++                nn.Linear(
++                    int(draft_config.emb_dim), int(config.vocab_size), bias=False
++                ),
++            )
+ 
+     def get_attention_sliding_window_size(self) -> Optional[int]:
+         return get_dflash_attention_sliding_window_size(self.config)
+@@ -410,6 +435,7 @@ class DFlashDraftModel(nn.Module):
+         ]
+ 
+         params_dict = dict(self.named_parameters())
++        loaded_params = set()
+ 
+         def resolve_param_name(name: str) -> Optional[str]:
+             if name in params_dict:
+@@ -425,6 +451,14 @@ class DFlashDraftModel(nn.Module):
+             return None
+ 
+         for name, loaded_weight in weights:
++            unprefixed_name = name.removeprefix("model.")
++            if self.projector_type != "domino" and unprefixed_name.startswith(
++                ("prefix_gru.", "embed_proj.")
++            ):
++                raise ValueError(
++                    "DFLASH checkpoint contains Domino projector weights but "
++                    f"projector_type={self.projector_type!r}."
++                )
+             for param_name, weight_name, shard_id in stacked_params_mapping:
+                 if f".{weight_name}." not in name:
+                     continue
+@@ -435,13 +469,30 @@ class DFlashDraftModel(nn.Module):
+                 param = params_dict[resolved_name]
+                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                 weight_loader(param, loaded_weight, shard_id)
++                loaded_params.add(resolved_name)
+                 break
+             else:
+                 resolved_name = resolve_param_name(name)
+                 if resolved_name is None:
++                    if unprefixed_name.startswith(("prefix_gru.", "embed_proj.")):
++                        # The Domino head here is a 1-layer bias-free GRU and a
++                        # bias-free embed_proj; any other projector tensor means
++                        # a head this model cannot reproduce.
++                        raise ValueError(
++                            "DFLASH Domino checkpoint has an unexpected projector "
++                            f"weight {name!r} {tuple(loaded_weight.shape)}."
++                        )
+                     # Ignore unexpected weights (e.g., HF rotary caches).
+                     continue
+                 param = params_dict[resolved_name]
++                if resolved_name.startswith(("prefix_gru.", "embed_proj.")) and tuple(
++                    loaded_weight.shape
++                ) != tuple(param.shape):
++                    raise ValueError(
++                        "DFLASH Domino projector weight shape mismatch: "
++                        f"expected {resolved_name}{tuple(param.shape)}, got "
++                        f"{tuple(loaded_weight.shape)} from {name!r}."
++                    )
+                 if resolved_name.endswith("fc.weight") and tuple(
+                     loaded_weight.shape
+                 ) != tuple(param.shape):
+@@ -454,6 +505,21 @@ class DFlashDraftModel(nn.Module):
+                     )
+                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                 weight_loader(param, loaded_weight)
++                loaded_params.add(resolved_name)
++
++        if self.projector_type == "domino":
++            required = {
++                "prefix_gru.weight_ih_l0",
++                "prefix_gru.weight_hh_l0",
++                "embed_proj.0.weight",
++                "embed_proj.2.weight",
++            }
++            missing = required - loaded_params
++            if missing:
++                raise ValueError(
++                    "DFLASH Domino checkpoint is missing required projector weights: "
++                    f"{sorted(missing)}."
++                )
+ 
+ 
+ EntryClass = DFlashDraftModel
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index c7162c1..6f1080f 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -1481,6 +1481,10 @@ class ServerArgs:
+         Optional[int],
+         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+     ] = None
++    speculative_domino_candidate_pool_size: A[
++        int,
++        "Domino only. Size of the approximate block-shared base-logit candidate pool. Set to 0 to score the full vocabulary.",
++    ] = 2048
+     speculative_accept_threshold_single: A[
+         float,
+         "Accept a draft token if its probability in the target model is greater than this threshold.",
+diff --git a/python/sglang/srt/speculative/dflash_utils.py b/python/sglang/srt/speculative/dflash_utils.py
+index e63efe4..d099d4a 100644
+--- a/python/sglang/srt/speculative/dflash_utils.py
++++ b/python/sglang/srt/speculative/dflash_utils.py
+@@ -423,6 +423,15 @@ class DFlashDraftConfig:
+     target_layer_ids: Optional[List[int]]
+     mask_token: str
+     mask_token_id: Optional[int]
++    projector_type: Optional[str]
++    shift_label: Optional[bool]
++    pure_draft_prefix_len: Optional[int]
++    gru_hidden_dim: Optional[int]
++    emb_dim: Optional[int]
++
++    @property
++    def is_domino(self) -> bool:
++        return self.projector_type == "domino"
+ 
+     def require_num_layers(self) -> int:
+         if self.num_hidden_layers is None:
+@@ -541,6 +550,72 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
+                 f"got {mask_token_id}."
+             )
+ 
++    projector_type = dflash_cfg.get(
++        "projector_type", _cfg_get(draft_hf_config, "projector_type", None)
++    )
++    shift_label = None
++    pure_draft_prefix_len = None
++    gru_hidden_dim = None
++    emb_dim = None
++    if projector_type == "domino":
++        shift_label = dflash_cfg.get(
++            "shift_label", _cfg_get(draft_hf_config, "shift_label", None)
++        )
++        pure_draft_prefix_len = _parse_optional_int(
++            dflash_cfg.get(
++                "pure_draft_prefix_len",
++                _cfg_get(draft_hf_config, "pure_draft_prefix_len", None),
++            ),
++            field_name="DFLASH Domino pure_draft_prefix_len",
++            min_value=0,
++        )
++        gru_hidden_dim = _parse_optional_int(
++            dflash_cfg.get(
++                "gru_hidden_dim", _cfg_get(draft_hf_config, "gru_hidden_dim", None)
++            ),
++            field_name="DFLASH Domino gru_hidden_dim",
++            min_value=1,
++        )
++        nested_emb_dim = _parse_optional_int(
++            dflash_cfg.get("emb_dim", None),
++            field_name="DFLASH Domino dflash_config.emb_dim",
++            min_value=1,
++        )
++        top_level_emb_dim = _parse_optional_int(
++            _cfg_get(draft_hf_config, "emb_dim", None),
++            field_name="DFLASH Domino top-level emb_dim",
++            min_value=1,
++        )
++        if (
++            nested_emb_dim is not None
++            and top_level_emb_dim is not None
++            and nested_emb_dim != top_level_emb_dim
++        ):
++            raise ValueError(
++                "DFLASH Domino emb_dim differs between dflash_config and the "
++                f"top-level config: {nested_emb_dim} != {top_level_emb_dim}."
++            )
++        emb_dim = nested_emb_dim if nested_emb_dim is not None else top_level_emb_dim
++
++        if not isinstance(shift_label, bool):
++            raise ValueError(
++                "DFLASH Domino requires dflash_config.shift_label to be a bool, "
++                f"got {shift_label!r}."
++            )
++        if pure_draft_prefix_len != 1:
++            raise ValueError(
++                "DFLASH Domino currently requires pure_draft_prefix_len=1, "
++                f"got {pure_draft_prefix_len!r}."
++            )
++        if gru_hidden_dim is None:
++            raise ValueError("DFLASH Domino requires dflash_config.gru_hidden_dim.")
++        if emb_dim is None:
++            raise ValueError("DFLASH Domino requires dflash_config.emb_dim.")
++        if block_size is not None and block_size <= 1:
++            raise ValueError(
++                f"DFLASH Domino requires block_size > 1, got {block_size}."
++            )
++
+     return DFlashDraftConfig(
+         num_hidden_layers=num_hidden_layers,
+         num_target_layers=num_target_layers,
+@@ -548,6 +623,11 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
+         target_layer_ids=parsed_target_layer_ids,
+         mask_token=mask_token,
+         mask_token_id=mask_token_id,
++        projector_type=projector_type,
++        shift_label=shift_label,
++        pure_draft_prefix_len=pure_draft_prefix_len,
++        gru_hidden_dim=gru_hidden_dim,
++        emb_dim=emb_dim,
+     )
+ 
+ 
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index c92a5d7..4a932df 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -6,9 +6,11 @@ from typing import List, Optional
+ import torch
+ 
+ from sglang.srt.distributed import get_tp_group
++from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+ from sglang.srt.managers.schedule_batch import ScheduleBatch
+ from sglang.srt.managers.scheduler import GenerationBatchResult
+ from sglang.srt.managers.tp_worker import TpModelWorker
++from sglang.srt.model_executor.cuda_graph_config import Backend
+ from sglang.srt.model_executor.forward_batch_info import (
+     CaptureHiddenMode,
+     ForwardBatch,
+@@ -31,6 +33,10 @@ from sglang.srt.speculative.dflash_utils import (
+     is_dflash_sampling_verify_available,
+     parse_dflash_draft_config,
+ )
++from sglang.srt.speculative.domino_utils import (
++    domino_greedy_rollout,
++    validate_domino_runtime,
++)
+ from sglang.srt.speculative.eagle_info_v2 import assign_extend_cache_locs_func
+ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+ from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+@@ -40,7 +46,13 @@ from sglang.srt.speculative.triton_ops.dflash_accept_bonus import (
+ from sglang.srt.speculative.triton_ops.dflash_prepare_block import (
+     _prepare_dflash_draft_block_unchecked,
+ )
+-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
++from sglang.srt.utils import (
++    get_available_gpu_memory,
++    get_bool_env_var,
++    is_cuda,
++    is_hip,
++    is_npu,
++)
+ 
+ _is_npu = is_npu()
+ 
+@@ -61,6 +73,97 @@ def _get_fused_kv_materialize_helper():
+     return _FusedKVMaterializeHelper
+ 
+ 
++class _DominoDraftSampler:
++    """Capture-safe Domino rollout over a fixed-size draft block."""
++
++    def __init__(
++        self,
++        *,
++        target_embedding,
++        lm_head_weight,
++        prefix_gru,
++        embed_proj,
++        vocab_size,
++        block_size,
++        shift_label,
++        max_bs,
++        candidate_pool_size=2048,
++        tp_group=None,
++        lm_head_org_vocab_start=0,
++        lm_head_num_org=None,
++        lm_head_num_org_padded=None,
++    ):
++        self.target_embedding = target_embedding
++        self.lm_head_weight = lm_head_weight
++        self.prefix_gru = prefix_gru
++        self.embed_proj = embed_proj
++        self.vocab_size = int(vocab_size)
++        self.block_size = int(block_size)
++        self.shift_label = bool(shift_label)
++        self.candidate_pool_size = int(candidate_pool_size)
++        self.tp_group = tp_group
++        self.lm_head_org_vocab_start = int(lm_head_org_vocab_start)
++        self.lm_head_num_org = lm_head_num_org
++        self.lm_head_num_org_padded = lm_head_num_org_padded
++        max_tokens = int(max_bs) * (self.block_size - 1)
++        self.out = torch.empty(
++            (max_tokens,), dtype=torch.int64, device=lm_head_weight.device
++        )
++
++    def __call__(self, hidden_states, input_ids=None):
++        if input_ids is None:
++            raise RuntimeError("Domino draft sampler requires block input_ids.")
++        bs = hidden_states.shape[0] // self.block_size
++        draft_hidden = hidden_states.view(bs, self.block_size, -1)
++        verified_ids = input_ids.view(bs, self.block_size)[:, 0]
++        proposals = domino_greedy_rollout(
++            draft_hidden=draft_hidden,
++            verified_ids=verified_ids,
++            target_embedding=self.target_embedding,
++            lm_head_weight=self.lm_head_weight,
++            prefix_gru=self.prefix_gru,
++            embed_proj=self.embed_proj,
++            vocab_size=self.vocab_size,
++            shift_label=self.shift_label,
++            candidate_pool_size=self.candidate_pool_size,
++            tp_group=self.tp_group,
++            lm_head_org_vocab_start=self.lm_head_org_vocab_start,
++            lm_head_num_org=self.lm_head_num_org,
++            lm_head_num_org_padded=self.lm_head_num_org_padded,
++            prefer_tp_candidate_pool=bs > 1,
++        )
++        self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
++
++
++def _make_draft_sampler_capture_hook(draft_sampler):
++    """Run ``draft_sampler`` at the tail of every captured draft forward."""
++
++    def capture_hook(runner, out, forward_batch, num_tokens):
++        del runner, num_tokens
++        if not isinstance(out, LogitsProcessorOutput) or out.hidden_states is None:
++            raise RuntimeError(
++                "draft sampler set but the draft forward has no "
++                "hidden_states to capture into the graph."
++            )
++        draft_sampler(out.hidden_states, forward_batch.input_ids)
++
++    return capture_hook
++
++
++def _domino_lm_head_shard_kwargs(lm_head) -> dict:
++    """Vocab-shard metadata of the target lm_head for the Domino rollout."""
++    shard = getattr(lm_head, "shard_indices", None)
++    return dict(
++        lm_head_org_vocab_start=(
++            int(shard.org_vocab_start_index) if shard is not None else 0
++        ),
++        lm_head_num_org=(int(shard.num_org_elements) if shard is not None else None),
++        lm_head_num_org_padded=(
++            int(shard.num_org_elements_padded) if shard is not None else None
++        ),
++    )
++
++
+ class DFlashWorkerV2(BaseSpecWorker):
+     """DFLASH speculative decoding worker (spec-v2).
+ 
+@@ -166,6 +269,41 @@ class DFlashWorkerV2(BaseSpecWorker):
+         draft_config = parse_dflash_draft_config(
+             draft_hf_config=self.draft_model_runner.model_config.hf_config
+         )
++        # Built in init_cuda_graphs when the Domino rollout is captured.
++        self._draft_sampler: Optional[_DominoDraftSampler] = None
++        self._is_domino = draft_config.is_domino
++        self.domino_candidate_pool_size = 0
++        if self._is_domino:
++            # Read only for Domino, so other drafts never depend on the flag.
++            self.domino_candidate_pool_size = int(
++                getattr(server_args, "speculative_domino_candidate_pool_size", 2048)
++            )
++            if self.domino_candidate_pool_size < 0:
++                raise ValueError(
++                    "--speculative-domino-candidate-pool-size must be non-negative, "
++                    f"got {self.domino_candidate_pool_size}."
++                )
++            target_model = self.target_worker.model_runner.model
++            target_embedding = target_model.get_input_embeddings()
++            lm_head = getattr(target_model, "lm_head", None)
++            prefix_gru = getattr(self.draft_model, "prefix_gru", None)
++            embed_proj = getattr(self.draft_model, "embed_proj", None)
++            if lm_head is None or prefix_gru is None or embed_proj is None:
++                raise ValueError(
++                    "DFLASH Domino requires target lm_head and loaded Domino projector modules."
++                )
++            validate_domino_runtime(
++                device=torch.device(self.device),
++                tp_size=int(get_tp_group().world_size),
++                tp_rank=int(self.tp_rank),
++                target_vocab_size=int(self.model_runner.model_config.vocab_size),
++                draft_vocab_size=int(self.draft_model_runner.model_config.vocab_size),
++                hidden_size=int(self.draft_model.config.hidden_size),
++                target_embedding=target_embedding,
++                lm_head=lm_head,
++                prefix_gru=prefix_gru,
++                embed_proj=embed_proj,
++            )
+         if server_args.speculative_num_draft_tokens is None:
+             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
+             self.block_size = int(draft_config.resolve_block_size(default=16))
+@@ -183,6 +321,11 @@ class DFlashWorkerV2(BaseSpecWorker):
+                     model_block_size,
+                 )
+         self.speculative_num_draft_tokens = int(self.block_size)
++        if self._is_domino and self.block_size <= 1:
++            raise ValueError(
++                "DFLASH Domino requires speculative_num_draft_tokens > 1, "
++                f"got {self.block_size}."
++            )
+ 
+         self._mask_token = draft_config.mask_token
+         self._mask_token_id_override = draft_config.mask_token_id
+@@ -199,6 +342,13 @@ class DFlashWorkerV2(BaseSpecWorker):
+                 self.draft_window_size,
+                 self.use_compact_draft_cache,
+             )
++            if self._is_domino:
++                logger.info(
++                    "DFLASH Domino rollout enabled (BF16 greedy, TP=%s, shift_label=%s, block-shared candidate pool size=%s).",
++                    int(get_tp_group().world_size),
++                    self.draft_model.shift_label,
++                    self.domino_candidate_pool_size,
++                )
+             logger.info(
+                 "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
+                 self._mask_token,
+@@ -307,10 +457,66 @@ class DFlashWorkerV2(BaseSpecWorker):
+                     "memory is available after target backend initialization.",
+                     available_mem,
+                 )
++        if capture_decode_cuda_graph and self._is_domino:
++            # Must run before capture so the draft graph folds the rollout in.
++            self._draft_sampler = self._maybe_build_domino_draft_sampler()
++            if self._draft_sampler is not None:
++                capture_tail_hooks = getattr(
++                    self.draft_model_runner, "capture_tail_hooks", None
++                )
++                if capture_tail_hooks is None:
++                    capture_tail_hooks = []
++                    self.draft_model_runner.capture_tail_hooks = capture_tail_hooks
++                capture_tail_hooks.append(
++                    _make_draft_sampler_capture_hook(self._draft_sampler)
++                )
+         self._draft_worker.init_cuda_graphs(
+             capture_decode_cuda_graph=capture_decode_cuda_graph
+         )
+ 
++    def _maybe_build_domino_draft_sampler(self) -> Optional[_DominoDraftSampler]:
++        def _eager(reason):
++            if self.tp_rank == 0:
++                logger.info("DFLASH Domino rollout kept eager (reason=%s).", reason)
++            return None
++
++        if get_bool_env_var("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER"):
++            return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
++        if self.server_args.cuda_graph_config.decode.backend == Backend.DISABLED:
++            return _eager("decode cuda graph disabled")
++        if self.block_size <= 1:
++            return _eager("block_size<=1")
++        target_model = self._target_worker.model_runner.model
++        lm_head = getattr(target_model, "lm_head", None)
++        if lm_head is None or not hasattr(lm_head, "weight"):
++            return _eager("no target lm_head")
++        if not torch.is_floating_point(lm_head.weight):
++            # Quantized lm_head (FP8/INT) would break the static matmul.
++            return _eager("quantized lm_head")
++        prefix_gru = self.draft_model.prefix_gru
++        embed_proj = self.draft_model.embed_proj
++        if prefix_gru is None or embed_proj is None:
++            return _eager("Domino projector modules are unavailable")
++        tp_group = get_tp_group()
++        if self.tp_rank == 0:
++            logger.info(
++                "DFLASH Domino rollout folded into the draft cuda graph (tp=%s).",
++                int(tp_group.world_size),
++            )
++        return _DominoDraftSampler(
++            target_embedding=target_model.get_input_embeddings(),
++            lm_head_weight=lm_head.weight,
++            prefix_gru=prefix_gru,
++            embed_proj=embed_proj,
++            vocab_size=int(self.model_runner.model_config.vocab_size),
++            block_size=self.block_size,
++            shift_label=self.draft_model.shift_label,
++            max_bs=max(self.server_args.cuda_graph_config.decode.bs),
++            candidate_pool_size=self.domino_candidate_pool_size,
++            tp_group=tp_group,
++            **_domino_lm_head_shard_kwargs(lm_head),
++        )
++
+     def _init_fused_kv_helper(self) -> None:
+         """Initialize the fused KV materialization helper with pre-stacked weights."""
+         try:
+@@ -1482,18 +1688,43 @@ class DFlashWorkerV2(BaseSpecWorker):
+         )
+ 
+         with torch.inference_mode():
+-            draft_logits_output = self.draft_model_runner.forward(
+-                forward_batch
+-            ).logits_output
++            draft_out = self.draft_model_runner.forward(forward_batch)
++        draft_logits_output = draft_out.logits_output
+ 
+         draft_hidden = draft_logits_output.hidden_states
+         if draft_hidden is None:
+             raise RuntimeError("DFLASH draft model returned no hidden states.")
+         draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+-        draft_next = self._greedy_sample_from_vocab_parallel_head(
+-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+-            lm_head=lm_head,
+-        ).view(bs, int(self.block_size) - 1)
++        if (
++            self._is_domino
++            and self._draft_sampler is not None
++            and draft_out.can_run_graph
++        ):
++            # The Domino rollout ran inside the replayed draft cuda graph.
++            draft_next = self._draft_sampler.out[
++                : bs * (int(self.block_size) - 1)
++            ].view(bs, int(self.block_size) - 1)
++        elif self._is_domino:
++            draft_next = domino_greedy_rollout(
++                draft_hidden=draft_hidden,
++                verified_ids=block_ids[:, 0],
++                target_embedding=embed_module,
++                lm_head_weight=lm_head.weight,
++                prefix_gru=self.draft_model.prefix_gru,
++                embed_proj=self.draft_model.embed_proj,
++                vocab_size=int(self.model_runner.model_config.vocab_size),
++                shift_label=bool(self.draft_model.shift_label),
++                candidate_pool_size=self.domino_candidate_pool_size,
++                tp_group=get_tp_group(),
++                **_domino_lm_head_shard_kwargs(lm_head),
++            )
++        else:
++            draft_next = self._greedy_sample_from_vocab_parallel_head(
++                hidden_states=draft_hidden[:, 1:, :].reshape(
++                    -1, draft_hidden.shape[-1]
++                ),
++                lm_head=lm_head,
++            ).view(bs, int(self.block_size) - 1)
+ 
+         draft_tokens = self._draft_block_tokens_buf[:bs]
+         draft_tokens[:, 0].copy_(block_ids[:, 0])
+diff --git a/python/sglang/srt/speculative/domino_utils.py b/python/sglang/srt/speculative/domino_utils.py
+new file mode 100644
+index 0000000..de99f50
+--- /dev/null
++++ b/python/sglang/srt/speculative/domino_utils.py
+@@ -0,0 +1,481 @@
++from __future__ import annotations
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++
++_DOMINO_CANDIDATE_POOL_SIZE = 2048
++# This is a throughput policy for the logical gathered tensor, not a peak-memory cap.
++_DOMINO_TP_FULL_BASE_LOGITS_MAX_BYTES = 96 * 1024 * 1024
++
++
++def _domino_gru_cell(
++    prefix_gru: nn.GRU, input: torch.Tensor, hidden: torch.Tensor
++) -> torch.Tensor:
++    """Run one feedback step without cuDNN's per-call RNN weight packing."""
++    return torch.ops.aten.gru_cell.default(
++        input,
++        hidden,
++        prefix_gru.weight_ih_l0,
++        prefix_gru.weight_hh_l0,
++        prefix_gru.bias_ih_l0 if prefix_gru.bias else None,
++        prefix_gru.bias_hh_l0 if prefix_gru.bias else None,
++    )
++
++
++def _domino_tp_first_ids(
++    local_logits: torch.Tensor,
++    *,
++    org_vocab_start: int,
++    num_org: int,
++    tp_group,
++) -> torch.Tensor:
++    """Select the full-vocab first argmax from contiguous vocab shards."""
++    local_max, local_arg = torch.max(local_logits[:, :num_org], dim=-1)
++    local_ids = local_arg.to(torch.int64) + int(org_vocab_start)
++    tp_size = int(tp_group.world_size)
++    batch_size = int(local_logits.shape[0])
++    gathered_max = torch.empty(
++        (tp_size * batch_size,), dtype=local_max.dtype, device=local_max.device
++    )
++    gathered_ids = torch.empty(
++        (tp_size * batch_size,), dtype=torch.int64, device=local_max.device
++    )
++    tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
++    tp_group.all_gather_into_tensor(gathered_ids, local_ids.contiguous())
++    gathered_max = gathered_max.view(tp_size, batch_size)
++    gathered_ids = gathered_ids.view(tp_size, batch_size)
++    best_rank = torch.argmax(gathered_max, dim=0, keepdim=True)
++    return torch.gather(gathered_ids, 0, best_rank).squeeze(0)
++
++
++def _domino_tp_candidate_state(
++    local_feedback_logits: torch.Tensor,
++    *,
++    candidate_pool_size: int,
++    org_vocab_start: int,
++    num_org: int,
++    tp_group,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Build one strict global candidate pool from vocab-sharded base logits."""
++    num_steps, batch_size, local_vocab_size = local_feedback_logits.shape
++    tp_size = int(tp_group.world_size)
++    local_k = min(int(candidate_pool_size), int(local_vocab_size))
++    if int(candidate_pool_size) > tp_size * local_k:
++        raise ValueError("Domino TP shards do not cover the requested candidate pool.")
++
++    pool_scores = local_feedback_logits.amax(dim=0)
++    if num_org < local_vocab_size:
++        pool_scores[:, num_org:].fill_(float("-inf"))
++    local_scores, local_positions = torch.topk(
++        pool_scores, k=local_k, dim=-1, sorted=False
++    )
++    local_ids = local_positions.to(torch.int64) + int(org_vocab_start)
++
++    gathered_scores = torch.empty(
++        (tp_size * batch_size, local_k),
++        dtype=local_scores.dtype,
++        device=local_scores.device,
++    )
++    gathered_ids = torch.empty(
++        (tp_size * batch_size, local_k),
++        dtype=torch.int64,
++        device=local_scores.device,
++    )
++    tp_group.all_gather_into_tensor(gathered_scores, local_scores.contiguous())
++    tp_group.all_gather_into_tensor(gathered_ids, local_ids.contiguous())
++    gathered_scores = (
++        gathered_scores.view(tp_size, batch_size, local_k)
++        .permute(1, 0, 2)
++        .reshape(batch_size, tp_size * local_k)
++    )
++    gathered_ids = (
++        gathered_ids.view(tp_size, batch_size, local_k)
++        .permute(1, 0, 2)
++        .reshape(batch_size, tp_size * local_k)
++    )
++    global_positions = torch.topk(
++        gathered_scores,
++        k=int(candidate_pool_size),
++        dim=-1,
++        sorted=False,
++    ).indices
++    candidate_ids = torch.gather(gathered_ids, 1, global_positions).contiguous()
++
++    owned = (candidate_ids >= int(org_vocab_start)) & (
++        candidate_ids < int(org_vocab_start + num_org)
++    )
++    local_positions = (candidate_ids - int(org_vocab_start)).clamp(
++        0, max(num_org - 1, 0)
++    )
++    candidate_base = torch.gather(
++        local_feedback_logits.transpose(0, 1),
++        2,
++        local_positions[:, None, :].expand(-1, num_steps, -1),
++    )
++    # Each global candidate is owned by exactly one vocab shard, so SUM
++    # reconstructs its base logit without gathering the full vocabulary.
++    candidate_base.masked_fill_(~owned[:, None, :], 0)
++    candidate_base = tp_group.all_reduce(candidate_base.contiguous())
++    return candidate_ids, candidate_base.transpose(0, 1)
++
++
++def validate_domino_runtime(
++    *,
++    device: torch.device,
++    tp_size: int,
++    tp_rank: int,
++    target_vocab_size: int,
++    draft_vocab_size: int,
++    hidden_size: int,
++    target_embedding: nn.Module,
++    lm_head: nn.Module,
++    prefix_gru: nn.GRU,
++    embed_proj: nn.Sequential,
++) -> None:
++    """Validate the deliberately narrow correctness-first Domino runtime."""
++    if device.type != "cuda":
++        raise ValueError(f"DFLASH Domino currently requires CUDA, got {device}.")
++    tp_size = int(tp_size)
++    if tp_size < 1:
++        raise ValueError(f"DFLASH Domino requires TP>=1, got TP={tp_size}.")
++    tp_rank = int(tp_rank)
++    if not 0 <= tp_rank < tp_size:
++        raise ValueError(
++            f"DFLASH Domino requires 0<=TP rank<TP size, got rank={tp_rank}, size={tp_size}."
++        )
++    if int(target_vocab_size) != int(draft_vocab_size):
++        raise ValueError(
++            "DFLASH Domino requires identical target and draft vocab sizes, "
++            f"got target={target_vocab_size}, draft={draft_vocab_size}."
++        )
++
++    embedding_weight = getattr(target_embedding, "weight", None)
++    lm_head_weight = getattr(lm_head, "weight", None)
++    if embedding_weight is None or lm_head_weight is None:
++        raise ValueError(
++            "DFLASH Domino requires target embedding and lm_head weight tensors."
++        )
++
++    lm_head_shard = getattr(lm_head, "shard_indices", None)
++    if lm_head_shard is not None:
++        if (
++            int(getattr(lm_head, "num_added_embeddings", 0)) != 0
++            or int(lm_head_shard.num_added_elements) != 0
++        ):
++            raise ValueError(
++                "DFLASH Domino does not support added-vocab lm_head shards."
++            )
++        if int(getattr(lm_head, "org_vocab_size", target_vocab_size)) != int(
++            target_vocab_size
++        ):
++            raise ValueError(
++                "DFLASH Domino lm_head original vocab size does not match the target."
++            )
++        if int(getattr(lm_head, "tp_size", tp_size)) != tp_size:
++            raise ValueError(
++                "DFLASH Domino lm_head TP size does not match the runtime TP size."
++            )
++        required_shard_fields = (
++            "org_vocab_start_index",
++            "org_vocab_end_index",
++            "num_org_elements",
++            "num_org_elements_padded",
++        )
++        missing_shard_fields = [
++            name for name in required_shard_fields if not hasattr(lm_head_shard, name)
++        ]
++        if missing_shard_fields:
++            raise ValueError(
++                "DFLASH Domino lm_head shard metadata is missing: "
++                + ", ".join(missing_shard_fields)
++            )
++        org_vocab_start = int(lm_head_shard.org_vocab_start_index)
++        org_vocab_end = int(lm_head_shard.org_vocab_end_index)
++        num_org = int(lm_head_shard.num_org_elements)
++        num_org_padded = int(lm_head_shard.num_org_elements_padded)
++        if (
++            num_org <= 0
++            or org_vocab_start < 0
++            or org_vocab_end != org_vocab_start + num_org
++            or org_vocab_end > int(target_vocab_size)
++            or num_org_padded < num_org
++        ):
++            raise ValueError("DFLASH Domino lm_head original-vocab shard is invalid.")
++        if int(lm_head_weight.shape[0]) < num_org_padded:
++            raise ValueError(
++                "DFLASH Domino lm_head weight is smaller than its padded vocab shard."
++            )
++        expected_start = tp_rank * num_org_padded
++        expected_end = min(expected_start + num_org_padded, int(target_vocab_size))
++        if (
++            org_vocab_start != expected_start
++            or org_vocab_end != expected_end
++            or num_org != expected_end - expected_start
++        ):
++            raise ValueError(
++                "DFLASH Domino lm_head vocab shard does not match its TP rank."
++            )
++    else:
++        if tp_size != 1:
++            raise ValueError("DFLASH Domino requires lm_head shard metadata for TP>1.")
++        if int(lm_head_weight.shape[0]) != int(target_vocab_size):
++            raise ValueError(
++                "DFLASH Domino lm_head row count must equal the target vocab size, "
++                f"got rows={int(lm_head_weight.shape[0])}, vocab={target_vocab_size}."
++            )
++
++    embedding_shard = getattr(target_embedding, "shard_indices", None)
++    if embedding_shard is not None:
++        if (
++            int(getattr(target_embedding, "num_added_embeddings", 0)) != 0
++            or int(embedding_shard.num_added_elements) != 0
++        ):
++            raise ValueError(
++                "DFLASH Domino does not support added-vocab embedding shards."
++            )
++        if int(getattr(target_embedding, "org_vocab_size", target_vocab_size)) != int(
++            target_vocab_size
++        ):
++            raise ValueError(
++                "DFLASH Domino embedding original vocab size does not match the target."
++            )
++        embedding_tp_size = int(getattr(target_embedding, "tp_size", tp_size))
++        if embedding_tp_size not in (1, tp_size):
++            raise ValueError(
++                "DFLASH Domino embedding TP size does not match the runtime TP size."
++            )
++        required_embedding_rows = (
++            int(target_vocab_size)
++            if embedding_tp_size == 1
++            else int(embedding_shard.num_org_elements_padded)
++        )
++        if int(embedding_weight.shape[0]) < required_embedding_rows:
++            raise ValueError(
++                "DFLASH Domino embedding weight is smaller than its padded vocab shard."
++            )
++    elif int(embedding_weight.shape[0]) < int(target_vocab_size):
++        if tp_size != 1:
++            raise ValueError(
++                "DFLASH Domino requires embedding shard metadata for TP>1."
++            )
++        raise ValueError(
++            "DFLASH Domino target embedding has fewer rows than the target vocab "
++            f"size: rows={int(embedding_weight.shape[0])}, vocab={target_vocab_size}."
++        )
++
++    if int(embedding_weight.shape[-1]) != int(hidden_size) or int(
++        lm_head_weight.shape[-1]
++    ) != int(hidden_size):
++        raise ValueError(
++            "DFLASH Domino target embedding/lm_head hidden size does not match "
++            f"the draft hidden size {hidden_size}."
++        )
++    if int(prefix_gru.input_size) != int(hidden_size):
++        raise ValueError(
++            "DFLASH Domino GRU input size does not match the draft hidden size."
++        )
++    if int(embed_proj[0].in_features) != int(hidden_size + prefix_gru.hidden_size):
++        raise ValueError("DFLASH Domino projector input shape is inconsistent.")
++    if int(embed_proj[2].out_features) != int(target_vocab_size):
++        raise ValueError("DFLASH Domino projector output vocab size is inconsistent.")
++
++    weights = (
++        embedding_weight,
++        lm_head_weight,
++        prefix_gru.weight_ih_l0,
++        prefix_gru.weight_hh_l0,
++        embed_proj[0].weight,
++        embed_proj[2].weight,
++    )
++    non_bf16 = [
++        str(weight.dtype) for weight in weights if weight.dtype != torch.bfloat16
++    ]
++    if non_bf16:
++        raise ValueError(
++            "DFLASH Domino currently requires BF16 target and projector weights; "
++            f"found {non_bf16}."
++        )
++
++
++@torch.no_grad()
++def domino_greedy_rollout(
++    *,
++    draft_hidden: torch.Tensor,
++    verified_ids: torch.Tensor,
++    target_embedding: nn.Module,
++    lm_head_weight: torch.Tensor,
++    prefix_gru: nn.GRU,
++    embed_proj: nn.Sequential,
++    vocab_size: int,
++    shift_label: bool,
++    candidate_pool_size: int = _DOMINO_CANDIDATE_POOL_SIZE,
++    tp_group=None,
++    lm_head_org_vocab_start: int = 0,
++    lm_head_num_org: int | None = None,
++    lm_head_num_org_padded: int | None = None,
++    prefer_tp_candidate_pool: bool | None = None,
++) -> torch.Tensor:
++    """Generate a Domino chain using one block-shared base-logit candidate pool."""
++    if draft_hidden.ndim != 3:
++        raise ValueError(
++            f"draft_hidden must have shape [batch, block, hidden], got {tuple(draft_hidden.shape)}."
++        )
++    batch_size, block_size, hidden_size = draft_hidden.shape
++    if verified_ids.shape != (batch_size,):
++        raise ValueError(
++            f"verified_ids must have shape ({batch_size},), got {tuple(verified_ids.shape)}."
++        )
++
++    num_proposals = int(block_size) - 1
++    if num_proposals < 1:
++        raise ValueError(f"Domino requires block_size > 1, got {block_size}.")
++    candidate_pool_size = int(candidate_pool_size)
++    if candidate_pool_size < 0:
++        raise ValueError(
++            "Domino candidate_pool_size must be non-negative, "
++            f"got {candidate_pool_size}."
++        )
++    candidate_pool_size = min(candidate_pool_size, int(vocab_size))
++    start = 0 if shift_label else 1
++    z = draft_hidden[:, start : start + num_proposals, :]
++    if int(z.shape[1]) != num_proposals:
++        raise ValueError(
++            "Domino draft hidden states do not contain enough proposal positions."
++        )
++
++    tp_size = int(tp_group.world_size) if tp_group is not None else 1
++    if tp_size > 1 and (lm_head_num_org is None or lm_head_num_org_padded is None):
++        raise ValueError(
++            "Domino TP rollout requires local lm_head vocab shard metadata."
++        )
++    local_vocab_size = int(lm_head_num_org_padded) if tp_size > 1 else int(vocab_size)
++    if tp_size > 1:
++        num_org = int(lm_head_num_org)
++        org_vocab_start = int(lm_head_org_vocab_start)
++        if (
++            num_org <= 0
++            or num_org > local_vocab_size
++            or org_vocab_start < 0
++            or org_vocab_start + num_org > int(vocab_size)
++        ):
++            raise ValueError(
++                "Domino TP rollout received an invalid lm_head vocab shard."
++            )
++    if int(lm_head_weight.shape[0]) < local_vocab_size:
++        raise ValueError(
++            "Domino lm_head weight is smaller than its padded vocab shard."
++        )
++    weight = lm_head_weight[:local_vocab_size]
++    z_for_logits = z.to(weight.dtype) if z.dtype != weight.dtype else z
++    logits_input = (
++        z_for_logits.transpose(0, 1)
++        .contiguous()
++        .view(num_proposals * batch_size, hidden_size)
++    )
++    local_logits = F.linear(logits_input, weight).view(
++        num_proposals, batch_size, local_vocab_size
++    )
++    if prefer_tp_candidate_pool is None:
++        full_base_logits_bytes = (
++            num_proposals * batch_size * int(vocab_size) * local_logits.element_size()
++        )
++        prefer_tp_candidate_pool = (
++            full_base_logits_bytes > _DOMINO_TP_FULL_BASE_LOGITS_MAX_BYTES
++        )
++    use_tp_candidate_pool = (
++        tp_size > 1
++        and prefer_tp_candidate_pool
++        and 0 < candidate_pool_size < int(vocab_size)
++    )
++    first_ids = None
++    candidate_ids = None
++    candidate_base = None
++    if tp_size == 1:
++        base_logits = local_logits[:, :, : int(vocab_size)]
++    elif use_tp_candidate_pool:
++        first_ids = _domino_tp_first_ids(
++            local_logits[0],
++            org_vocab_start=int(lm_head_org_vocab_start),
++            num_org=int(lm_head_num_org),
++            tp_group=tp_group,
++        )
++        if num_proposals > 1:
++            candidate_ids, candidate_base = _domino_tp_candidate_state(
++                local_logits[1:],
++                candidate_pool_size=candidate_pool_size,
++                org_vocab_start=int(lm_head_org_vocab_start),
++                num_org=int(lm_head_num_org),
++                tp_group=tp_group,
++            )
++        base_logits = None
++    else:
++        local_logits_t = local_logits.view(
++            num_proposals * batch_size, local_vocab_size
++        ).T.contiguous()
++        gathered_logits = torch.empty(
++            (tp_size * local_vocab_size, num_proposals * batch_size),
++            dtype=local_logits.dtype,
++            device=local_logits.device,
++        )
++        tp_group.all_gather_into_tensor(gathered_logits, local_logits_t)
++        base_logits = (
++            gathered_logits.T[:, : int(vocab_size)]
++            .contiguous()
++            .view(num_proposals, batch_size, int(vocab_size))
++        )
++
++    if first_ids is None:
++        first_ids = torch.argmax(base_logits[0], dim=-1).to(torch.long)
++    proposals = [first_ids]
++    if num_proposals == 1:
++        return first_ids[:, None]
++
++    candidate_weight = None
++    if candidate_ids is not None:
++        candidate_weight = F.embedding(candidate_ids, embed_proj[2].weight)
++    elif 0 < candidate_pool_size < int(vocab_size):
++        feedback_logits = base_logits[1:]
++        candidate_ids = torch.topk(
++            feedback_logits.amax(dim=0),
++            k=candidate_pool_size,
++            dim=-1,
++            sorted=False,
++        ).indices.contiguous()
++        candidate_base = torch.gather(
++            feedback_logits.transpose(0, 1),
++            2,
++            candidate_ids[:, None, :].expand(-1, num_proposals - 1, -1),
++        ).transpose(0, 1)
++        candidate_weight = F.embedding(candidate_ids, embed_proj[2].weight)
++
++    prefix_ids = torch.stack((verified_ids, first_ids), dim=1)
++    _, gru_hidden = prefix_gru(target_embedding(prefix_ids))
++
++    for index in range(1, num_proposals):
++        step_hidden = z[:, index, :]
++        correction_hidden = embed_proj[1](
++            embed_proj[0](torch.cat((step_hidden, gru_hidden[0]), dim=-1))
++        )
++        if candidate_ids is None:
++            correction = embed_proj[2](correction_hidden)
++            next_ids = torch.argmax(base_logits[index] + correction, dim=-1).to(
++                torch.long
++            )
++        else:
++            correction = torch.bmm(
++                candidate_weight, correction_hidden.unsqueeze(-1)
++            ).squeeze(-1)
++            candidate_position = torch.argmax(
++                candidate_base[index - 1] + correction, dim=-1
++            )
++            next_ids = torch.gather(
++                candidate_ids, 1, candidate_position[:, None]
++            ).squeeze(1)
++        proposals.append(next_ids)
++        if index + 1 < num_proposals:
++            gru_hidden = _domino_gru_cell(
++                prefix_gru, target_embedding(next_ids), gru_hidden[0]
++            )[None]
++
++    return torch.stack(proposals, dim=1)

@@ -8,6 +8,24 @@ from pathlib import Path
 from typing import Any, Dict
 
 
+def _check_domino_serving_fields(method_config: Dict[str, Any], block_size) -> None:
+    """Fail on a Domino config SGLang's Domino DFLASH parser would refuse."""
+    if not isinstance(method_config.get("shift_label"), bool):
+        raise ValueError("Domino export needs a bool dflash_config.shift_label")
+    prefix_len = method_config.get("pure_draft_prefix_len")
+    if isinstance(prefix_len, bool) or prefix_len != 1:
+        raise ValueError(
+            "SGLang serves Domino only with dflash_config.pure_draft_prefix_len=1, "
+            f"got {prefix_len!r}"
+        )
+    for key in ("gru_hidden_dim", "emb_dim"):
+        value = method_config.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"Domino export needs a positive dflash_config.{key}")
+    if block_size <= 1:
+        raise ValueError(f"Domino export needs block_size > 1, got {block_size}")
+
+
 def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, Any]:
     path = Path(config_path)
     with path.open(encoding="utf-8") as handle:
@@ -25,6 +43,8 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
             "export is not DFlash-family: "
             f"dflash_config.projector_type={projector_type!r}"
         )
+    if projector_type == "domino":
+        _check_domino_serving_fields(method_config, block_size)
 
     config["architectures"] = ["DFlashDraftModel"]
     config.pop("auto_map", None)

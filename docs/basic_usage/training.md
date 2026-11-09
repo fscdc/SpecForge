@@ -459,8 +459,29 @@ specforge export --to sglang \
   --output-dir ./exports/qwen3-8b-eagle3-sglang
 ```
 
-`--to sglang` currently implements the EAGLE3 serving-key contract. Use
-`--to hf` for DFlash, Domino, DSpark, and P-EAGLE model directories. For an
+`--to sglang` currently implements the EAGLE3 serving-key contract and the
+Domino / MMDomino one. A Domino-family checkpoint exports as an SGLang DFLASH
+draft (`architectures: ["DFlashDraftModel"]`, `dflash_config.projector_type:
+"domino"` plus `shift_label`, `pure_draft_prefix_len`, `gru_hidden_dim`,
+`emb_dim`), the layout of the Domino authors' checkpoints, checked against the
+run's resume contract:
+
+```bash
+specforge export --to sglang \
+  --checkpoint ./outputs/qwen3.5-4b-mmdomino-llava-ov15-1M/qwen3.5-4b-mmdomino-llava-ov15-1M-latest \
+  --draft-config configs/qwen3.5-4b-mmdomino.json \
+  --output-dir ./exports/qwen3.5-4b-mmdomino-sglang
+```
+
+Serve it with `--speculative-algorithm DFLASH --speculative-draft-model-path
+<export>` on an SGLang carrying `patches/sglang/v0.5.14/dflash-domino.patch`
+(applied by `scripts/benchmark_helper.sh`). SGLang 0.5.14 without the patch
+serves the export as plain DFLASH and silently drops the GRU correction head.
+SGLang serves Domino with `pure_draft_prefix_len=1` and a greedy draft rollout
+only; `--speculative-domino-candidate-pool-size` (default 2048, 0 = full
+vocabulary) bounds the vocabulary positions 2+ of a block score.
+
+Use `--to hf` for DFlash, MMFlash, DSpark, and P-EAGLE model directories. For an
 EAGLE-family self-contained Hugging Face directory, provide the target model as
 the source of the frozen embedding when it is absent from the runtime
 checkpoint:

@@ -16,7 +16,14 @@ model:
   lm_head_key: "lm_head.weight"
   torch_dtype: "bfloat16"
 data:
-  # Copy the finished 9B regen over from the HPC regen_data directory first.
+  # Copy the finished 27B regen and the visual-KL sidecar directory below over
+  # from the HPC (/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge ->
+  # /local_home2/fengsicheng/specforge) first. Its rows point at HPC image
+  # paths: rewrite them to this machine's copy of the SAME llava-ov15-1M files
+  # (an image of another size changes the token count),
+  #   sed 's#"image": "/scratch/Projects/CFP-04/CFP04-CF-054/fengsicheng/specforge/data/#"image": "/local_home2/fengsicheng/specforge/data/#'
+  # -- a row whose image cannot be opened is dropped without an error, and with
+  # every image row dropped the run silently trains on the text rows only.
   train_data_path: "/local_home2/fengsicheng/specforge/regen_data/qwen38-27B_llava-ov15-1M-prompted_regen_first_turn.jsonl"
   # Per-token visual-grounding scores for the row ids of THIS train_data_path,
   # written by scripts/score_visual_kl_hpc.sh (which reads both fields from this
@@ -30,6 +37,10 @@ data:
   # g = transform(KL) * exp(-entropy): high only where the image both changes
   # AND settles the target's prediction. false = raw KL rank (ablation).
   visual_score_confidence_gate: true
+  # Refuse to train if more than 0.2% of the kept image rows have no usable
+  # score (an unfinished scoring pass, another tokenisation) or no image row
+  # survives encoding (unreadable image paths).
+  visual_score_max_unscored_frac: 0.002
   max_length: 4096
   chat_template: "qwen3.5"
   build_dataset_num_proc: 32
@@ -50,6 +61,7 @@ training:
   num_anchors: 512
   loss_decay_gamma: 7
   save_interval: 10000
+  max_checkpoints: 3   # 24 GB each
   log_interval: 50
   dist_timeout: 30
   seed: 42

@@ -51,7 +51,7 @@ from matplotlib.path import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNS = os.path.join(ROOT, "accept_analysis")
-OUT = os.path.join(ROOT, "figures")
+OUT = os.environ.get("FIG_OUT") or os.path.join(ROOT, "figures")  # FIG_OUT: write elsewhere, e.g. for review
 DRAFTS = {"zlab": "text-only data", "llava-ov-1M": "multimodal data"}
 LABEL = {"chartqa": "ChartQA", "textvqa": "TextVQA", "mmstar": "MMStar",
          "dynamath": "DynaMath", "mathvista": "MathVista", "mathverse": "MathVerse"}
@@ -61,6 +61,7 @@ LABEL = {"chartqa": "ChartQA", "textvqa": "TextVQA", "mmstar": "MMStar",
 Q_FILL = ["#9ec5f4", "#5598e7", "#256abf", "#104281"]
 Q_INK = ["#5598e7", "#256abf", "#104281", "#0d366b"]
 INK, INK2, INK3, GRID, SURFACE = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#ffffff"
+BENCH_FONTSIZE = 8  # benchmark names under the columns of the paper / supp figures (was 9.5)
 
 plt.rcParams.update({
     "font.family": "DejaVu Sans", "font.size": 8, "axes.titlesize": 8.5,
@@ -194,7 +195,7 @@ def draw_combined(benches, all_stats):
         # benchmark name centred under its column, below the x labels
         box = axes[1, j].get_position()
         fig.text((box.x0 + box.x1) / 2, 0.055, s["label"], ha="center", va="center",
-                 fontsize=9.5, fontweight="bold", color=INK)
+                 fontsize=BENCH_FONTSIZE, fontweight="bold", color=INK)
     handles = [Patch(facecolor="#dedcd6", edgecolor=INK2, hatch="////", linewidth=0, label=f"DFlash, {DRAFTS['zlab']}"),
                Patch(facecolor="#b9b7b0", linewidth=0, label=f"DFlash, {DRAFTS['llava-ov-1M']}")]
     fig.legend(handles=handles, loc="upper center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 1.0),
@@ -216,7 +217,7 @@ def draw_supp(benches, all_stats):
               lambda v: f"{v:.0f}%", ymax=_ymax(s, "accept_rate"))
         box = axes[j].get_position()
         fig.text((box.x0 + box.x1) / 2, 0.075, s["label"], ha="center", va="center",
-                 fontsize=9.5, fontweight="bold", color=INK)
+                 fontsize=BENCH_FONTSIZE, fontweight="bold", color=INK)
     handles = [Patch(facecolor="#dedcd6", edgecolor=INK2, hatch="////", linewidth=0, label=f"DFlash, {DRAFTS['zlab']}"),
                Patch(facecolor="#b9b7b0", linewidth=0, label=f"DFlash, {DRAFTS['llava-ov-1M']}")]
     fig.legend(handles=handles, loc="upper center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 1.0),

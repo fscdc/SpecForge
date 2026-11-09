@@ -22,6 +22,16 @@ GATE_README = GATE_DIR / "README.md"
 TRAINING_GUIDE = ROOT / "docs" / "basic_usage" / "training.md"
 CUSTOMIZATION_GUIDE = ROOT / "docs" / "advanced_features" / "customization.md"
 CONFIG_README = ROOT / "examples" / "configs" / "README.md"
+#: the dflash_config fields SGLang's Domino DFLASH path parses.
+DOMINO_METHOD_CONFIG = {
+    "projector_type": "domino",
+    "mask_token_id": 123,
+    "target_layer_ids": [1, 9, 17, 25, 33],
+    "shift_label": True,
+    "pure_draft_prefix_len": 1,
+    "gru_hidden_dim": 1024,
+    "emb_dim": 256,
+}
 
 
 def command_line(output: str, marker: str, suffix: str = "") -> list[str]:
@@ -425,10 +435,7 @@ class TestNormalizeDFlashExport(unittest.TestCase):
                         "architectures": ["DominoDraftModel"],
                         "auto_map": {"AutoModel": "domino.DominoDraftModel"},
                         "block_size": 16,
-                        "dflash_config": {
-                            "projector_type": "domino",
-                            "gru_hidden_dim": 1024,
-                        },
+                        "dflash_config": DOMINO_METHOD_CONFIG,
                     }
                 ),
                 encoding="utf-8",
@@ -438,9 +445,57 @@ class TestNormalizeDFlashExport(unittest.TestCase):
 
             self.assertEqual(normalized["architectures"], ["DFlashDraftModel"])
             self.assertNotIn("auto_map", normalized)
-            self.assertEqual(normalized["dflash_config"]["projector_type"], "domino")
-            self.assertEqual(normalized["dflash_config"]["gru_hidden_dim"], 1024)
+            self.assertEqual(normalized["dflash_config"], DOMINO_METHOD_CONFIG)
             self.assertEqual(json.loads(path.read_text()), normalized)
+
+    def test_rejects_a_domino_config_sglang_cannot_serve(self):
+        broken = {
+            "shift_label": {"shift_label": 1},
+            "pure_draft_prefix_len": {"pure_draft_prefix_len": 0},
+            "gru_hidden_dim": {"gru_hidden_dim": None},
+            "emb_dim": {"emb_dim": True},
+        }
+        for field, override in broken.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "config.json"
+                original = json.dumps(
+                    {
+                        "architectures": ["DominoDraftModel"],
+                        "block_size": 16,
+                        "dflash_config": {**DOMINO_METHOD_CONFIG, **override},
+                    }
+                )
+                path.write_text(original, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, field):
+                    self.module.normalize_export(str(path), 16)
+                # nothing is rewritten for a refused export
+                self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_non_domino_exports_need_no_domino_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for projector in (None, "dflash", "mmflash"):
+                with self.subTest(projector=projector):
+                    method = {"mask_token_id": 7, "target_layer_ids": [1, 5]}
+                    if projector is not None:
+                        method["projector_type"] = projector
+                    config = {
+                        "architectures": ["MMFlashDraftModel"],
+                        "auto_map": {"AutoModel": "mmflash.MMFlashDraftModel"},
+                        "block_size": 16,
+                        "dflash_config": method,
+                    }
+                    path = Path(tmp) / f"{projector}.json"
+                    path.write_text(json.dumps(config), encoding="utf-8")
+
+                    self.module.normalize_export(str(path), 16)
+
+                    # byte-for-byte what normalization wrote before Domino checks
+                    del config["auto_map"]
+                    config["architectures"] = ["DFlashDraftModel"]
+                    self.assertEqual(
+                        path.read_text(encoding="utf-8"),
+                        json.dumps(config, indent=2) + "\n",
+                    )
 
     def test_rejects_a_mismatched_block_size(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -25,6 +25,10 @@ if TYPE_CHECKING:
     from specforge.algorithms.registry import AlgorithmRegistration
     from specforge.training.capture_contract import ServerCaptureContract
 
+#: specforge.triton_cache.PER_PROCESS_CACHE_MANAGER, spelled out so planning
+#: does not import Triton
+PER_PROCESS_TRITON_CACHE_MANAGER = "specforge.triton_cache:PerProcessFileCacheManager"
+
 LaunchRole = Literal["auto", "all", "producer", "consumer", "both"]
 PlanKind = Literal["worker", "command", "supervisor", "managed_supervisor"]
 ReadinessKind = Literal["http", "mooncake"]
@@ -568,6 +572,11 @@ def _managed_local_services(
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),
         }
+        if server.tp_size > 1 or len(managed.capture_servers) > 1:
+            # several SGLang processes JIT-compile the same kernels at the same
+            # moment; on NFS a shared Triton cache lets one read a file the
+            # other is replacing (FileNotFoundError, the scheduler exits)
+            service_env["TRITON_CACHE_MANAGER"] = PER_PROCESS_TRITON_CACHE_MANAGER
         capture_services.append(
             ServiceSpec(
                 command=CommandSpec(

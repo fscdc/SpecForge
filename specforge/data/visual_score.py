@@ -115,18 +115,31 @@ def _quantile_cache_path(path: str) -> str:
     return path + ".quantiles.json"
 
 
-def compute_quantile_edges(path: str, *, points: int = _QUANTILE_POINTS) -> np.ndarray:
-    """Edges of the empirical KL CDF over every scored token of the corpus.
+def _sidecar_signature(files: Sequence[str]) -> List[List[Any]]:
+    """``[path, size, mtime_ns]`` per sidecar file: any append or rewrite changes it."""
+    signature: List[List[Any]] = []
+    for file in files:
+        stat = os.stat(file)
+        signature.append([file, int(stat.st_size), int(stat.st_mtime_ns)])
+    return signature
 
-    Cached next to the sidecar (``quantiles.json``) because it only depends on
-    the sidecar's content; delete the cache after re-scoring.
-    """
+
+def _quantile_edges_and_count(path: str, points: int) -> Tuple[np.ndarray, int]:
+    """:func:`compute_quantile_edges` plus the number of scored tokens behind the edges."""
     cache = _quantile_cache_path(path)
-    if os.path.isfile(cache):
+    # taken before reading: a file that grows while it is read leaves a cache
+    # that no longer matches, so the next load recomputes
+    signature = _sidecar_signature(_sidecar_files(path))
+    try:
         with open(cache, encoding="utf-8") as handle:
             payload = json.load(handle)
-        if payload.get("points") == points and payload.get("files") == _sidecar_files(path):
-            return np.asarray(payload["edges"], dtype=np.float64)
+        if payload.get("points") == points and payload.get("signature") == signature:
+            return np.asarray(payload["edges"], dtype=np.float64), int(payload["num_tokens"])
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        # a torn cache (a producer killed mid-write) or a foreign one is a miss
+        pass
     chunks: List[np.ndarray] = []
     for record in iter_sidecar(path):
         chunks.append(np.asarray(record["kl"], dtype=np.float32))
@@ -134,21 +147,37 @@ def compute_quantile_edges(path: str, *, points: int = _QUANTILE_POINTS) -> np.n
         raise ValueError(f"visual score sidecar {path!r} is empty")
     values = np.concatenate(chunks)
     edges = np.quantile(values, np.linspace(0.0, 1.0, points + 1))
+    partial = f"{cache}.tmp.{os.getpid()}"
     try:
-        with open(cache, "w", encoding="utf-8") as handle:
+        with open(partial, "w", encoding="utf-8") as handle:
             json.dump(
                 {
                     "points": points,
-                    "files": _sidecar_files(path),
+                    "files": [entry[0] for entry in signature],
+                    "signature": signature,
                     "num_tokens": int(values.size),
                     "edges": edges.tolist(),
                 },
                 handle,
             )
+        os.replace(partial, cache)
     except OSError:
         # a read-only sidecar location just recomputes next time
-        pass
-    return edges
+        try:
+            os.unlink(partial)
+        except OSError:
+            pass
+    return edges, int(values.size)
+
+
+def compute_quantile_edges(path: str, *, points: int = _QUANTILE_POINTS) -> np.ndarray:
+    """Edges of the empirical KL CDF over every scored token of the corpus.
+
+    Cached next to the sidecar (``quantiles.json``) because it only depends on
+    the sidecar's content. The cache is keyed by each file's path, size and
+    mtime, so a sidecar that grew or was re-scored in place recomputes.
+    """
+    return _quantile_edges_and_count(path, points)[0]
 
 
 def transform_scores(
@@ -241,8 +270,9 @@ class VisualScoreTable:
         confidence_gate: bool = True,
     ) -> "VisualScoreTable":
         edges = None
+        edge_tokens = None
         if transform != "identity":
-            edges = compute_quantile_edges(path)
+            edges, edge_tokens = _quantile_edges_and_count(path, _QUANTILE_POINTS)
         entries: Dict[str, Tuple[int, str, np.ndarray]] = {}
         stats = VisualScoreStats(
             files=_sidecar_files(path), transform=transform, confidence_gate=confidence_gate
@@ -273,6 +303,12 @@ class VisualScoreTable:
             g_hi += int((g >= 0.75).sum())
         if not entries:
             raise ValueError(f"visual score sidecar {path!r} is empty")
+        if edge_tokens is not None and edge_tokens != stats.tokens:
+            raise ValueError(
+                f"visual score sidecar {path!r} changed while it was loaded: the quantile "
+                f"edges cover {edge_tokens} scored tokens but the table read {stats.tokens}; "
+                "is a scorer still writing to it? Train on a finished sidecar (or a copy)"
+            )
         if edges is not None:
             points = len(edges) - 1
             stats.kl_quantiles = {

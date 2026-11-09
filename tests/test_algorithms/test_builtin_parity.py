@@ -34,6 +34,12 @@ class BuiltinProviderParityTest(unittest.TestCase):
                 {"eager", "sdpa", "flex_attention"},
                 None,
             ),
+            "mmdomino": (
+                "DominoDraftModel",
+                {"input_ids", "loss_mask", "hidden_states"},
+                {"eager", "sdpa", "flex_attention"},
+                None,
+            ),
             "dspark": (
                 "DSparkDraftModel",
                 {
@@ -108,6 +114,12 @@ class BuiltinProviderParityTest(unittest.TestCase):
                 (("input_ids", "input_ids", ()), ("loss_mask", "loss_mask", ())),
                 None,
             ),
+            "mmdomino": (
+                "hidden_states",
+                None,
+                (("input_ids", "input_ids", ()), ("loss_mask", "loss_mask", ())),
+                None,
+            ),
             "dspark": (
                 "hidden_states",
                 "target_last_hidden_states",
@@ -162,6 +174,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
             "dflash": "DFlashTrainStrategy",
             "mmflash": "MMFlashTrainStrategy",
             "domino": "DominoTrainStrategy",
+            "mmdomino": "MMDominoTrainStrategy",
             "dspark": "DSparkTrainStrategy",
         }
         model = object()

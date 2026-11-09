@@ -155,7 +155,7 @@ class DataConfig(StrictConfigModel):
     #: server builds and the request is rejected for exceeding the context.
     #: Only set this if the server is configured with a matching limit.
     image_max_tokens: int = Field(default=0, ge=0)
-    #: MMFlash only -- per-token visual-dependency sidecar (a JSONL file or a
+    #: MMFlash/MMDomino only -- per-token visual-dependency sidecar (a JSONL file or a
     #: directory of shards written by ``scripts/score_visual_kl.py``), keyed by
     #: the training record's ``id``. Empty: every image row trains with g=0,
     #: i.e. verification-aware weights without the visual term.
@@ -172,6 +172,12 @@ class DataConfig(StrictConfigModel):
     #: Off: raw (transformed) KL, which also flags tokens the target cannot
     #: settle even with the image. See ``specforge.data.visual_score``.
     visual_score_confidence_gate: bool = True
+    #: Refuse to train when more than this share of the kept image rows has no
+    #: usable sidecar entry (missing, or built from another tokenisation), or
+    #: when a sidecar is set but no image row survived encoding (unreadable
+    #: image paths). ``None`` only reports them. A finished scoring pass leaves
+    #: ~0: rows the scorer drops as too long are dropped by training as well.
+    visual_score_max_unscored_frac: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     build_dataset_num_proc: int = Field(default=8, gt=0)
     #: Ordered background feature-loader workers. ``None`` preserves the
     #: former strategy defaults (EAGLE/P-EAGLE=4, DFlash-family=8).
@@ -584,11 +590,11 @@ class TrainingConfig(StrictConfigModel):
         "mmflash",
     ] = "dflash"
     dpace_alpha: float = 0.5
-    #: MMFlash only -- with ``loss_type: mmflash`` every token's base weight is
+    #: MMFlash/MMDomino only -- with ``loss_type: mmflash`` every token's base weight is
     #: the prefix confidence ``prod_{i<=k} ((1 - s) * p_i + s)``: the smoothed
     #: probability that verification reaches position k. ``s`` is this floor.
     mmflash_smoothing: float = Field(default=0.5, ge=0.0, le=1.0)
-    #: MMFlash only -- every token's weight is the ``loss_type`` base weight
+    #: MMFlash/MMDomino only -- every token's weight is the ``loss_type`` base weight
     #: times ``1 + visual_alpha * g * (1 - p)``: visual grounding g (sidecar)
     #: times how far the draft still is from the token (p = its probability on
     #: the target). Bounded in [1, 1 + visual_alpha]; 0 is exactly ``loss_type``.
@@ -685,6 +691,11 @@ class TrainingConfig(StrictConfigModel):
             raise ValueError(
                 "training.sp_ulysses_size/sp_ring_size require "
                 "training.attention_backend=usp"
+            )
+        if self.strategy == "mmdomino" and self.loss_type not in ("dflash", "mmflash"):
+            raise ValueError(
+                "training.strategy=mmdomino supports training.loss_type dflash "
+                f"(Domino's decay) or mmflash (prefix confidence), got {self.loss_type!r}"
             )
         if self.draft_sparse is not None:
             if self.strategy != "mmflash":

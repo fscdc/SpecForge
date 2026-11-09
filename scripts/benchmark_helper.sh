@@ -31,6 +31,19 @@
 #                         specforge/inference/sglang_patch_inventory.md.
 #                         SPECFORGE_ALLOW_UNPATCHED_GEMMA4=1 skips it and leaves
 #                         the tree as it is, for a draft trained without it
+#   dflash-domino         Domino drafts (DFlash backbone + GRU logits
+#                         correction; Domino / MMDomino exports) under
+#                         --speculative-algorithm DFLASH, ported from the
+#                         Domino authors' SGLang fork: a draft whose
+#                         dflash_config.projector_type is "domino" runs its
+#                         greedy rollout inside the draft CUDA graph
+#                         (dflash.py, dflash_utils.py, dflash_worker_v2.py,
+#                         new domino_utils.py, decode_cuda_graph_runner.py,
+#                         server_args.py: --speculative-domino-candidate-
+#                         pool-size, default 2048, 0 = full vocabulary).
+#                         Other DFLASH drafts serve byte-identically. Without
+#                         it SGLang serves a Domino export as plain DFLASH and
+#                         silently drops the correction head
 #
 # All of them edit modules that launch_server imports at startup, so run this before
 # starting the server, in the same environment:
@@ -54,18 +67,22 @@ PATCH_DIR="${REPO_ROOT}/patches/sglang/v0.5.14"
 # UNPATCHED file GNU patch prints "Unreversed patch detected! Ignoring -R" and
 # dry-runs it forward instead, exiting 0 either way, so it reports "already
 # applied" for both states.
-PATCH_NAMES=(request-timing-split phase-accounting qwen35-eagle3-capture gemma4-spec)
+PATCH_NAMES=(request-timing-split phase-accounting qwen35-eagle3-capture gemma4-spec dflash-domino)
 PATCH_TARGETS=(
     "sglang/srt/managers/tokenizer_manager.py"
     "sglang/srt/managers/scheduler_components/metrics_reporter.py"
     "sglang/srt/models/qwen3_5.py"
     $'sglang/srt/models/gemma4_causal.py\nsglang/srt/models/gemma4_mm.py\nsglang/srt/multimodal/processors/gemma4.py'
+    # domino_utils.py is new in the patch, so it cannot be a target (a clean
+    # tree would report it missing); the five files it edits are
+    $'sglang/srt/model_executor/runner/decode_cuda_graph_runner.py\nsglang/srt/models/dflash.py\nsglang/srt/server_args.py\nsglang/srt/speculative/dflash_utils.py\nsglang/srt/speculative/dflash_worker_v2.py'
 )
 PATCH_SENTINELS=(
     'meta_info["first_token_latency"]'
     'def phase_account_step'
     'def set_eagle3_layers_to_capture'
     $'aux_hidden_states.append(hidden_states.clone())\nand vision_bidirectional\ngpu_image_decode = False'
+    $'capture_tail_hooks\nself.prefix_gru\nspeculative_domino_candidate_pool_size\ndef is_domino\n_DominoDraftSampler'
 )
 
 # The directory sglang is installed under, or empty when python3 is not the

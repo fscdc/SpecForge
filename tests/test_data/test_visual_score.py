@@ -122,6 +122,51 @@ class TestTable(unittest.TestCase):
         self.assertEqual(payload["num_tokens"], 5)
         VisualScoreTable.load(self.tmp.name, transform="binary")  # must not choke on the cache
 
+    def test_quantile_cache_follows_a_sidecar_that_grows_in_place(self):
+        # the scorer appends to fixed shard names: the same file list must not
+        # reuse edges computed before the append
+        before = VisualScoreTable.load(self.tmp.name, confidence_gate=False)
+        cache = os.path.join(self.tmp.name, "quantiles.json")
+        with open(self.path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"id": "c#3", "n_tokens": 9, "n_loss": 4, "kl": [9.0, 9.5, 8.0, 7.0]}) + "\n")
+        after = VisualScoreTable.load(self.tmp.name, confidence_gate=False)
+        with open(cache) as handle:
+            payload = json.load(handle)
+        self.assertEqual(payload["num_tokens"], 9)
+        self.assertEqual(after.stats.tokens, 9)
+        self.assertEqual(payload["signature"][0][1], os.path.getsize(self.path))
+        # 5.0 was the maximum, now four larger values rank above it
+        self.assertEqual(float(before.get("a#1")[2][1]), 1.0)
+        self.assertLess(float(after.get("a#1")[2][1]), 0.6)
+
+    def test_torn_or_old_cache_is_recomputed(self):
+        cache = os.path.join(self.tmp.name, "quantiles.json")
+        for content in ('{"points": 1000, "edg', '{"points": 1000, "files": [], "edges": [0, 1]}', "[1, 2]"):
+            with self.subTest(content=content):
+                with open(cache, "w") as handle:
+                    handle.write(content)
+                table = VisualScoreTable.load(self.tmp.name, confidence_gate=False)
+                self.assertEqual(float(table.get("a#1")[2][1]), 1.0)
+                with open(cache) as handle:
+                    self.assertEqual(json.load(handle)["num_tokens"], 5)
+        self.assertEqual([n for n in os.listdir(self.tmp.name) if ".tmp." in n], [])
+
+    def test_sidecar_changing_during_the_load_raises(self):
+        from unittest import mock
+
+        from specforge.data import visual_score
+
+        real = visual_score._quantile_edges_and_count
+
+        def stale(path, points):
+            edges, count = real(path, points)
+            return edges, count - 1  # as if a scorer appended between the two reads
+
+        with mock.patch.object(visual_score, "_quantile_edges_and_count", stale):
+            with self.assertRaisesRegex(ValueError, "changed while it was loaded"):
+                VisualScoreTable.load(self.tmp.name)
+        VisualScoreTable.load(self.tmp.name, transform="identity")  # identity reads no edges
+
     def test_duplicate_or_ragged_rows_raise(self):
         _write_sidecar(self.tmp.name, [self.rows[0]], name="visual_kl.shard001.jsonl")
         with self.assertRaises(ValueError):

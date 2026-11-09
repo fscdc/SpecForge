@@ -81,9 +81,11 @@ def materialize_draft(
 
     Validates the state dict against the architecture: unexpected keys fail, and
     the only tolerated missing keys are the embeddings (excluded from draft
-    checkpoints by design — serving loads them from the target). Legacy
-    ``t2d``/``d2t`` buffers are tolerated only when ``vocab_mapping_path`` is
-    supplied to restore them.
+    checkpoints by design — serving loads them from the target). Domino's
+    trained ``embed_proj`` head is not an embedding and stays required: a
+    random one would export and serve without error. Legacy ``t2d``/``d2t``
+    buffers are tolerated only when ``vocab_mapping_path`` is supplied to
+    restore them.
     """
     from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 
@@ -97,7 +99,10 @@ def materialize_draft(
         )
     tolerated = {"t2d", "d2t"} if vocab_mapping_path else set()
     non_embed_missing = [
-        key for key in missing if "embed" not in key.lower() and key not in tolerated
+        key
+        for key in missing
+        if ("embed" not in key.lower() or key.startswith("embed_proj."))
+        and key not in tolerated
     ]
     if non_embed_missing:
         raise ValueError(

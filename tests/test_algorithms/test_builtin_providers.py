@@ -22,14 +22,14 @@ from specforge.algorithms.common.providers import (
 from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mmflash", "peagle")
+BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mmdomino", "mmflash", "peagle")
 
 
 class BuiltinProviderContractTest(unittest.TestCase):
     def setUp(self):
         self.registry = builtin_algorithm_registry()
 
-    def test_six_builtins_are_explicit_and_instance_owned(self):
+    def test_seven_builtins_are_explicit_and_instance_owned(self):
         self.assertEqual(BUILTINS, self.registry.names)
         self.assertIsNot(builtin_algorithm_registry(), self.registry)
 
@@ -136,7 +136,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 self.assertEqual(vocab_size, defaults.draft_vocab_size)
                 self.assertEqual(has_override, policy.apply_overrides is not None)
 
-        for name in ("domino", "dspark"):
+        for name in ("domino", "dspark", "mmdomino"):
             with self.subTest(algorithm=name):
                 policy = self.registry.resolve(name).providers.model.draft_config
                 self.assertIsNone(policy.target_defaults)
@@ -198,6 +198,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "domino": dflash_family,
             "dspark": dflash_family,
             "mmflash": dflash_family,
+            "mmdomino": dflash_family,
         }
         expected_keys = {
             "eagle3": {
@@ -239,6 +240,16 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "mmflash_dpace_alpha",
                 "mmflash_visual_alpha",
                 "mmflash_smoothing",
+            },
+            "mmdomino": {
+                "mmdomino_block_size",
+                "mmdomino_shift_label",
+                "mmdomino_pure_draft_prefix_len",
+                "mmdomino_lambda_base_start",
+                "mmdomino_lambda_base_decay_ratio",
+                "mmdomino_loss_type",
+                "mmdomino_visual_alpha",
+                "mmdomino_smoothing",
             },
         }
 
@@ -424,7 +435,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==6; "
+            "r=builtin_algorithm_registry(); assert len(r)==7; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )

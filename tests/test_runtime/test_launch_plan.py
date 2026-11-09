@@ -567,6 +567,34 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--context-length") + 1], "135")
         self.assertNotIn("--disable-radix-cache", argv)
 
+    def test_capture_processes_sharing_a_cache_get_per_process_triton_dirs(self):
+        from specforge.launch_plan import PER_PROCESS_TRITON_CACHE_MANAGER
+        from specforge.triton_cache import PER_PROCESS_CACHE_MANAGER
+
+        self.assertEqual(PER_PROCESS_TRITON_CACHE_MANAGER, PER_PROCESS_CACHE_MANAGER)
+
+        def server(port, gpus):
+            return {"port": port, "cuda_visible_devices": gpus, "tp_size": len(gpus)}
+
+        cases = (
+            ("one TP1 server", [server(30000, ["0"])], False),
+            ("one TP2 server", [server(30000, ["0", "1"])], True),
+            ("two TP1 replicas", [server(30000, ["0"]), server(30001, ["1"])], True),
+        )
+        for name, servers, expected in cases:
+            with self.subTest(name), tempfile.TemporaryDirectory() as root:
+                cfg = _managed_config(os.path.join(root, "attempt"), servers=servers)
+                with mock.patch(
+                    "specforge.training.capture_contract.resolve_server_capture_contract",
+                    return_value=CAPTURE_CONTRACT,
+                ):
+                    plan = build_launch_plan(cfg, config_path="run.yaml", env={})
+                for service in plan.services[1:]:
+                    self.assertEqual(
+                        service.command.env.get("TRITON_CACHE_MANAGER"),
+                        PER_PROCESS_TRITON_CACHE_MANAGER if expected else None,
+                    )
+
     def test_managed_local_plan_owns_mooncake_and_multiple_capture_servers(self):
         servers = [
             {
